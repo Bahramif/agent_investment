@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+vertex_deploy.py
+mandate_builder.py
+run_portfolio.py
+test_agent.py
+verify_alpaca_connection.py

@@ -1,0 +1,95 @@
+# =============================================================================
+# mandate.yaml
+# The user's investment mandate. Division of labor:
+#   - the USER sets bucket weights (how much capital goes where) -> hard bounds
+#   - the AGENTS distribute inside each bucket (which instruments, how much) and
+#     fill any space the user leaves open
+#   - instrument SELECTION is always the agents' job
+#
+# All weights are fractions of the TOTAL portfolio (0.50 = 50% of everything).
+# A user-locked weight is a hard constraint; its `band` is how far agents may
+# let it drift before a rebalance pulls it back. Space a user doesn't lock is
+# "open" and distributed by the agents, subject to the sub-limits below.
+# =============================================================================
+
+total: 1.0
+
+default_limits:            # apply inside every bucket unless a bucket overrides
+  max_per_name: 0.10       # no single instrument above 10% of the total portfolio
+  min_names: 3             # diversification floor per funded bucket
+
+buckets:
+
+  equities:
+    set_by: user
+    weight: 0.50
+    band: 0.05
+    children:
+      tech_ai:             # user drills in: locks a quarter of the book to AI/tech
+        set_by: user
+        weight: 0.25
+        band: 0.05
+        limits: { max_per_name: 0.08 }
+    # equities has a locked child summing to 0.25, so the remaining 0.25 of the
+    # equity sleeve is OPEN — agents place it across any equity names they have
+    # conviction in (energy, industrials, ...). Their call, not the user's.
+
+  forex:
+    set_by: user
+    weight: 0.20
+    band: 0.04
+    # no children -> agents pick the pairs and size them within 0.20
+
+  crypto:
+    set_by: user
+    weight: 0.15
+    band: 0.05
+    limits: { max_per_name: 0.075 }   # tighter single-name cap for crypto
+
+  cash:
+    set_by: user
+    weight: 0.15
+    band: 0.03
+
+
+# =============================================================================
+# day_trading — the intraday capability (long-only, US equities).
+# NOT part of `buckets` above: buckets are fractions of the total portfolio and
+# feed mandate_allocator.py, which never reads this block. The day-trading
+# sleeve is a fixed dollar amount in its OWN Alpaca paper account (separate API
+# keys — see daytrade_broker.py), so intraday churn can't pollute portfolio
+# positions or trigger wash-trade rejections against portfolio orders.
+# Every value below is a STARTING DEFAULT. Typos here are errors, not no-ops
+# (daytrade_config.py rejects unknown keys).
+# =============================================================================
+day_trading:
+  enabled: true
+  sleeve_capital: 25000          # dollars; sizing is cash-based, never margin buying power
+  long_only: true                # shorting is not implemented — false is rejected
+  run_unfiltered_shadow: true    # also simulate the no-LLM-playbook engine each day (ablation data)
+
+  universe:
+    min_price: 5.0
+    min_avg_volume: 1000000
+    max_watchlist: 30
+
+  limits:
+    max_positions: 5
+    risk_per_trade: 0.01         # 1% of sleeve risked (entry -> stop) per trade
+    max_position_pct: 0.20       # <= 20% of sleeve in one name
+    daily_loss_halt: 0.03        # -3% of sleeve on the day -> stop trading, flatten
+    max_trades_per_day: 20
+    min_stop_pct: 0.002
+    flatten_on_halt: true
+
+  session:                       # Eastern time
+    no_entry_first_minutes: 5
+    last_entry_et: "15:30"
+    flatten_et: "15:45"
+
+  costs:                         # applied to every backtest number (see daytrade_config.CostModel)
+    slippage_bps: 3.0
+    participation_cap: 0.10
+
+  strategies: [orb_long, vwap_pullback_long, gap_and_go_long]
+  params: {}                     # e.g. orb_long: { or_minutes: 15, rr: 2.0 }

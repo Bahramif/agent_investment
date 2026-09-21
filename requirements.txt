@@ -1,0 +1,10 @@
+flask
+gunicorn
+google-cloud-aiplatform[reasoningengine,agent-engines]
+google-cloud-secret-manager
+google-cloud-firestore
+alpaca-py
+yfinance
+scipy
+pyyaml
+tzdata

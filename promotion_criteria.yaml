@@ -1,0 +1,63 @@
+# =============================================================================
+# promotion_criteria.yaml
+# Champion / challenger promotion scorecard.
+#
+# Every threshold here is a SENSIBLE STARTING DEFAULT, not gospel. Good values
+# depend on the strategy, asset class, and trade frequency. Start strict and
+# loosen only with evidence. The structure matters more than the exact numbers.
+#
+# Hard gates are pass/fail VETOES: a challenger must pass ALL of them to be
+# eligible. Only survivors are ranked, and the top candidate must still clear
+# a margin over the champion before anything is promoted.
+# =============================================================================
+
+version: 1
+
+# --- Edge: is it actually more profitable, net of costs, out of sample? -------
+edge_gates:
+  min_sharpe_margin: 0.30           # challenger net OOS Sharpe >= champion + this
+  require_return_ge_champion: true  # net annualized return not worse than champion
+
+# --- Risk: no buying returns with hidden risk --------------------------------
+risk_gates:
+  max_drawdown_rel_tolerance: 0.10  # challenger MaxDD <= champion_MDD * (1 + this)
+  require_cvar_le_champion: true    # 95% tail loss no worse than champion
+  max_leverage: 2.0                 # absolute cap from the mandate
+  leverage_not_above_champion: true # unless the challenger sets an explicit override
+
+# --- Statistical validity: the anti-self-deception gates ---------------------
+statistical_gates:
+  min_trades: 150                   # too few trades => any Sharpe is noise
+  max_p_value: 0.05                 # significance of the champion-vs-challenger diff
+  require_positive_deflated_sharpe: true  # deflated for the NUMBER of challengers tried
+  distribution:                     # agents are stochastic -> judge many runs
+    require_median_beats_champion: true
+    low_percentile: 10
+    low_percentile_floor_vs_champion: 0.90  # 10th-pct run >= 90% of champion return
+
+# --- Robustness: works beyond one lucky period -------------------------------
+robustness_gates:
+  regime_worse_tolerance: 0.10      # "materially worse" = >10% below champion in a regime
+  min_walkforward_win_rate: 0.50    # positive in a majority of walk-forward folds
+  param_perturbation_pct: 0.10      # perturb params +/- 10% ...
+  max_perturbation_degradation: 0.25  # ... performance must not drop more than this
+
+# --- Cost & operational reality ----------------------------------------------
+cost_operational_gates:
+  costs_already_net: true           # metrics MUST be after fees/slippage/turnover
+  require_capacity_ok: true         # fills stay realistic at target capital
+  shadow_vs_sim_tolerance: 0.15     # live shadow result within 15% of sim result
+
+# --- Ranking among eligible challengers --------------------------------------
+ranking:
+  metric: deflated_sharpe           # rank survivors by this, higher is better
+
+# --- Governance: what may promote itself vs. what needs a human --------------
+# A change that stays inside ALL these bounds may auto-promote once it clears
+# the gates. Anything touching leverage, risk limits, or capital rules requires
+# human sign-off no matter how good the numbers look.
+governance:
+  auto_promote_requires:
+    leverage_unchanged: true
+    risk_limits_unchanged: true
+    capital_rules_unchanged: true

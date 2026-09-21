@@ -1,0 +1,16 @@
+# environment / build artefacts
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# local tooling state
+.claude/
+
+# never commit credentials
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
