@@ -93,3 +93,20 @@ day_trading:
 
   strategies: [orb_long, vwap_pullback_long, gap_and_go_long]
   params: {}                     # e.g. orb_long: { or_minutes: 15, rr: 2.0 }
+
+  # Failure-learning loop (daytrade_learning.py). Learned "lessons" can only
+  # SKIP a setup or SHRINK its size — never add trades, raise size, or touch the
+  # limits above — and each must pass an out-of-sample test before it can be used.
+  learning:
+    enabled: true
+    auto_activate: false         # validated lessons wait for a human (dashboard or CLI)
+    min_matched_trades: 30       # historical setups a rule must match to be judged at all
+    min_distinct_days: 10        # ...spread over at least this many days
+    max_p_value: 0.05            # before the multiple-testing correction, which only raises the bar
+    min_walkforward_win_rate: 0.5
+    max_opportunity_cost: 0.25   # a rule may discard at most 25% of all winning R
+    max_active_lessons: 10
+    min_combined_risk_mult: 0.25 # stacked size cuts never go below 25% of normal risk
+    lesson_ttl_days: 60          # active lessons with no live evidence by then expire
+    max_proposals_per_day: 3
+    post_exit_minutes: 30        # watch price after an exit (was the stop just noise?)

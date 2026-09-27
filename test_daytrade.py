@@ -292,4 +292,49 @@ if __name__ == "__main__":
     assert not w.fake.pos
     ok(f"flattened at {to_et(datetime.fromisoformat(t['exit_ts'])):%H:%M} ET on a 13:00 close")
 
+    print("SCENARIO N: learning — the day's journal is saved with real outcomes, THEN the post-close hook runs")
+    w = World(standard_bars(SLOW_UP + [TARGET_HIT]))
+    seen = []
+    deps = w.deps()
+    deps.post_close = lambda day: seen.append((day, len(w.store.get_journal(day))))
+    run_session(deps)
+    j = w.store.get_journal(DAY)
+    taken = [r for r in j if r["status"] == "taken"]
+    assert len(taken) == 1 and taken[0]["symbol"] == "AAA" and taken[0]["exit_reason"] == "target"
+    assert taken[0]["r_real"] > 1.5 and taken[0]["snapshot"]["strategy"] == "orb_long"
+    assert taken[0]["exit_virtual"] == "target", "the virtual outcome agrees with what the broker did"
+    assert seen == [(DAY, len(j))], "post_close runs once, after the journal exists"
+    assert w.session()["trades"][0]["snapshot"]["minutes_since_open"] == 17
+    ok(f"journal: {len(j)} record(s), AAA taken {taken[0]['r_real']:+.2f}R real / "
+       f"{taken[0]['r_virtual']:+.2f}R virtual; hook ran after the save")
+
+    print("SCENARIO O: an ACTIVE lesson on the live playbook skips the setup; the shadow still takes it")
+    from daytrade_learning import run_post_close
+    lesson = {"id": "Lorb", "status": "active", "activated": "2026-03-01", "when": {"strategy": {"==": "orb_long"}},
+              "action": {"type": "skip"}}
+    w = World(standard_bars(SLOW_UP + [TARGET_HIT]), playbook=Playbook(watchlist=list(SYMS), lessons=[lesson]))
+    w.store.save_lesson(lesson)
+    deps = w.deps()
+    deps.post_close = lambda day: run_post_close(w.store, w.cfg, day, use_llm=False)
+    res = run_session(deps)
+    s = w.session()
+    assert res["status"] == "completed" and not w.fake.submitted and s["trades"] == []
+    assert s["shadow"]["entries"] == 1 and s["shadow"]["pnl"] > 0, "the no-playbook baseline is untouched by lessons"
+    ghost = [r for r in w.store.get_journal(DAY) if r["status"] == "filtered_lesson"]
+    assert len(ghost) == 1 and ghost[0]["lesson_ids"] == ["Lorb"] and ghost[0]["r_virtual"] > 1.5
+    stored = w.store.list_lessons()[0]
+    assert stored["live"]["n"] == 1 and stored["live"]["sum_r"] > 1.5, "the lesson's live record shows what it cost"
+    assert s["attribution"]["filters"]["filtered_lesson"]["verdict"] == "cost"
+    ok(f"no order; the skipped breakout would have made {ghost[0]['r_virtual']:+.2f}R — charged to lesson Lorb")
+
+    print("SCENARIO P: a failing learning hook cannot change how the day ended")
+    w = World(standard_bars(SLOW_UP + [TARGET_HIT]))
+    deps = w.deps()
+    def boom(day):
+        raise RuntimeError("learning exploded")
+    deps.post_close = boom
+    res = run_session(deps)
+    assert res["status"] == "completed" and w.session()["status"] == "completed" and len(w.session()["trades"]) == 1
+    ok("hook raised; session still completed with its trade recorded")
+
     print("\nAll day-trading integration scenarios passed.")

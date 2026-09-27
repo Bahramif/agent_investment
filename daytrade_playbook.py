@@ -31,6 +31,12 @@ configured strategies) — the model being unavailable must not stop the day,
 and must not be able to loosen anything either. The result records which
 path was taken (`source`) so the ablation in the dashboard can separate them.
 
+MEMORY. The prompt can carry a few lines of cross-day memory from the
+failure-learning loop (daytrade_learning.memory_lines): recent attribution
+and the learned rules the engine already enforces. Those rules ride on the
+playbook (`lessons`) but are attached by the planner, never by the model —
+the model cannot add, drop or edit one.
+
 WHETHER THE LLM EARNS ITS PLACE is an empirical question, not an assumption:
 the runner simulates the same day with NO playbook (the "shadow") and stores
 both, so paper results show directly whether this step helped. If it does
@@ -121,6 +127,12 @@ def build_candidates(daily: Dict[str, List[Bar]], min_price: float, min_avg_volu
     return sorted(out, key=lambda c: (-c.score, c.symbol))
 
 
+def snapshot_market(market: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """The market_read() subset the engine's entry snapshots use."""
+    spy = market.get("SPY") or {}
+    return {k: spy[src] for k, src in (("spy_prev_change", "prev_change"), ("spy_mom_5d", "mom_5d")) if src in spy}
+
+
 def market_read(daily: Dict[str, List[Bar]], benchmarks: Sequence[str] = ("SPY", "QQQ")) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for sym in benchmarks:
@@ -174,7 +186,7 @@ def clamp_playbook(raw: Dict[str, Any], candidates: Sequence[Candidate], cfg: Da
 
 
 def build_prompt(candidates: Sequence[Candidate], market: Dict[str, Dict[str, float]], day: date,
-                 cfg: DayTradingConfig) -> str:
+                 cfg: DayTradingConfig, memory: Sequence[str] = ()) -> str:
     lines = [f"Date: {day.isoformat()} (pre-market). You are setting the playbook for a LONG-ONLY intraday "
              f"engine that trades opening-range breakouts, VWAP pullbacks and gap-and-go continuations, "
              f"flat by {cfg.session.flatten_et:%H:%M} ET.",
@@ -190,6 +202,9 @@ def build_prompt(candidates: Sequence[Candidate], market: Dict[str, Dict[str, fl
         heads = " ; ".join(h[:110] for h in c.headlines[:2]) or "-"
         lines.append(f"  {c.symbol} | {c.price:.2f} | {c.atr_pct:.1%} | {c.prev_change:+.1%} | "
                      f"{c.mom_5d:+.1%} | {c.rel_volume:.1f}x | {heads}")
+    if memory:
+        lines += ["", "Recent sessions (from the engine's own journal; R = multiples of per-trade risk):"]
+        lines += [f"  {m[:400]}" for m in list(memory)[:8]]
     lines += ["", "Call the set_playbook tool."]
     return "\n".join(lines)
 
@@ -206,7 +221,8 @@ def call_claude(client: Any, prompt: str, model: str = PLAYBOOK_MODEL) -> Dict[s
 
 
 def make_playbook(candidates: Sequence[Candidate], market: Dict[str, Dict[str, float]], day: date,
-                  cfg: DayTradingConfig, client: Any = None, use_llm: bool = True) -> Playbook:
+                  cfg: DayTradingConfig, client: Any = None, use_llm: bool = True,
+                  memory: Sequence[str] = ()) -> Playbook:
     """Never raises: any failure degrades to the deterministic playbook."""
     shortlist = list(candidates[: cfg.universe.max_watchlist * 2])
     if not shortlist:
@@ -219,7 +235,7 @@ def make_playbook(candidates: Sequence[Candidate], market: Dict[str, Dict[str, f
         if client is None:
             from claude_reasoning import _client
             client = _client()
-        raw = call_claude(client, build_prompt(shortlist, market, day, cfg))
+        raw = call_claude(client, build_prompt(shortlist, market, day, cfg, memory))
         pb = clamp_playbook(raw, shortlist, cfg)
         pb.source = "claude"                            # type: ignore[attr-defined]
         return pb
@@ -233,13 +249,13 @@ def make_playbook(candidates: Sequence[Candidate], market: Dict[str, Dict[str, f
 def playbook_to_dict(pb: Playbook) -> Dict[str, Any]:
     return {"risk_on": pb.risk_on, "enabled_strategies": pb.enabled_strategies, "watchlist": pb.watchlist,
             "risk_multiplier": pb.risk_multiplier, "rationale": pb.rationale,
-            "source": getattr(pb, "source", "deterministic")}
+            "source": getattr(pb, "source", "deterministic"), "lessons": pb.lessons}
 
 
 def playbook_from_dict(d: Dict[str, Any]) -> Playbook:
     pb = Playbook(risk_on=d.get("risk_on", True), enabled_strategies=d.get("enabled_strategies"),
                   watchlist=d.get("watchlist"), risk_multiplier=d.get("risk_multiplier", 1.0),
-                  rationale=d.get("rationale", ""))
+                  rationale=d.get("rationale", ""), lessons=d.get("lessons"))
     pb.source = d.get("source", "deterministic")        # type: ignore[attr-defined]
     return pb
 
@@ -353,10 +369,21 @@ if __name__ == "__main__":
     assert none.risk_on is False and none.watchlist == []
     print("✓ ok")
 
-    print("TEST 9: playbook round-trips through the store's dict form")
+    print("TEST 9: playbook round-trips through the store's dict form (lessons included)")
     pb = clamp_playbook(raw, cands, cfg); pb.source = "claude"
+    pb.lessons = [{"id": "L1", "when": {"gap_pct": {">": 0.04}}, "action": {"type": "skip"}}]
     back = playbook_from_dict(playbook_to_dict(pb))
-    assert (back.risk_on, back.watchlist, back.risk_multiplier, back.enabled_strategies) == \
-           (pb.risk_on, pb.watchlist, pb.risk_multiplier, pb.enabled_strategies) and back.source == "claude"
+    assert (back.risk_on, back.watchlist, back.risk_multiplier, back.enabled_strategies, back.lessons) == \
+           (pb.risk_on, pb.watchlist, pb.risk_multiplier, pb.enabled_strategies, pb.lessons) and back.source == "claude"
+    assert clamp_playbook({**raw, "lessons": [{"id": "EVIL"}]}, cands, cfg).lessons is None, \
+        "the model cannot attach lessons — only the planner can"
+    print("✓ ok")
+
+    print("TEST 10: memory lines reach the prompt; SPY read maps to snapshot features")
+    fc = FakeClient({"risk_on": True, "watchlist": ["HOT"], "rationale": "x"})
+    make_playbook(cands, mk, day, cfg, client=fc, memory=["2026-03-03: 4 trades, -2.0R; failures: false_breakout x3"])
+    assert "false_breakout x3" in fc.calls[0]["messages"][0]["content"]
+    sm = snapshot_market(mk)
+    assert set(sm) == {"spy_prev_change", "spy_mom_5d"} and snapshot_market({}) == {}
     print("✓ ok")
     print("\nAll daytrade_playbook tests passed.")

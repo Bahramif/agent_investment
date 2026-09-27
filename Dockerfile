@@ -20,6 +20,10 @@ COPY daytrade_config.py intraday_data.py daytrade_strategies.py daytrade_risk.py
      daytrade_engine.py daytrade_backtest.py daytrade_broker.py daytrade_store.py \
      daytrade_playbook.py daytrade_runner.py daytrade_ui.py promotion_gate.py \
      mandate.yaml ./
+# Failure-learning loop: imported by the engine (journal, lessons), the runner's
+# post-close hook and the dashboard's Learning page.
+COPY daytrade_journal.py daytrade_lessons.py daytrade_attribution.py daytrade_reflection.py \
+     daytrade_learning.py ./
 
 ENV PORT=8080
 EXPOSE 8080
