@@ -15,6 +15,14 @@ Routes
   POST /daytrade/halt            kill switch ON   — open to anyone with page access
   POST /daytrade/resume          kill switch OFF  — requires the shared token
   GET  /daytrade/api/status      JSON for monitoring
+  GET  /daytrade/learning        the failure-learning loop: lessons by status with their
+                                 out-of-sample evidence and live record, failure-tag totals
+  POST /daytrade/lessons/<id>/activate   validated -> active   — requires the shared token
+  POST /daytrade/lessons/<id>/retire     active/validated -> retired — requires the shared token
+
+WHY LESSON CHANGES NEED THE TOKEN. A lesson can only restrict, but switching
+one on or off still changes what the engine does tomorrow, so both go
+through the same gate as resuming trading.
 
 WHY HALT IS OPEN BUT RESUME IS NOT. The rest of this app is deliberately
 public (web_ui.py says so). Halting can only REDUCE risk, so leaving it open
@@ -34,12 +42,15 @@ is rendered through Jinja autoescape — it is untrusted input. Tested.
 from __future__ import annotations
 
 import hmac
+from urllib.parse import urlencode
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from flask import Blueprint, jsonify, redirect, render_template_string, request
 
+from daytrade_attribution import tag_totals
 from daytrade_config import DayTradingConfig
+from daytrade_learning import activate_lesson, load_lessons, retire_lesson
 from daytrade_store import DayTradeStore, summarize_sessions
 from intraday_data import ET, session_date
 
@@ -153,6 +164,11 @@ DASHBOARD = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     {% else %}<tr><td colspan="5" class="muted">No sessions yet.</td></tr>{% endfor %}
   </table></div>
 
+  <h2>Learning</h2>
+  <div class="info">The engine journals every setup it sees — taken or not — and learns restrict-only rules from
+    repeated failures, each tested out of sample before it can be switched on.
+    <a href="/daytrade/learning">Lessons and failure analysis →</a></div>
+
   <h2>Limits in force</h2>
   <div class="info">{{ cfg.limits.max_positions }} positions max · {{ '%.1f'|format(cfg.limits.risk_per_trade*100) }}% risk/trade ·
     {{ '%.0f'|format(cfg.limits.max_position_pct*100) }}% max per name · halt at −{{ '%.0f'|format(cfg.limits.daily_loss_halt*100) }}% on the day ·
@@ -190,12 +206,82 @@ SESSION_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   </table></div>
   {% if s.open_positions %}<h2>Open at last update</h2><div class="info">
     {% for p in s.open_positions %}{{ p.symbol }} {{ p.qty|int }} @ {{ '{:,.2f}'.format(p.entry_price) }} (stop {{ p.stop }}, target {{ p.target }})<br>{% endfor %}</div>{% endif %}
+  {% if s.attribution %}<h2>Why trades won or lost</h2>
+    {% set a = s.attribution %}
+    <div class="table-wrap"><table>
+      <tr><th>Tag (taken trades)</th><th>Trades</th><th>Sum R</th></tr>
+      {% for tag, v in (a.by_tag or {}).items()|sort %}<tr><td>{{ tag }}</td><td>{{ v.n }}</td><td>{{ '{:+.2f}'.format(v.sum_r) }}</td></tr>
+      {% else %}<tr><td colspan="3" class="muted">No trades to attribute.</td></tr>{% endfor %}
+    </table></div>
+    {% if a.filters %}<h2>What each restriction did <span class="muted">(outcomes of setups NOT taken)</span></h2>
+    <div class="table-wrap"><table>
+      <tr><th>Stopped by</th><th>Setups</th><th>Their R</th><th>Verdict</th></tr>
+      {% for k, v in a.filters.items()|sort %}<tr><td>{{ k }}</td><td>{{ v.n }}</td><td>{{ '{:+.2f}'.format(v.sum_r) }}</td>
+        <td><span class="{{ 'pos' if v.verdict == 'saved' else 'neg' if v.verdict == 'cost' else '' }}">{{ v.verdict }}</span></td></tr>{% endfor %}
+    </table></div>{% endif %}
+  {% endif %}
+  {% if s.learning %}<div class="info"><b>Post-close reflection</b> ({{ s.learning.source }}): {{ s.learning.summary }}
+    {% if s.learning.validated %}<br>Validated: {% for v in s.learning.validated %}{{ v.rule }}{{ '; ' if not loop.last }}{% endfor %}{% endif %}
+    {% if s.learning.rejected %}<br><span class="muted">Rejected {{ s.learning.rejected|length }} proposal(s) — see the Learning page.</span>{% endif %}
+    {% if s.learning.error %}<br><span class="muted">Model unavailable: {{ s.learning.error }}</span>{% endif %}</div>{% endif %}
+  {% if s.retired_lessons %}<div class="warn">Retired today: {% for r in s.retired_lessons %}{{ r.rule }} — {{ r.why }}{{ '; ' if not loop.last }}{% endfor %}</div>{% endif %}
   <h2>Decision &amp; event log</h2><div class="table-wrap"><table>
     <tr><th>Time (ET)</th><th>Kind</th><th>Symbol</th><th>Detail</th></tr>
     {% for e in s.events or [] %}<tr><td>{{ t_et(e.ts) }}</td><td>{{ e.kind }}</td><td>{{ e.symbol or '' }}</td>
       <td style="white-space:normal">{{ detail(e) }}</td></tr>
     {% else %}<tr><td colspan="4" class="muted">No events.</td></tr>{% endfor %}
   </table></div>
+</body></html>"""
+
+
+LEARNING_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Day Trading — Learning</title>""" + PAGE_CSS + """</head>
+<body>
+""" + _MACROS + """
+  <h1>⚡ What the day-trading engine has learned</h1>
+  <div class="paper-banner">📝 Alpaca PAPER account — not real money.</div>
+  <p><a href="/daytrade">← back to Day Trading</a></p>
+  {% if flash %}<div class="info">{{ flash }}</div>{% endif %}
+  <div class="info">Lessons are rules over the entry features that can only <b>skip</b> a setup or <b>shrink</b> its size.
+    A proposal (from Claude or the deterministic miner) must pass an out-of-sample test — at least
+    {{ lc.min_matched_trades }} matching setups over {{ lc.min_distinct_days }} days, a significant loss after correcting for
+    all {{ trials }} proposals so far, consistency over time, and ≤ {{ '%.0f'|format(lc.max_opportunity_cost*100) }}% of winning R
+    thrown away. {{ 'Validated lessons switch on automatically.' if lc.auto_activate else 'A validated lesson waits for you to activate it.' }}
+    Active lessons retire themselves if the trades they stop turn out to be winners.</div>
+
+  {% for status, title in (('active', 'Active — enforced by the engine'), ('validated', 'Validated — awaiting activation'),
+                            ('proposed', 'Proposed'), ('rejected', 'Rejected'), ('retired', 'Retired')) %}
+  {% set group = by_status.get(status, []) %}
+  {% if group or status in ('active', 'validated') %}
+  <h2>{{ title }} <span class="muted">({{ group|length }})</span></h2>
+  <div class="table-wrap"><table>
+    <tr><th>Rule</th><th>Out-of-sample</th><th>Live (trades it acted on)</th><th>Source</th><th></th></tr>
+    {% for l in group %}{% set v = l.validation or {} %}<tr>
+      <td style="white-space:normal"><b>{{ l.describe() }}</b><br><span class="muted">{{ l.id }} · {{ l.hypothesis }}</span>
+        {% if l.history %}<br><span class="muted">{{ l.history[-1].day }}: {{ l.history[-1].why }}</span>{% endif %}</td>
+      <td>{% if v %}n={{ v.n }} · {{ '{:+.2f}'.format(v.mean_r) }}R<br>z {{ '%.2f'|format(v.z) }} / {{ '%.2f'|format(v.z_required) }} ·
+        folds {{ v.fold_wins }}/{{ v.folds }}{% else %}—{% endif %}</td>
+      <td>{{ l.live.n or 0 }} · {{ '{:+.2f}'.format(l.live.sum_r or 0) }}R</td>
+      <td>{{ l.source }}</td>
+      <td>{% if status in ('validated', 'active') %}
+        <form class="inline" method="post" action="/daytrade/lessons/{{ l.id }}/{{ 'activate' if status == 'validated' else 'retire' }}">
+          {% if token_required %}<input type="password" name="token" placeholder="token" required>{% endif %}
+          <button class="{{ 'btn-resume' if status == 'validated' else 'btn-halt' }}">{{ 'Activate' if status == 'validated' else 'Retire' }}</button>
+        </form>{% endif %}</td></tr>
+    {% else %}<tr><td colspan="5" class="muted">None.</td></tr>{% endfor %}
+  </table></div>
+  {% endif %}
+  {% endfor %}
+
+  <h2>Failure tags on taken trades <span class="muted">(journal, all sources)</span></h2>
+  <div class="table-wrap"><table>
+    <tr><th>Tag</th><th>Trades</th><th>Sum R</th><th>Win rate</th></tr>
+    {% for tag, v in tags|dictsort %}<tr><td>{{ tag }}</td><td>{{ v.n }}</td><td>{{ '{:+.2f}'.format(v.sum_r) }}</td>
+      <td>{{ '{:.0%}'.format(v.wins / v.n) if v.n else '—' }}</td></tr>
+    {% else %}<tr><td colspan="4" class="muted">No journaled trades yet. Run a backtest with --save-journal to seed history.</td></tr>{% endfor %}
+  </table></div>
+  <div class="meta">{{ trials }} lesson proposals tested so far · max {{ lc.max_active_lessons }} active ·
+    stacked size cuts never below {{ '%.0f'|format(lc.min_combined_risk_mult*100) }}% · CLI: python daytrade_learning.py list</div>
 </body></html>"""
 
 
@@ -258,14 +344,43 @@ def make_daytrade_blueprint(
         store_fn().set_halted(True, reason, by="dashboard")
         return redirect("/daytrade?msg=Trading+halted.")
 
-    @bp.route("/daytrade/resume", methods=["POST"])
-    def resume():
+    def _authorized() -> bool:
         expected = token_fn()
         supplied = request.form.get("token") or request.headers.get("X-Daytrade-Token") or ""
-        if expected and not hmac.compare_digest(supplied.encode(), expected.encode()):
+        return not expected or hmac.compare_digest(supplied.encode(), expected.encode())
+
+    @bp.route("/daytrade/resume", methods=["POST"])
+    def resume():
+        if not _authorized():
             return ("unauthorized — resuming trading requires the token", 403)
-        store_fn().set_halted(False, "resumed", by="token" if expected else "dashboard")
+        store_fn().set_halted(False, "resumed", by="token" if token_fn() else "dashboard")
         return redirect("/daytrade?msg=Trading+resumed.")
+
+    @bp.route("/daytrade/learning")
+    def learning():
+        store, cfg = store_fn(), config_fn()
+        by_status: Dict[str, List[Any]] = {}
+        for l in load_lessons(store):
+            by_status.setdefault(l.status, []).append(l)
+        try:
+            tags = tag_totals(store.list_journal())
+        except Exception:
+            tags = {}
+        return render(LEARNING_PAGE, by_status=by_status, lc=cfg.learning, trials=store.get_trials(), tags=tags,
+                      token_required=bool(token_fn()), flash=request.args.get("msg"))
+
+    @bp.route("/daytrade/lessons/<lesson_id>/<action>", methods=["POST"])
+    def lesson_action(lesson_id: str, action: str):
+        if action not in ("activate", "retire"):
+            return "unknown action", 404
+        if not _authorized():
+            return ("unauthorized — changing lessons requires the token", 403)
+        by = "token" if token_fn() else "dashboard"
+        store = store_fn()
+        err = (activate_lesson(store, config_fn(), lesson_id, by, today_fn()) if action == "activate"
+               else retire_lesson(store, lesson_id, by, "retired from the dashboard", today_fn()))
+        msg = err or f"Lesson {lesson_id} {'activated' if action == 'activate' else 'retired'}."
+        return redirect("/daytrade/learning?" + urlencode({"msg": msg}))
 
     @bp.route("/daytrade/api/status")
     def api_status():
@@ -375,4 +490,39 @@ if __name__ == "__main__":
     r = empty.test_client().get("/daytrade")
     assert r.status_code == 200 and "No session recorded yet today" in r.get_data(as_text=True)
     print("✓ ok")
+
+    print("TEST 9: session page shows attribution and the post-close reflection, escaped")
+    store.save_session(today, {"attribution": {"taken": {"n": 1, "sum_r": 1.9, "wins": 1},
+                                               "by_tag": {"win": {"n": 1, "sum_r": 1.9, "wins": 1}},
+                                               "filters": {"off_watchlist": {"n": 2, "sum_r": -1.5, "wins": 0, "verdict": "saved"}}},
+                               "learning": {"source": "claude", "summary": "<b>gaps</b> faded", "validated": [], "rejected": [{}]}})
+    d = c.get("/daytrade/sessions/2026-03-04").get_data(as_text=True)
+    assert "Why trades won or lost" in d and "off_watchlist" in d and "saved" in d and "&lt;b&gt;gaps" in d
+    print("✓ ok")
+
+    print("TEST 10: learning page lists lessons by status; activate/retire need the token and respect the rules")
+    from daytrade_lessons import parse_lesson
+    L = parse_lesson({"when": {"strategy": {"==": "orb_long"}, "gap_pct": {">=": 0.04}}, "action": {"type": "skip"},
+                      "hypothesis": "<script>x</script>"}, 0.25, source="claude")
+    L.set_status("validated", "2026-03-04", "passed")
+    L.validation = {"n": 40, "mean_r": -0.6, "z": 3.1, "z_required": 1.9, "fold_wins": 3, "folds": 4}
+    R = parse_lesson({"when": {"rel_volume": {">": 9}}, "action": {"type": "skip"}}, 0.25)
+    R.set_status("rejected", "2026-03-04", "only 3 matching trades")
+    store.save_lesson(L.to_dict()); store.save_lesson(R.to_dict())
+    store.save_journal(today, [{"status": "taken", "r_real": -1.0, "exit_reason": "stop", "mfe_r": 0.1,
+                                "strategy": "orb_long", "snapshot": {}}])
+    page = c.get("/daytrade/learning").get_data(as_text=True)
+    assert "Validated — awaiting activation" in page and "gap_pct &gt;= 0.04" in page and "Rejected" in page
+    assert "false_breakout" in page and "<script>x" not in page and "Activate" in page
+    url = f"/daytrade/lessons/{L.id}/activate"
+    assert c.post(url, data={}).status_code == 403 and store.list_lessons()[0]["status"] != "active"
+    r = c.post(url, data={"token": "s3cret"})
+    assert r.status_code == 302 and "activated" in r.headers["Location"]
+    assert {x["id"]: x["status"] for x in store.list_lessons()}[L.id] == "active"
+    r = c.post(f"/daytrade/lessons/{R.id}/activate", data={"token": "s3cret"})
+    assert "only+a+validated" in r.headers["Location"] and {x["id"]: x["status"] for x in store.list_lessons()}[R.id] == "rejected"
+    assert c.post(f"/daytrade/lessons/{L.id}/delete", data={"token": "s3cret"}).status_code == 404
+    assert c.post(f"/daytrade/lessons/{L.id}/retire", data={"token": "s3cret"}).status_code == 302
+    assert {x["id"]: x["status"] for x in store.list_lessons()}[L.id] == "retired"
+    print("✓ 403 without token; validated -> active -> retired with it; a rejected lesson can't be activated")
     print("\nAll daytrade_ui tests passed.")
