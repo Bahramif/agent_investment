@@ -7,6 +7,10 @@ here can touch or be mistaken for a portfolio ledger:
 
   meridian_daytrade_sessions/{YYYY-MM-DD}   one document per trading day
   meridian_daytrade_control/state           the kill switch
+  meridian_daytrade_journal/{source}-{date} the learning journal: every journaled signal of a day
+                                            (source "live" from the runner, "backtest" from the harness)
+  meridian_daytrade_lessons/{lesson id}     learned lessons, with validation, live record and audit trail
+  meridian_daytrade_control/learning        the global lesson-trial counter (multiple-testing correction)
 
 The session document is what makes the runner restartable: after a crash,
 the new process reads today's document to learn which names were already
@@ -33,6 +37,8 @@ from daytrade_engine import Trade
 
 _SESSIONS = "meridian_daytrade_sessions"
 _CONTROL = "meridian_daytrade_control"
+_JOURNAL = "meridian_daytrade_journal"
+_LESSONS = "meridian_daytrade_lessons"
 MAX_EVENTS = 200
 
 
@@ -44,13 +50,15 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
     return {"symbol": t.symbol, "strategy": t.strategy, "qty": t.qty, "entry_price": t.entry_price,
             "exit_price": t.exit_price, "entry_ts": t.entry_ts.isoformat(), "exit_ts": t.exit_ts.isoformat(),
             "pnl": round(t.pnl, 4), "fees": round(t.fees, 4), "reason": t.reason,
-            "r_multiple": round(t.r_multiple, 4)}
+            "r_multiple": round(t.r_multiple, 4), "snapshot": dict(t.snapshot), "mae_r": round(t.mae_r, 4),
+            "mfe_r": round(t.mfe_r, 4), "entry_ref": t.entry_ref}
 
 
 def trade_from_dict(d: Dict[str, Any]) -> Trade:
     return Trade(d["symbol"], d["strategy"], d["qty"], d["entry_price"], d["exit_price"],
                  datetime.fromisoformat(d["entry_ts"]), datetime.fromisoformat(d["exit_ts"]),
-                 d["pnl"], d.get("fees", 0.0), d.get("reason", ""), d.get("r_multiple", 0.0))
+                 d["pnl"], d.get("fees", 0.0), d.get("reason", ""), d.get("r_multiple", 0.0),
+                 dict(d.get("snapshot") or {}), d.get("mae_r", 0.0), d.get("mfe_r", 0.0), d.get("entry_ref", 0.0))
 
 
 class DayTradeStore(Protocol):
@@ -60,6 +68,31 @@ class DayTradeStore(Protocol):
     def save_session(self, day: date, patch: Dict[str, Any]) -> None: ...
     def append_events(self, day: date, events: List[Dict[str, Any]]) -> None: ...
     def list_sessions(self, limit: int = 30) -> List[Dict[str, Any]]: ...
+    # learning loop
+    def save_journal(self, day: date, records: List[Dict[str, Any]], source: str = "live") -> None: ...
+    def get_journal(self, day: date, source: str = "live") -> List[Dict[str, Any]]: ...
+    def list_journal(self, source: Optional[str] = None, since: Optional[date] = None) -> List[Dict[str, Any]]: ...
+    def list_lessons(self) -> List[Dict[str, Any]]: ...
+    def save_lesson(self, lesson: Dict[str, Any]) -> None: ...
+    def get_trials(self) -> int: ...
+    def bump_trials(self, n: int) -> int: ...
+
+
+def _journal_id(day: date, source: str) -> str:
+    if source not in ("live", "backtest"):
+        raise ValueError(f"journal source must be 'live' or 'backtest', got {source!r}")
+    return f"{source}-{day.isoformat()}"
+
+
+def _flatten_journal(docs: List[Dict[str, Any]], source: Optional[str], since: Optional[date]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for d in sorted(docs, key=lambda x: (x.get("date", ""), x.get("source", ""))):
+        if source and d.get("source") != source:
+            continue
+        if since and d.get("date", "") < since.isoformat():
+            continue
+        out += [{**r, "source": d.get("source")} for r in d.get("records", [])]
+    return out
 
 
 def _default_control() -> Dict[str, Any]:
@@ -70,6 +103,9 @@ class InMemoryDayTradeStore:
     def __init__(self) -> None:
         self._control = _default_control()
         self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._journal: Dict[str, Dict[str, Any]] = {}
+        self._lessons: Dict[str, Dict[str, Any]] = {}
+        self._trials = 0
 
     def get_control(self) -> Dict[str, Any]:
         return dict(self._control)
@@ -94,6 +130,29 @@ class InMemoryDayTradeStore:
 
     def list_sessions(self, limit: int = 30) -> List[Dict[str, Any]]:
         return [copy.deepcopy(self._sessions[k]) for k in sorted(self._sessions, reverse=True)[:limit]]
+
+    def save_journal(self, day: date, records: List[Dict[str, Any]], source: str = "live") -> None:
+        self._journal[_journal_id(day, source)] = {"date": day.isoformat(), "source": source,
+                                                   "records": copy.deepcopy(records)}
+
+    def get_journal(self, day: date, source: str = "live") -> List[Dict[str, Any]]:
+        return copy.deepcopy(self._journal.get(_journal_id(day, source), {}).get("records", []))
+
+    def list_journal(self, source: Optional[str] = None, since: Optional[date] = None) -> List[Dict[str, Any]]:
+        return copy.deepcopy(_flatten_journal(list(self._journal.values()), source, since))
+
+    def list_lessons(self) -> List[Dict[str, Any]]:
+        return [copy.deepcopy(v) for _, v in sorted(self._lessons.items())]
+
+    def save_lesson(self, lesson: Dict[str, Any]) -> None:
+        self._lessons[lesson["id"]] = copy.deepcopy(lesson)
+
+    def get_trials(self) -> int:
+        return self._trials
+
+    def bump_trials(self, n: int) -> int:
+        self._trials += max(0, int(n))
+        return self._trials
 
 
 class FirestoreDayTradeStore:
@@ -134,6 +193,41 @@ class FirestoreDayTradeStore:
         from google.cloud import firestore
         q = self._db.collection(_SESSIONS).order_by("date", direction=firestore.Query.DESCENDING).limit(limit)
         return [s.to_dict() for s in q.stream()]
+
+    # One document per (source, day): a day's journal is a few dozen records,
+    # far under Firestore's 1 MiB document limit, and a whole backtest is one
+    # document per simulated day.
+    def save_journal(self, day: date, records: List[Dict[str, Any]], source: str = "live") -> None:
+        self._db.collection(_JOURNAL).document(_journal_id(day, source)).set(
+            {"date": day.isoformat(), "source": source, "records": records, "updated_at": _now().isoformat()})
+
+    def get_journal(self, day: date, source: str = "live") -> List[Dict[str, Any]]:
+        snap = self._db.collection(_JOURNAL).document(_journal_id(day, source)).get()
+        return (snap.to_dict() or {}).get("records", []) if snap.exists else []
+
+    def list_journal(self, source: Optional[str] = None, since: Optional[date] = None) -> List[Dict[str, Any]]:
+        return _flatten_journal([s.to_dict() for s in self._db.collection(_JOURNAL).stream()], source, since)
+
+    def list_lessons(self) -> List[Dict[str, Any]]:
+        return sorted((s.to_dict() for s in self._db.collection(_LESSONS).stream()), key=lambda d: d.get("id", ""))
+
+    def save_lesson(self, lesson: Dict[str, Any]) -> None:
+        self._db.collection(_LESSONS).document(lesson["id"]).set(lesson)
+
+    def _learning(self):
+        return self._db.collection(_CONTROL).document("learning")
+
+    def get_trials(self) -> int:
+        snap = self._learning().get()
+        return int((snap.to_dict() or {}).get("n_trials", 0)) if snap.exists else 0
+
+    def bump_trials(self, n: int) -> int:
+        """Read-modify-write, not a transaction: the post-close learning job is
+        the only writer. The counter only ever grows, which is the safe
+        direction for a multiple-testing correction."""
+        total = self.get_trials() + max(0, int(n))
+        self._learning().set({"n_trials": total, "updated_at": _now().isoformat()}, merge=True)
+        return total
 
 
 def default_store() -> DayTradeStore:
@@ -208,7 +302,8 @@ if __name__ == "__main__":
 
     day = date(2026, 3, 4)
     t0 = datetime(2026, 3, 4, 14, 48, tzinfo=timezone.utc)
-    trade = Trade("AAA", "orb_long", 49, 100.62, 101.8, t0, t0 + timedelta(minutes=40), 57.5, 0.2, "target", 1.9)
+    trade = Trade("AAA", "orb_long", 49, 100.62, 101.8, t0, t0 + timedelta(minutes=40), 57.5, 0.2, "target", 1.9,
+                  {"strategy": "orb_long", "gap_pct": 0.031}, -0.4, 2.1, 100.6)
 
     def suite(name, store):
         print(f"--- {name} ---")
@@ -243,6 +338,32 @@ if __name__ == "__main__":
         got = store.list_sessions(limit=3)
         assert [g["date"] for g in got] == ["2026-03-04", "2026-03-03", "2026-03-02"]
         print("✓ 03-04, 03-03, 03-02")
+
+        print("TEST 5: journal per (source, day), flattened oldest-first with filters")
+        store.save_journal(day, [{"symbol": "AAA", "r_virtual": 1.0}], source="live")
+        store.save_journal(day - timedelta(days=1), [{"symbol": "BBB", "r_virtual": -1.0}], source="backtest")
+        store.save_journal(day, [{"symbol": "AAA", "r_virtual": 2.0}], source="live")      # overwrite, not append
+        assert store.get_journal(day) == [{"symbol": "AAA", "r_virtual": 2.0}]
+        assert store.get_journal(day, "backtest") == []
+        allj = store.list_journal()
+        assert [(r["symbol"], r["source"]) for r in allj] == [("BBB", "backtest"), ("AAA", "live")]
+        assert [r["symbol"] for r in store.list_journal(source="live")] == ["AAA"]
+        assert store.list_journal(since=day) == [{"symbol": "AAA", "r_virtual": 2.0, "source": "live"}]
+        try:
+            store.save_journal(day, [], source="paper-ish")
+            raise AssertionError("should have raised")
+        except ValueError:
+            pass
+        print("✓ ok")
+
+        print("TEST 6: lessons upsert by id; the trial counter only grows")
+        store.save_lesson({"id": "L2", "status": "proposed"})
+        store.save_lesson({"id": "L1", "status": "proposed"})
+        store.save_lesson({"id": "L2", "status": "validated"})
+        assert [(l["id"], l["status"]) for l in store.list_lessons()] == [("L1", "proposed"), ("L2", "validated")]
+        assert store.get_trials() == 0 and store.bump_trials(3) == 3 and store.bump_trials(-5) == 3
+        assert store.get_trials() == 3
+        print("✓ ok")
 
     suite("InMemoryDayTradeStore", InMemoryDayTradeStore())
     fake = FakeFirestoreClient()

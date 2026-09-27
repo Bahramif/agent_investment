@@ -88,6 +88,26 @@ class UniverseRules:
 
 
 @dataclass
+class LearningConfig:
+    """The failure-learning loop (daytrade_journal / _attribution / _lessons /
+    _reflection / _learning). Learned rules can only RESTRICT — skip a setup or
+    shrink its size — and every one must pass a statistical gate on history
+    it was not derived from. Nothing here can reach daytrade_risk's limits."""
+    enabled: bool = True
+    auto_activate: bool = False          # validated lessons wait for a human by default
+    min_matched_trades: int = 30         # a rule needs this many historical matches to be judged at all
+    min_distinct_days: int = 10          # ...spread over this many days (not one bad afternoon)
+    max_p_value: float = 0.05            # before the multiple-testing correction, which only raises the bar
+    min_walkforward_win_rate: float = 0.5
+    max_opportunity_cost: float = 0.25   # share of all winning R a rule may throw away
+    max_active_lessons: int = 10
+    min_combined_risk_mult: float = 0.25 # stacked risk_mult lessons can't shrink a trade below this
+    lesson_ttl_days: int = 60            # active lessons with no live evidence by then expire
+    max_proposals_per_day: int = 3
+    post_exit_minutes: int = 30          # how long to watch price after an exit (was the stop just noise?)
+
+
+@dataclass
 class DayTradingConfig:
     enabled: bool = True
     sleeve_capital: float = 25_000.0
@@ -99,6 +119,7 @@ class DayTradingConfig:
     strategies: List[str] = field(default_factory=lambda: list(KNOWN_STRATEGIES))
     params: Dict[str, Dict[str, float]] = field(default_factory=dict)   # per-strategy overrides
     run_unfiltered_shadow: bool = True   # runner also simulates the no-playbook engine, for the LLM ablation
+    learning: LearningConfig = field(default_factory=LearningConfig)
 
 
 def _fill(dc_cls, raw: Optional[Dict[str, Any]], name: str):
@@ -123,13 +144,14 @@ def config_from_dict(raw: Optional[Dict[str, Any]]) -> DayTradingConfig:
     limits = _fill(RiskLimits, raw.pop("limits", None), "limits")
     session = _fill(SessionRules, session_raw, "session")
     costs = _fill(CostModel, raw.pop("costs", None), "costs")
+    learning = _fill(LearningConfig, raw.pop("learning", None), "learning")
     raw.pop("account", None)   # documented in mandate.yaml; consumed by daytrade_broker, not here
 
     top_known = {"enabled", "sleeve_capital", "long_only", "run_unfiltered_shadow"}
     unknown = set(raw) - top_known
     if unknown:
         raise ValueError(f"day_trading: unknown key(s) {sorted(unknown)}")
-    cfg = DayTradingConfig(universe=universe, limits=limits, session=session, costs=costs, **raw)
+    cfg = DayTradingConfig(universe=universe, limits=limits, session=session, costs=costs, learning=learning, **raw)
     if strategies is not None:
         cfg.strategies = list(strategies)
     cfg.params = {k: dict(v) for k, v in params.items()}
@@ -150,6 +172,18 @@ def config_from_dict(raw: Optional[Dict[str, Any]]) -> DayTradingConfig:
         raise ValueError("day_trading.limits.daily_loss_halt must be in (0, 0.2]")
     if not cfg.session.last_entry_et < cfg.session.flatten_et:
         raise ValueError("day_trading.session.last_entry_et must be before flatten_et")
+    lc = cfg.learning
+    if lc.min_matched_trades < 10 or lc.min_distinct_days < 3:
+        raise ValueError("day_trading.learning: min_matched_trades >= 10 and min_distinct_days >= 3 "
+                         "(fewer is judging a rule on anecdotes)")
+    if not 0 < lc.max_p_value <= 0.2:
+        raise ValueError("day_trading.learning.max_p_value must be in (0, 0.2]")
+    if not 0 < lc.min_combined_risk_mult <= 1.0:
+        raise ValueError("day_trading.learning.min_combined_risk_mult must be in (0, 1]")
+    if not 0 <= lc.max_opportunity_cost <= 1.0 or not 0 <= lc.min_walkforward_win_rate <= 1.0:
+        raise ValueError("day_trading.learning: max_opportunity_cost and min_walkforward_win_rate must be in [0, 1]")
+    if lc.max_active_lessons < 0 or lc.max_proposals_per_day < 0 or lc.lesson_ttl_days < 1 or lc.post_exit_minutes < 1:
+        raise ValueError("day_trading.learning: counts must be non-negative, ttl and post_exit_minutes >= 1")
     return cfg
 
 
@@ -204,7 +238,20 @@ if __name__ == "__main__":
     assert "day_trading" in m and set(m["buckets"]) == {"equities", "forex", "crypto", "cash"}
     print(f"✓ sleeve=${cfg.sleeve_capital:,.0f}, strategies={cfg.strategies}; buckets untouched")
 
-    print("TEST 6: sell-side fees")
+    print("TEST 6: learning block — defaults, typo rejection, bounds")
+    assert d.learning.enabled and not d.learning.auto_activate and d.learning.min_matched_trades == 30
+    ok = config_from_dict({"learning": {"auto_activate": True, "max_active_lessons": 4}})
+    assert ok.learning.auto_activate and ok.learning.max_active_lessons == 4
+    for bad in ({"learning": {"min_matched": 5}}, {"learning": {"min_matched_trades": 3}},
+                {"learning": {"min_combined_risk_mult": 0}}, {"learning": {"max_p_value": 0.5}}):
+        try:
+            config_from_dict(bad)
+            raise AssertionError(f"should have raised for {bad}")
+        except ValueError:
+            pass
+    print("✓ safe defaults (auto_activate off); typos and anecdote-sized thresholds rejected")
+
+    print("TEST 7: sell-side fees")
     fee = CostModel().sell_fees(100, 50.0)
     assert 0 < fee < 1.0
     assert CostModel().sell_fees(10_000_000, 1.0) >= 8.30   # TAF capped, SEC part still scales

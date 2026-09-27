@@ -25,6 +25,16 @@ the two exits a broker can't: the end-of-day flatten and the daily-loss halt.
 Playbook (optional) is the LLM's only input, and it can only RESTRICT: fewer
 strategies, fewer names, risk-off, or a smaller risk multiplier. It is
 clamped here, so a malformed or overreaching playbook can't widen anything.
+
+LEARNING HOOKS. The playbook also carries the ACTIVE learned lessons
+(daytrade_lessons.py): deterministic, restrict-only rules checked at signal
+time (skip, or shrink size — never below learning.min_combined_risk_mult).
+And every first signal per symbol is journaled (daytrade_journal.py) with its
+entry snapshot and a stand-alone virtual outcome — including the ones the
+playbook, a lesson or a capacity veto stopped — so the learning loop can see
+what each restriction actually cost or saved. Journaling never changes a
+decision: the signals it evaluates for filtered names are computed and
+recorded, not traded.
 """
 
 from __future__ import annotations
@@ -32,9 +42,11 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 from daytrade_config import DayTradingConfig
+from daytrade_journal import SignalTracker, entry_features
+from daytrade_lessons import LessonSet
 from daytrade_risk import RiskState, check_entry, daily_loss_breached, daily_pnl
 from daytrade_strategies import STRATEGIES, SymbolContext, first_signal, update_vwaps
 from intraday_data import MARKET_CLOSE, Bar, effective_session, in_regular_session, to_et
@@ -91,10 +103,16 @@ class Position:
     entry_ts: datetime
     client_order_id: str
     initial_qty: float = 0.0
+    entry_ref: float = 0.0                 # the signal's reference price (fill - ref = entry slippage)
+    snapshot: Dict[str, Any] = field(default_factory=dict)
+    hi: float = 0.0                        # price extremes while held -> MAE / MFE
+    lo: float = 0.0
 
     def __post_init__(self):
         if not self.initial_qty:
             self.initial_qty = self.qty
+        if not self.hi:
+            self.hi = self.lo = self.entry_price
 
 
 @dataclass
@@ -110,6 +128,10 @@ class Trade:
     fees: float
     reason: str
     r_multiple: float
+    snapshot: Dict[str, Any] = field(default_factory=dict)   # entry features (daytrade_journal.FEATURES)
+    mae_r: float = 0.0                     # worst price while held, in R (<= 0)
+    mfe_r: float = 0.0                     # best price while held, in R (>= 0)
+    entry_ref: float = 0.0
 
 
 @dataclass
@@ -120,6 +142,12 @@ class Playbook:
     watchlist: Optional[List[str]] = None             # symbols to trade, or None = all fed
     risk_multiplier: float = 1.0                      # clamped to [0, 1]
     rationale: str = ""
+    lessons: Optional[List[Dict[str, Any]]] = None    # ACTIVE learned lessons (restrict-only), as stored dicts
+
+
+# Capacity vetoes whose signal is still a real setup worth a counterfactual.
+# Window / halt / malformed-stop vetoes are not: those setups could never trade.
+_GHOSTABLE_VETOES = ("at max_positions", "at max_trades_per_day", "position size rounds to 0")
 
 
 class DayTradingEngine:
@@ -127,7 +155,7 @@ class DayTradingEngine:
 
     def __init__(self, cfg: DayTradingConfig, day: date, prev_close: Optional[Dict[str, float]] = None,
                  playbook: Optional[Playbook] = None, close_time: time = MARKET_CLOSE,
-                 max_signal_age: timedelta = timedelta(seconds=150)):
+                 max_signal_age: timedelta = timedelta(seconds=150), market: Optional[Dict[str, float]] = None):
         self.cfg, self.day, self.close_time = cfg, day, close_time
         self.prev_close = prev_close or {}
         self.last_entry, self.flatten = effective_session(cfg.session, close_time)
@@ -141,6 +169,10 @@ class DayTradingEngine:
         self.state = RiskState()
         self.trades: List[Trade] = []
         self.decisions: List[Dict[str, Any]] = []
+        self.market = dict(market or {})                   # daily benchmark read for entry snapshots
+        self.journal = SignalTracker(day, cfg.costs.slippage_bps, self.flatten, cfg.learning.post_exit_minutes)
+        self._ghosted: Set[str] = set()
+        self._snapshots: Dict[str, Dict[str, Any]] = {}
         self.set_playbook(playbook)
 
     # ------------------------------------------------------------------ playbook
@@ -151,6 +183,8 @@ class DayTradingEngine:
         self.watchlist: Optional[Set[str]] = None if pb.watchlist is None else {s.upper() for s in pb.watchlist}
         self.risk_on = bool(pb.risk_on)
         self.risk_multiplier = min(1.0, max(0.0, float(pb.risk_multiplier)))
+        self.all_strategies = [s for s in self.cfg.strategies if s in STRATEGIES]
+        self.lessons = LessonSet.from_dicts(pb.lessons, self.cfg.learning.min_combined_risk_mult)
         self.playbook = pb
 
     # ------------------------------------------------------------------ helpers
@@ -166,6 +200,23 @@ class DayTradingEngine:
             if c and c.bars:
                 unreal += (c.bars[-1].close - pos.entry_price) * pos.qty
         self.state.unrealized_pnl = unreal
+
+    def _snapshot(self, sig: Any) -> Dict[str, Any]:
+        return entry_features(self.ctx[sig.symbol], sig, self.ctx, self.market, self.risk_multiplier)
+
+    def _ghost(self, sig: Any, ts: datetime, status: str, snap: Optional[Dict[str, Any]] = None,
+               reasons: Sequence[str] = (), lesson_ids: Sequence[str] = ()) -> None:
+        """Journal a signal the engine did NOT take — once per symbol per day."""
+        if sig.symbol in self._ghosted:
+            return
+        self._ghosted.add(sig.symbol)
+        self.journal.track(sig, snap if snap is not None else self._snapshot(sig), status, ts, reasons, lesson_ids)
+
+    def journal_records(self) -> List[Dict[str, Any]]:
+        """Every journaled signal with its virtual outcome, real outcome merged
+        into the taken ones. Call after the day's last fill."""
+        self.journal.finalize()
+        return self.journal.records(self.trades)
 
     @staticmethod
     def entry_order_id(day: date, symbol: str) -> str:
@@ -196,6 +247,10 @@ class DayTradingEngine:
             ctx.bars.append(b)
             update_vwaps(ctx.vwaps, self._cum[sym], b)
             fresh.append(b)
+            self.journal.on_bar(b)
+            pos = self.positions.get(sym)
+            if pos is not None and b.end > pos.entry_ts:
+                pos.hi, pos.lo = max(pos.hi, b.high), min(pos.lo, b.low)
         self._mark()
 
         if not self.state.halted and daily_loss_breached(self.state, self.sleeve, self.cfg.limits):
@@ -219,26 +274,48 @@ class DayTradingEngine:
                     intents.append(ExitIntent(sym, int(pos.qty), why))
                     self._log(now, "exit", sym, qty=pos.qty, reason=why)
 
-        # 3) entries — evaluate every NEW bar in time order
-        if entries_allowed and self.risk_on and not self.state.halted:
-            limits = self.cfg.limits
+        # 3) entries — evaluate every NEW bar in time order. Signals for names the
+        #    playbook filtered out are still computed, but only to be JOURNALED.
+        if entries_allowed and not self.state.halted:
+            base_limits = self.cfg.limits
             if self.risk_multiplier < 1.0:
-                limits = dataclasses.replace(limits, risk_per_trade=limits.risk_per_trade * self.risk_multiplier)
+                base_limits = dataclasses.replace(base_limits,
+                                                  risk_per_trade=base_limits.risk_per_trade * self.risk_multiplier)
+            fewer = len(self.enabled) < len(self.all_strategies)
             for b in fresh:
                 sym = b.symbol
-                if self.watchlist is not None and sym.upper() not in self.watchlist:
-                    continue
                 if sym in self.positions or sym in self.pending or sym in self.state.symbols_traded:
                     continue
                 if now - b.end > self.max_signal_age:
                     continue                               # stale: a replayed bar must never trade
+                filtered = ("risk_off" if not self.risk_on else
+                            "off_watchlist" if self.watchlist is not None and sym.upper() not in self.watchlist
+                            else None)
                 sig = first_signal(self.ctx[sym], self.enabled, self.cfg.params)
                 if sig is None:
+                    if fewer and sym not in self._ghosted:
+                        ghost = first_signal(self.ctx[sym], self.all_strategies, self.cfg.params)
+                        if ghost is not None:
+                            self._ghost(ghost, b.end, filtered or "strategy_disabled")
                     continue
+                if filtered:
+                    self._ghost(sig, b.end, filtered)
+                    continue
+                snap = self._snapshot(sig)
+                skip, mult, lesson_ids = self.lessons.evaluate(snap) if self.lessons else (False, 1.0, [])
+                if skip:
+                    self._log(b.end, "lesson_skip", sym, strategy=sig.strategy, lessons=lesson_ids)
+                    self._ghost(sig, b.end, "filtered_lesson", snap, lesson_ids=lesson_ids)
+                    continue
+                limits = base_limits
+                if mult < 1.0:
+                    limits = dataclasses.replace(limits, risk_per_trade=limits.risk_per_trade * mult)
                 qty, why = check_entry(sig, b.end, self.state, self.sleeve, limits, self.cfg.session,
                                        self.last_entry, self.cfg.universe.min_price)
                 if qty < 1:
                     self._log(b.end, "veto", sym, strategy=sig.strategy, reasons=why)
+                    if why and all(r.startswith(_GHOSTABLE_VETOES) for r in why):
+                        self._ghost(sig, b.end, "vetoed", snap, reasons=why, lesson_ids=lesson_ids)
                     continue
                 stop, target = round(sig.stop, 2), round(sig.target, 2)
                 intent = EntryIntent(sym, qty, round(sig.entry, 2), stop, target, sig.strategy, sig.reason,
@@ -249,8 +326,11 @@ class DayTradingEngine:
                 self.state.committed_notional += qty * intent.entry_ref
                 self.state.symbols_traded.add(sym)
                 intents.append(intent)
+                self._snapshots[sym] = snap
+                self.journal.track(sig, snap, "taken", b.end, lesson_ids=lesson_ids, lesson_mult=mult)
                 self._log(b.end, "entry", sym, strategy=sig.strategy, qty=qty, entry=intent.entry_ref,
-                          stop=stop, target=target, reason=sig.reason)
+                          stop=stop, target=target, reason=sig.reason,
+                          **({"lessons": lesson_ids, "lesson_mult": mult} if lesson_ids else {}))
         return intents
 
     # ------------------------------------------------------------------ feedback
@@ -263,7 +343,8 @@ class DayTradingEngine:
                 return
             self.state.committed_notional += fill.qty * fill.price - intent.qty * intent.entry_ref
             self.positions[sym] = Position(sym, fill.qty, fill.price, intent.stop, intent.target,
-                                           intent.strategy, fill.ts, intent.client_order_id)
+                                           intent.strategy, fill.ts, intent.client_order_id,
+                                           entry_ref=intent.entry_ref, snapshot=self._snapshots.pop(sym, {}))
             self._log(fill.ts, "filled_buy", sym, qty=fill.qty, price=fill.price)
         elif fill.side == "sell":
             pos = self.positions.get(sym)
@@ -272,9 +353,14 @@ class DayTradingEngine:
                 return
             qty = min(fill.qty, pos.qty)
             pnl = (fill.price - pos.entry_price) * qty - fill.fees
-            risk = max((pos.entry_price - pos.stop) * qty, 1e-9)
+            risk_ps = max(pos.entry_price - pos.stop, 1e-9)
+            risk = risk_ps * qty
             self.trades.append(Trade(sym, pos.strategy, qty, pos.entry_price, fill.price, pos.entry_ts,
-                                     fill.ts, pnl, fill.fees, fill.reason, pnl / risk))
+                                     fill.ts, pnl, fill.fees, fill.reason, pnl / risk, snapshot=dict(pos.snapshot),
+                                     mae_r=(min(pos.lo, fill.price) - pos.entry_price) / risk_ps,
+                                     mfe_r=(max(pos.hi, fill.price) - pos.entry_price) / risk_ps,
+                                     entry_ref=pos.entry_ref))
+            self.journal.watch_exit(sym, fill.ts, fill.price, risk_ps)
             self.state.realized_pnl += pnl
             self.state.committed_notional -= qty * pos.entry_price
             pos.qty -= qty
@@ -478,4 +564,64 @@ if __name__ == "__main__":
     e11.on_bars(bs + bs[:3] + [after_hours], bs[-1].end)
     assert len(e11.ctx["AAA"].bars) == len(bs)
     print("✓ context has exactly the unique in-session bars")
+
+    print("TEST 12: learned lessons — skip journals a ghost, risk_mult shrinks size, neither widens anything")
+    skip_orb = {"id": "Lskip", "when": {"strategy": {"==": "orb_long"}}, "action": {"type": "skip"}}
+    e12 = DayTradingEngine(cfg, day, playbook=Playbook(lessons=[skip_orb]))
+    assert [i for i in run(e12, bars_for("AAA", wide)) if isinstance(i, EntryIntent)] == []
+    recs = e12.journal_records()
+    assert [(r["status"], r["lesson_ids"]) for r in recs] == [("filtered_lesson", ["Lskip"])]
+    assert any(d["kind"] == "lesson_skip" for d in e12.decisions)
+    shrink = {"id": "Lhalf", "when": {"rel_volume": {">": 1.0}}, "action": {"type": "risk_mult", "value": 0.5}}
+    risk_bound = config_from_dict({"sleeve_capital": 25_000, "limits": {"max_position_pct": 1.0}})   # risk, not cap, binds
+    q_base = [i for i in run(DayTradingEngine(risk_bound, day), bars_for("AAA", wide)) if isinstance(i, EntryIntent)]
+    e12b = DayTradingEngine(risk_bound, day, playbook=Playbook(lessons=[shrink]))
+    q_lesson = [i for i in run(e12b, bars_for("AAA", wide)) if isinstance(i, EntryIntent)]
+    assert q_lesson and q_lesson[0].qty < q_base[0].qty, (q_lesson[0].qty, q_base[0].qty)
+    widen = {"id": "Lbad", "when": {"rel_volume": {">": 1.0}}, "action": {"type": "risk_mult", "value": 3.0}}
+    e12c = DayTradingEngine(risk_bound, day, playbook=Playbook(lessons=[widen, {"garbage": 1}]))
+    q_widen = [i for i in run(e12c, bars_for("AAA", wide)) if isinstance(i, EntryIntent)]
+    assert len(e12c.lessons) == 0 and q_widen[0].qty == q_base[0].qty, "an invalid/widening lesson is dropped"
+    print(f"✓ skip -> ghost; 0.5x lesson -> {q_lesson[0].qty} sh vs {q_base[0].qty}; a 3x 'lesson' is ignored")
+
+    print("TEST 13: playbook-filtered signals are journaled with outcomes but never traded")
+    for pb, status in [(Playbook(watchlist=["ZZZ"]), "off_watchlist"), (Playbook(risk_on=False), "risk_off"),
+                       (Playbook(enabled_strategies=["gap_and_go_long"]), "strategy_disabled")]:
+        e13 = DayTradingEngine(cfg, day, playbook=pb)
+        rows13 = breakout_rows() + [(100.7, 101.9, 100.6, 101.0, 3000)]
+        assert [i for i in run(e13, bars_for("AAA", rows13)) if isinstance(i, EntryIntent)] == []
+        recs = e13.journal_records()
+        assert [r["status"] for r in recs] == [status], (status, recs)
+        assert recs[0]["exit_virtual"] == "target" and recs[0]["r_virtual"] > 1.5
+        assert recs[0]["snapshot"]["strategy"] == "orb_long" and recs[0]["snapshot"]["minutes_since_open"] == 17
+    print("✓ off-watchlist / risk-off / disabled-strategy ghosts each carry a snapshot and a +R virtual outcome")
+
+    print("TEST 14: a taken trade carries its snapshot, MAE/MFE and slippage into the journal")
+    e14 = DayTradingEngine(cfg, day, market={"spy_prev_change": -0.01})
+    got = [i for i in run(e14, bars_for("AAA", breakout_rows())) if isinstance(i, EntryIntent)]
+    fill_ts = et_datetime(day, time(9, 48)).astimezone(UTC)
+    e14.apply_fill(FillEvent("AAA", "buy", got[0].qty, 100.65, fill_ts))
+    dip = [Bar("AAA", fill_ts, 100.65, 100.9, 100.3, 100.5, 3000),
+           Bar("AAA", fill_ts + timedelta(minutes=1), 100.5, 101.2, 100.4, 101.1, 3000)]
+    for b in dip:
+        e14.on_bars([b], b.end)
+    e14.apply_fill(FillEvent("AAA", "sell", got[0].qty, 101.0, fill_ts + timedelta(minutes=2), reason="eod_flatten"))
+    t = e14.trades[0]
+    risk_ps = 100.65 - got[0].stop
+    assert abs(t.mae_r - (100.3 - 100.65) / risk_ps) < 1e-9 and abs(t.mfe_r - (101.2 - 100.65) / risk_ps) < 1e-9
+    assert t.snapshot["spy_prev_change"] == -0.01 and t.entry_ref == got[0].entry_ref
+    rec = [r for r in e14.journal_records() if r["status"] == "taken"][0]
+    assert rec["r_real"] == round(t.r_multiple, 6) and rec["slippage_bps"] > 0 and rec["exit_reason"] == "eod_flatten"
+    print(f"✓ MAE {t.mae_r:+.2f}R, MFE {t.mfe_r:+.2f}R, slippage {rec['slippage_bps']:.1f}bps, snapshot kept")
+
+    print("TEST 15: capacity vetoes are journaled once; window vetoes are not (never tradable)")
+    e15 = DayTradingEngine(config_from_dict({"sleeve_capital": 25_000, "limits": {"max_positions": 1}}), day)
+    both = sorted(bars_for("AAA", breakout_rows()) + bars_for("BBB", breakout_rows(50.0)), key=lambda b: (b.ts, b.symbol))
+    for b in both:
+        e15.on_bars([b], b.end)
+    recs = e15.journal_records()
+    assert sorted((r["symbol"], r["status"]) for r in recs) == [("AAA", "taken"), ("BBB", "vetoed")], recs
+    assert any("max_positions" in x for x in [r for r in recs if r["status"] == "vetoed"][0]["reasons"])
+    assert [r for r in eng6.journal_records()] == [], "the 15:35 window veto is not a counterfactual"
+    print("✓ BBB blocked by max_positions -> one 'vetoed' ghost; late-day window veto -> nothing")
     print("\nAll daytrade_engine tests passed.")

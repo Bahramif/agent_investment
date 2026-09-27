@@ -48,6 +48,13 @@ the backtest uses; its P&L is stored beside the live result. That pair is the
 LLM ablation: on days with a playbook, did the model's restrictions beat the
 plain engine? It is a simulation, not a broker account, and after a mid-day
 restart it is marked `partial`.
+
+LEARNING. The live playbook carries the ACTIVE learned lessons (attached by
+the planner from the store; the shadow gets none, so the shadow stays the
+plain-engine baseline). At wrap-up the engine's journal — every signal it
+saw, taken or not, with entry features and outcomes — is saved, then the
+post-close learning hook runs (daytrade_learning.run_post_close). Both are
+wrapped so that a learning failure can never change how the day ended.
 """
 
 from __future__ import annotations
@@ -81,6 +88,7 @@ class DayPlan:
     shadow_playbook: Playbook           # the unrestricted deterministic baseline
     prev_close: Dict[str, float]
     candidates: List[str]               # symbols worth feeding (playbook + shadow watchlists)
+    market: Dict[str, float] = field(default_factory=dict)   # SPY read for entry snapshots
 
 
 PlanFn = Callable[[date], DayPlan]
@@ -96,6 +104,7 @@ class RunnerDeps:
     make_feed: Callable[[List[str]], BarFeed]
     sleep: Callable[[float], None] = _time.sleep
     poll_seconds: float = 15.0
+    post_close: Optional[Callable[[date], Any]] = None      # learning hook, after the journal is saved
 
 
 def _log(msg: str) -> None:
@@ -295,10 +304,12 @@ class SessionRunner:
             symbols = sorted(set(plan.candidates) | set(plan.playbook.watchlist or []) |
                              set(plan.shadow_playbook.watchlist or []))
         close_dt = et_datetime(self.day, close).astimezone(UTC)
-        self.engine = DayTradingEngine(eff, self.day, plan.prev_close, plan.playbook, close_time=close)
+        self.engine = DayTradingEngine(eff, self.day, plan.prev_close, plan.playbook, close_time=close,
+                                       market=plan.market)
         self.sim: Optional[SimBroker] = None
         if cfg.run_unfiltered_shadow:
-            self.shadow = DayTradingEngine(eff, self.day, plan.prev_close, plan.shadow_playbook, close_time=close)
+            self.shadow = DayTradingEngine(eff, self.day, plan.prev_close, plan.shadow_playbook, close_time=close,
+                                           market=plan.market)
             self.sim = SimBroker(cfg.costs)
 
         self._recover(now, existing)
@@ -391,8 +402,27 @@ class SessionRunner:
         elif self.engine.state.halted:
             status = "halted"
         self._persist(now, status, force=True, ended_at=now.isoformat(), flat_verified=not leftover)
+        self._learn()
         return {"status": status, "trades": len(self.engine.trades), "realized_pnl": self.engine.state.realized_pnl,
                 "halted": self.engine.state.halted}
+
+
+    def _learn(self) -> None:
+        """After the day is fully recorded: save the journal, then learn. A
+        failure here is logged, never raised — the session is already final."""
+        if not self.cfg.learning.enabled:
+            return
+        try:
+            self.engine.journal.partial = self.recovered
+            self.store.save_journal(self.day, self.engine.journal_records(), "live")
+        except Exception as e:
+            _log(f"journal save failed: {type(e).__name__}: {e}")
+            return
+        if self.d.post_close is not None:
+            try:
+                self.d.post_close(self.day)
+            except Exception as e:
+                _log(f"post-close learning failed: {type(e).__name__}: {e}")
 
 
 def run_session(deps: RunnerDeps) -> Dict[str, Any]:
@@ -403,8 +433,21 @@ def run_session(deps: RunnerDeps) -> Dict[str, Any]:
 # Production wiring
 # -----------------------------------------------------------------------------
 def make_plan_day(cfg: DayTradingConfig, data: IntradayDataClient, universe: Sequence[str], use_llm: bool = True,
-                  news_fn: Optional[Callable[[Sequence[str]], Dict[str, List[str]]]] = None) -> PlanFn:
-    from daytrade_playbook import BENCHMARKS
+                  news_fn: Optional[Callable[[Sequence[str]], Dict[str, List[str]]]] = None,
+                  lessons_fn: Optional[Callable[[], List[Dict[str, Any]]]] = None,
+                  memory_fn: Optional[Callable[[], List[str]]] = None) -> PlanFn:
+    """lessons_fn / memory_fn come from the learning loop. Either failing
+    degrades to "no lessons" / "no memory" — never to a failed plan."""
+    from daytrade_playbook import BENCHMARKS, snapshot_market
+
+    def _safe(fn, default):
+        if fn is None:
+            return default
+        try:
+            return fn()
+        except Exception as e:
+            _log(f"learning input unavailable ({type(e).__name__}: {e}) — planning without it")
+            return default
 
     def plan(day: date) -> DayPlan:
         daily = data.get_daily_bars(list(universe) + list(BENCHMARKS), day - timedelta(days=45), day - timedelta(days=1))
@@ -413,17 +456,21 @@ def make_plan_day(cfg: DayTradingConfig, data: IntradayDataClient, universe: Seq
             heads = news_fn([c.symbol for c in cands[:20]])
             for c in cands:
                 c.headlines = heads.get(c.symbol, [])
-        pb = make_playbook(cands, market_read(daily), day, cfg, use_llm=use_llm)
+        mkt = market_read(daily)
+        pb = make_playbook(cands, mkt, day, cfg, use_llm=use_llm, memory=_safe(memory_fn, []))
+        if cfg.learning.enabled:
+            pb.lessons = _safe(lessons_fn, []) or None     # attached here, never by the model
         shadow_pb = deterministic_playbook(cands, cfg)
         prev = {s: sorted(bs, key=lambda b: b.ts)[-1].close for s, bs in daily.items() if bs}
         top = [c.symbol for c in cands[: cfg.universe.max_watchlist * 2]]
-        return DayPlan(pb, shadow_pb, prev, top)
+        return DayPlan(pb, shadow_pb, prev, top, snapshot_market(mkt))
     return plan
 
 
 def build_real_deps(config_path: str, use_llm: bool) -> RunnerDeps:
     from alpaca.data.historical import StockHistoricalDataClient
     from daytrade_broker import load_credentials, make_daytrade_trading_client
+    from daytrade_learning import active_lesson_dicts, memory_lines, run_post_close
     from daytrade_store import default_store
     from intraday_data import AlpacaClock, AlpacaIntradayDataClient, PollingBarFeed
     from universe import EQUITIES
@@ -448,10 +495,14 @@ def build_real_deps(config_path: str, use_llm: bool) -> RunnerDeps:
                 out[s] = []                     # news is optional context; never block the day on it
         return out
 
-    return RunnerDeps(cfg=cfg, store=default_store(), broker=AlpacaDayTradeBroker(tc, dedicated=True),
+    store = default_store()
+    return RunnerDeps(cfg=cfg, store=store, broker=AlpacaDayTradeBroker(tc, dedicated=True),
                       clock=AlpacaClock(tc),
-                      plan_day=make_plan_day(cfg, data, [e[0] for e in EQUITIES], use_llm, news_fn),
-                      make_feed=lambda syms: PollingBarFeed(data, syms))
+                      plan_day=make_plan_day(cfg, data, [e[0] for e in EQUITIES], use_llm, news_fn,
+                                             lessons_fn=lambda: active_lesson_dicts(store),
+                                             memory_fn=lambda: memory_lines(store)),
+                      make_feed=lambda syms: PollingBarFeed(data, syms),
+                      post_close=lambda day: run_post_close(store, cfg, day, use_llm=use_llm))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -40,6 +40,14 @@ build_challenger_report() leaves shadow_return as NaN unless you pass real
 paper-trading results (Phase 5), and the gate's comparison against NaN is
 False. A strategy must not be promotable on backtest evidence alone.
 
+LEARNING JOURNAL. Every simulated day also produces the engine's journal
+(daytrade_journal.py): each signal's entry features plus a stand-alone
+virtual outcome. That is the history the failure-learning loop validates
+lessons against — thousands of labelled setups instead of a few per paper
+day. `run --save-journal` stores it (source "backtest"); `--journal-out
+FILE.jsonl` writes it locally. `--lessons active` replays the currently
+active lessons, to see what they would have done to the whole backtest.
+
 HONEST LIMITATIONS: walk-forward "folds" here are fixed-parameter time
 splits (there is nothing being re-fit), parameter robustness is a joint
 +/-pct perturbation of all parameters (4 corners), not a full grid, and the
@@ -165,6 +173,7 @@ class DayResult:
     capacity_rejects: int
     max_participation: float
     universe_return: float          # median open->close return across symbols: the regime label's source
+    journal: List[Dict[str, Any]] = field(default_factory=list)   # learning journal (daytrade_journal)
 
 
 @dataclass
@@ -201,9 +210,9 @@ def _close_time_for(bars_by_symbol: Dict[str, List[Bar]]) -> time:
 
 def run_day(cfg: DayTradingConfig, day: date, bars_by_symbol: Dict[str, List[Bar]],
             prev_close: Optional[Dict[str, float]] = None, playbook: Optional[Playbook] = None,
-            cost: Optional[CostModel] = None) -> DayResult:
+            cost: Optional[CostModel] = None, market: Optional[Dict[str, float]] = None) -> DayResult:
     close = _close_time_for(bars_by_symbol)
-    engine = DayTradingEngine(cfg, day, prev_close or {}, playbook, close_time=close)
+    engine = DayTradingEngine(cfg, day, prev_close or {}, playbook, close_time=close, market=market)
     sim = SimBroker(cost or cfg.costs)
     by_ts: Dict[datetime, List[Bar]] = defaultdict(list)
     for bars in bars_by_symbol.values():
@@ -239,7 +248,7 @@ def run_day(cfg: DayTradingConfig, day: date, bars_by_symbol: Dict[str, List[Bar
     rets = [closes[s] / opens[s] - 1 for s in opens if opens[s] > 0]
     return DayResult(day, list(engine.trades), sum(t.pnl for t in engine.trades), engine.state.halted,
                      engine.state.halt_reason, engine.state.entries_today, sim.capacity_rejects,
-                     sim.max_participation, statistics.median(rets) if rets else 0.0)
+                     sim.max_participation, statistics.median(rets) if rets else 0.0, engine.journal_records())
 
 
 def _prev_closes(by_day: Dict[str, Dict[date, List[Bar]]], all_days: List[date]) -> Dict[date, Dict[str, float]]:
@@ -255,9 +264,25 @@ def _prev_closes(by_day: Dict[str, Dict[date, List[Bar]]], all_days: List[date])
     return out
 
 
+def market_by_day(spy_bars: Sequence[Bar]) -> Dict[date, Dict[str, float]]:
+    """Per-day SPY read from minute bars, known before that day's open —
+    the same two numbers the live planner feeds the engine."""
+    closes = [(d, bs[-1].close) for d, bs in sorted(group_by_day(spy_bars).items()) if bs]
+    out: Dict[date, Dict[str, float]] = {}
+    for i in range(1, len(closes)):
+        d = closes[i][0]
+        m = {"spy_prev_change": closes[i - 1][1] / closes[i - 2][1] - 1.0} if i >= 2 else {}
+        if i >= 6:
+            m["spy_mom_5d"] = closes[i - 1][1] / closes[i - 6][1] - 1.0
+        out[d] = m
+    return out
+
+
 def run_backtest(data: Dict[str, List[Bar]], cfg: DayTradingConfig, cost: Optional[CostModel] = None,
                  playbooks: Optional[Dict[date, Playbook]] = None, days: Optional[Sequence[date]] = None,
-                 label: str = "") -> BacktestResult:
+                 label: str = "", markets: Optional[Dict[date, Dict[str, float]]] = None,
+                 lessons: Optional[List[Dict[str, Any]]] = None) -> BacktestResult:
+    """`lessons` apply to every day that has no explicit playbook."""
     by_day = {sym: group_by_day(bars) for sym, bars in data.items()}
     all_days = sorted({d for dd in by_day.values() for d in dd})
     if days is not None:
@@ -269,7 +294,8 @@ def run_backtest(data: Dict[str, List[Bar]], cfg: DayTradingConfig, cost: Option
         todays = {s: dd[d] for s, dd in by_day.items() if d in dd}
         if not todays:
             continue
-        results.append(run_day(cfg, d, todays, prev.get(d), (playbooks or {}).get(d), cost))
+        pb = (playbooks or {}).get(d) or (Playbook(lessons=lessons) if lessons else None)
+        results.append(run_day(cfg, d, todays, prev.get(d), pb, cost, (markets or {}).get(d)))
     return BacktestResult(results, cfg.sleeve_capital, label)
 
 
@@ -523,6 +549,26 @@ def _fetch_minute_bars(symbols: Sequence[str], start: date, end: date) -> Dict[s
     return out
 
 
+def save_journal(result: BacktestResult, path: str = "", to_store: bool = False, store: Any = None) -> int:
+    """Write the learning journal to a .jsonl file and/or the store. Returns records written."""
+    n = sum(len(d.journal) for d in result.days)
+    if path:
+        import json
+        with open(path, "w") as fh:
+            for d in result.days:
+                for r in d.journal:
+                    fh.write(json.dumps({**r, "source": "backtest"}) + "\n")
+        print(f"  wrote {n} journal records to {path}")
+    if to_store:
+        if store is None:
+            from daytrade_store import default_store
+            store = default_store()
+        for d in result.days:
+            store.save_journal(d.day, d.journal, "backtest")
+        print(f"  stored {n} journal records ({len(result.days)} days) for lesson validation")
+    return n
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(
@@ -537,6 +583,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="HOW MANY strategy/parameter variants you have tried in total — be honest, the Deflated "
                          "Sharpe punishes hiding failed attempts")
     ap.add_argument("--no-perturb", action="store_true", help="skip the (slow) parameter-robustness reruns; the gate then FAILS closed")
+    ap.add_argument("--save-journal", action="store_true",
+                    help="store the learning journal in Firestore (source 'backtest') for lesson validation")
+    ap.add_argument("--journal-out", default="", help="also write the learning journal to this .jsonl file")
+    ap.add_argument("--lessons", choices=("none", "active"), default="none",
+                    help="'active' replays the currently active learned lessons (from the store) on every day")
     a = ap.parse_args(argv)
 
     from daytrade_config import load_day_trading_config
@@ -556,8 +607,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not got:
         print("No bars returned — check credentials, symbols and dates.")
         return 2
+    markets: Dict[date, Dict[str, float]] = {}
+    try:
+        spy = _fetch_minute_bars(["SPY"], start - timedelta(days=10), end).get("SPY", [])
+        markets = market_by_day(spy)
+    except Exception as e:
+        print(f"  (no SPY context for entry snapshots: {e})")
+    lessons = None
+    if a.lessons == "active":
+        from daytrade_learning import active_lesson_dicts
+        from daytrade_store import default_store
+        lessons = active_lesson_dicts(default_store())
+        print(f"Replaying {len(lessons)} active lesson(s).")
     print(f"{got:,} bars. Running strategies...")
-    result = run_backtest(data, cfg, label="strategies")
+    result = run_backtest(data, cfg, label="strategies", markets=markets, lessons=lessons)
+    save_journal(result, a.journal_out, a.save_journal)
     print(f"{len(result.trades)} trades over {len(result.days)} days. Building null-model champion...")
     champion = null_baseline(data, cfg, target_trades=max(len(result.trades), 10))
     rerun = None if a.no_perturb else (lambda p: run_backtest(data, dataclasses.replace(cfg, params=p)))
@@ -740,4 +804,45 @@ if __name__ == "__main__":
     assert not nogo and msg2.startswith("NO-GO") and "stat" in msg2 or "edge" in msg2
     assert "ops.shadow_vs_sim" not in msg2.split("Failing:")[1], "shadow is excused, so it must not be listed as blocking"
     print("✓ strong edge -> PROCEED TO PAPER; random walk -> NO-GO, with the blocking gates named")
+
+    print("TEST 14: the learning journal — one record per first signal, virtual outcome tracks the simulated fill")
+    journal = [r for d in result.days for r in d.journal]
+    taken = [r for r in journal if r["status"] == "taken" and r.get("r_real") is not None]
+    assert len(taken) == len(result.trades), (len(taken), len(result.trades))
+    same_exit = sum(1 for r in taken if r["exit_virtual"] == r["exit_reason"]) / len(taken)
+    same_sign = sum(1 for r in taken if (r["r_virtual"] > 0) == (r["r_real"] > 0)) / len(taken)
+    assert same_exit > 0.9 and same_sign > 0.9, (same_exit, same_sign)
+    assert all(r["snapshot"]["strategy"] == r["strategy"] for r in journal)
+    ghosts = [r for r in journal if r["status"] != "taken"]
+    print(f"✓ {len(journal)} records ({len(taken)} taken, {len(ghosts)} ghosts); virtual vs real: "
+          f"{same_exit:.0%} same exit, {same_sign:.0%} same sign")
+
+    print("TEST 15: SPY context is known BEFORE each day (no look-ahead); journal saves to store and .jsonl")
+    spy = [b for d in days for b in synthetic_day("SPY", d, seed=4, start_price=500)]
+    mk = market_by_day(spy)
+    closes = {d: [b for b in spy if to_et(b.ts).date() == d][-1].close for d in days}
+    d2 = days[2]
+    assert abs(mk[d2]["spy_prev_change"] - (closes[days[1]] / closes[days[0]] - 1)) < 1e-12
+    assert days[0] not in mk and "spy_mom_5d" not in mk[days[2]] and "spy_mom_5d" in mk[days[6]]
+    with_mk = run_backtest(data, cfg2, days=days[:8], markets=mk)
+    snaps = [(d.day, r["snapshot"]) for d in with_mk.days for r in d.journal]
+    assert all((sn["spy_prev_change"] is not None) == (d >= days[2]) for d, sn in snaps), \
+        "known from day 3 on (needs two prior closes), and never invented before that"
+    import json, os, tempfile
+    from daytrade_store import InMemoryDayTradeStore
+    st = InMemoryDayTradeStore()
+    path = os.path.join(tempfile.mkdtemp(), "j.jsonl")
+    n = save_journal(with_mk, path, to_store=True, store=st)
+    assert n == len(open(path).read().splitlines()) == len(st.list_journal(source="backtest")) > 0
+    assert json.loads(open(path).readline())["source"] == "backtest"
+    print(f"✓ {n} records to both; SPY read from the PRIOR close only")
+
+    print("TEST 16: --lessons replay: a skip-everything lesson removes every trade and journals every skip")
+    nuke = [{"id": "Lall", "when": {"minutes_since_open": {">=": 0}}, "action": {"type": "skip"}}]
+    none = run_backtest(data, cfg2, days=days[:8], lessons=nuke)
+    base = run_backtest(data, cfg2, days=days[:8])
+    assert base.trades and not none.trades
+    skipped = [r for d in none.days for r in d.journal if r["status"] == "filtered_lesson"]
+    assert len(skipped) >= len(base.trades) and all(r["lesson_ids"] == ["Lall"] for r in skipped)
+    print(f"✓ {len(base.trades)} trades -> 0; {len(skipped)} skips journaled with their outcomes")
     print("\nAll daytrade_backtest tests passed.")
