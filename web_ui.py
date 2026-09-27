@@ -2671,7 +2671,7 @@ def close_portfolio_route(portfolio_id: str):
     return portfolios_route()
 
 
-def recalibrate_portfolio(portfolio_id: str) -> Dict[str, Any]:
+def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "") -> Dict[str, Any]:
     """The actual autopilot recalibration: re-runs the SAME recommendation
     pipeline this portfolio was launched with (same sectors, same top_n),
     sized against its CURRENT mark-to-market value — not the stale original
@@ -2680,7 +2680,10 @@ def recalibrate_portfolio(portfolio_id: str) -> Dict[str, Any]:
     holds and the new target (unlike launch's fresh from-zero buy, which
     would double up on shares already held). Callable manually (see
     /portfolios/<id>/recalibrate) or by the daily due-check
-    (/portfolios/recalibrate_due) that a Cloud Scheduler job hits."""
+    (/portfolios/recalibrate_due) that a Cloud Scheduler job hits, or by the
+    mid-day news watch (/portfolios/proactive_check). `trigger` ("manual" |
+    "scheduled" | "proactive") and `reason` are recorded on the history event
+    so the page shows WHY each recalibration happened."""
     import portfolio_store
     from datetime import datetime, timedelta, timezone
     from alpaca.trading.client import TradingClient
@@ -2806,7 +2809,8 @@ def recalibrate_portfolio(portfolio_id: str) -> Dict[str, Any]:
     portfolio_store.record_rebalance(
         portfolio_id, new_holdings, new_cash, new_pending,
         event={"date": rebalance_date, "orders": orders_placed, "errors": errors,
-              "portfolio_value_before": current_value, "target_weights": weights},
+              "portfolio_value_before": current_value, "target_weights": weights,
+              "trigger": trigger, "reason": reason[:1000]},
         next_rebalance_date=next_date,
     )
     return {"orders": orders_placed, "errors": errors, "portfolio_value_before": current_value}
@@ -2816,7 +2820,7 @@ def recalibrate_portfolio(portfolio_id: str) -> Dict[str, Any]:
 def recalibrate_route(portfolio_id: str):
     """Manual "Recalibrate Now" trigger — the same real logic the scheduled
     daily due-check runs automatically, just invoked on demand."""
-    result = recalibrate_portfolio(portfolio_id)
+    result = recalibrate_portfolio(portfolio_id, trigger="manual")
     return portfolio_detail(portfolio_id)
 
 
@@ -2862,11 +2866,102 @@ def recalibrate_due_route():
     results = []
     for p in due:
         try:
-            r = recalibrate_portfolio(p["id"])
+            r = recalibrate_portfolio(p["id"], trigger="scheduled")
             results.append({"id": p["id"], "name": p["name"], **r})
         except Exception as e:
             results.append({"id": p["id"], "name": p["name"], "error": str(e)})
     return {"checked": len(due), "results": results}
+
+
+# =============================================================================
+# Mid-day news watch — decides, per open portfolio, whether today's news calls
+# for recalibrating NOW rather than waiting for the scheduled date. The logic
+# (guardrails, evidence, Claude review, fallback, policy) lives in
+# proactive_recal.py; this is only the wiring to Alpaca, Firestore and Claude.
+#
+# Schedule it once per trading day, mid-session (same token as the due-check):
+#   gcloud scheduler jobs create http meridian-proactive-recal --location us-central1 \
+#       --schedule "30 12 * * 1-5" --time-zone "America/New_York" \
+#       --uri "https://<SERVICE_URL>/portfolios/proactive_check" --http-method POST \
+#       --headers "X-Recalibrate-Token=<token>" --attempt-deadline 1800s
+# A holiday is handled here, not in the schedule: with the market closed a
+# "recalibrate" verdict is only flagged. POST ?dry_run=1 to see what it WOULD do.
+# =============================================================================
+def _intraday_quotes(symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    """{symbol: {"price": latest trade, "prev_close": previous session close}}
+    from Alpaca's snapshot endpoint (one request for all symbols). A symbol
+    Alpaca returns nothing for is simply absent."""
+    if not symbols:
+        return {}
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockSnapshotRequest
+    sc = apply_default_timeout(StockHistoricalDataClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
+    snaps = sc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols))
+    out: Dict[str, Dict[str, float]] = {}
+    for sym, sn in (snaps or {}).items():
+        trade, prev = getattr(sn, "latest_trade", None), getattr(sn, "previous_daily_bar", None)
+        if trade is not None and prev is not None and trade.price and prev.close:
+            out[sym] = {"price": float(trade.price), "prev_close": float(prev.close)}
+    return out
+
+
+_NEWS_CLIENT = None
+
+
+def _headlines(symbol: str, days: int) -> List[str]:
+    global _NEWS_CLIENT
+    if _NEWS_CLIENT is None:
+        from alpaca.data.historical.news import NewsClient
+        from alpaca_clients import AlpacaNewsClient
+        _NEWS_CLIENT = AlpacaNewsClient(NewsClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
+    return _NEWS_CLIENT.get_recent_headlines(symbol, days)
+
+
+def _market_open() -> bool:
+    from alpaca.trading.client import TradingClient
+    tc = apply_default_timeout(TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True))
+    return bool(tc.get_clock().is_open)
+
+
+def _proactive_cfg():
+    from proactive_recal import load_config
+    return load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
+
+
+@app.route("/portfolios/proactive_check", methods=["POST"])
+def proactive_check_route():
+    """Hit once mid-day by Cloud Scheduler. PLACES REAL ORDERS for any
+    portfolio the news watch decides to recalibrate, so it takes the same
+    token as /portfolios/recalibrate_due. ?dry_run=1 assesses and logs only."""
+    import portfolio_store
+    from proactive_recal import ProactiveDeps, run_proactive_check
+    expected = _recalibrate_token()
+    if expected and request.headers.get("X-Recalibrate-Token") != expected:
+        return {"error": "unauthorized"}, 403
+    dry_run = request.args.get("dry_run") in ("1", "true", "yes")
+
+    def recalibrate(pid: str, reason: str) -> Dict[str, Any]:
+        return recalibrate_portfolio(pid, trigger="proactive", reason=reason)
+
+    def client():
+        from claude_reasoning import _client
+        return _client()
+
+    cfg = _proactive_cfg()
+    portfolios = []
+    for p in portfolio_store.list_portfolios():
+        # fold in fills from earlier rebalances first, so "orders still in
+        # flight" reflects reality rather than a stale ledger
+        if p.get("status") == "open" and p.get("pending_order_ids") and _reconcile_portfolio_orders(p["id"]):
+            p = portfolio_store.get_portfolio(p["id"]) or p
+        portfolios.append(p)
+    deps = ProactiveDeps(quotes_fn=_intraday_quotes, news_fn=_headlines, recalibrate_fn=recalibrate,
+                         record_fn=portfolio_store.record_proactive_check, client_fn=client,
+                         market_open_fn=_market_open)
+    results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
+    return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
+            "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,
+                         "source": r.source} for r in results]}
 
 
 PORTFOLIO_DETAIL_PAGE = """
@@ -2989,11 +3084,30 @@ PORTFOLIO_DETAIL_PAGE = """
     <tr><th>Date</th><th>Orders placed</th><th>Portfolio value before</th></tr>
     {% for ev in p.rebalance_history|reverse %}
     <tr>
-      <td>{{ ev.date }}</td>
+      <td>{{ ev.date }}{% if ev.trigger %}<div class="act" style="background:#eef0f5;color:#555;">{{ ev.trigger }}</div>{% endif %}
+        {% if ev.reason %}<div style="color:#6a7280;font-size:0.8rem;max-width:260px;white-space:normal;">{{ ev.reason }}</div>{% endif %}</td>
       <td>{% for o in ev.orders %}<span class="act {{ o.side }}">{{ o.side }} {{ o.qty }} {{ o.symbol }}</span> {% endfor %}
         {% if not ev.orders %}no changes needed{% endif %}
         {% if ev.errors %}<div style="color:#a3312f;">{{ ev.errors|length }} error(s)</div>{% endif %}</td>
       <td>${{ '{:,.2f}'.format(ev.portfolio_value_before) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% endif %}
+
+  {% if p.proactive_checks %}
+  <h2>Mid-day news watch</h2>
+  <p class="meta-row">Once each trading day the news watch reads this portfolio's headlines and price moves
+    and decides whether to recalibrate ahead of schedule. Latest checks:</p>
+  <div class="table-wrap">
+  <table>
+    <tr><th>When</th><th>Decision</th><th>Why</th></tr>
+    {% for c in (p.proactive_checks|reverse|list)[:7] %}
+    <tr>
+      <td>{{ c.at[:10] }}</td>
+      <td><b>{{ c.action }}</b>{% if c.source and c.source != 'rules' %}<div style="color:#888;font-size:0.78rem;">{{ c.source }}{% if c.review and c.review.confidence is not none %} · {{ '%.0f'|format(c.review.confidence * 100) }}%{% endif %}</div>{% endif %}</td>
+      <td style="white-space:normal;">{{ c.reason }}{% if c.triggers %}<div style="color:#888;font-size:0.8rem;">{{ c.triggers|join('; ') }}</div>{% endif %}</td>
     </tr>
     {% endfor %}
   </table>

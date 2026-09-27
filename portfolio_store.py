@@ -163,6 +163,20 @@ def record_rebalance(portfolio_id: str, new_holdings: Dict[str, Dict[str, float]
     })
 
 
+def record_proactive_check(portfolio_id: str, entry: Dict[str, Any], keep: int = 30) -> None:
+    """Appends one mid-day news-watch result (proactive_recal.py) — acted on
+    or not — to the portfolio's `proactive_checks`, newest last, capped at
+    `keep`. A check that led to a recalibration ALSO shows up in
+    rebalance_history (trigger="proactive"); this log is what explains the
+    days it decided to wait."""
+    doc_ref = _get_client().collection(_COLLECTION).document(portfolio_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        return
+    checks = (snap.to_dict() or {}).get("proactive_checks", []) + [entry]
+    doc_ref.update({"proactive_checks": checks[-keep:]})
+
+
 # =============================================================================
 # Reconciling orders that were still IN FLIGHT when the ledger was written.
 #
