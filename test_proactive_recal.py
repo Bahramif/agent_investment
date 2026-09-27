@@ -1,0 +1,156 @@
+"""
+test_proactive_recal.py
+========================
+Drives the REAL web_ui Flask app through /portfolios/proactive_check — the
+endpoint the mid-day Cloud Scheduler job hits — to prove the news watch is
+wired end to end: pending fills are reconciled first, the token is enforced,
+a material-news verdict runs a REAL recalibration (orders placed, history
+tagged "proactive" with the reason), quiet days and dry runs never trade, and
+every check is logged and rendered on the portfolio page.
+
+Only the outside world is faked (same harness as
+test_portfolio_page_reconcile.py): GCP at import, Firestore, Alpaca, the
+deployed agent's recommend(), headlines, and Claude.
+
+Run:  python test_proactive_recal.py
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace as NS
+
+import test_portfolio_page_reconcile as harness      # stubs GCP, imports the real web_ui
+from test_portfolio_page_reconcile import FakeTradingClient, base_doc, install
+
+web_ui = harness.web_ui
+import alpaca.trading.client as alpaca_trading_client   # noqa: E402
+import claude_reasoning                                  # noqa: E402
+
+TODAY = datetime.now(timezone.utc).date()
+TOKEN = {"X-Recalibrate-Token": "stub"}                  # what the stubbed Secret Manager returns
+
+
+def doc(**over):
+    """A portfolio launched 20 days ago, next scheduled recalibration 12 days out."""
+    fields = {"created_at": (TODAY - timedelta(days=20)).isoformat() + "T15:00:00+00:00",
+              "next_rebalance_date": (TODAY + timedelta(days=12)).isoformat()}
+    return base_doc(**{**fields, **over})
+
+
+class FakeClaude:
+    def __init__(self, verdict):
+        self.verdict, self.calls, self.messages = verdict, [], self
+    def create(self, **kw):
+        self.calls.append(kw)
+        return NS(stop_reason="tool_use", content=[NS(type="tool_use", name="decide_recalibration", input=self.verdict)])
+
+
+YES = {"recalibrate": True, "confidence": 0.92, "urgency": "high", "key_symbols": ["AAA"],
+       "reason": "AAA disclosed an SEC accounting probe and its CFO resigned — the thesis for the largest holding changed."}
+NEWS = {"AAA": ["AAA discloses SEC probe into revenue recognition", "AAA CFO resigns"]}
+
+
+def world(news=None, verdict=YES, market_open=True):
+    state = {"recommend_calls": 0, "claude": FakeClaude(verdict)}
+    web_ui._intraday_quotes = lambda syms: {s: {"price": 12.0, "prev_close": 12.2} for s in syms}
+    web_ui._headlines = lambda s, days: (news or {}).get(s, [])
+    web_ui._market_open = lambda: market_open
+    claude_reasoning._client = lambda: state["claude"]
+
+    def fake_recommend(sectors, top_n):
+        state["recommend_calls"] += 1
+        return {"final_weights": {"BBB": 0.5, "CCC": 0.4}, "status": "ok"}
+    web_ui.recommend = fake_recommend
+    return state
+
+
+def ok(msg): print(f"✓ {msg}")
+
+
+if __name__ == "__main__":
+    alpaca_trading_client.TradingClient = FakeTradingClient
+    web_ui._live_prices = lambda syms: {s: 12.0 for s in syms}
+    harness.simulate.fetch_price_series = lambda *a, **k: {}
+    c = web_ui.app.test_client()
+
+    print("SCENARIO A: the endpoint is token-protected — it can place real orders")
+    fake = install(doc())
+    st = world(news=NEWS)
+    assert c.post("/portfolios/proactive_check").status_code == 403
+    assert c.post("/portfolios/proactive_check", headers={"X-Recalibrate-Token": "wrong"}).status_code == 403
+    assert not FakeTradingClient.submitted and st["recommend_calls"] == 0 and not st["claude"].calls
+    ok("403 without / with a wrong token; nothing assessed, nothing traded")
+
+    print("SCENARIO B: material news -> in-flight fills reconciled, then a REAL proactive recalibration")
+    fake = install(doc())
+    st = world(news=NEWS)
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    d = fake.docs["p1"]
+    assert r["results"][0]["action"] == "recalibrated" and r["results"][0]["source"] == "claude", r
+    assert st["recommend_calls"] == 1 and FakeTradingClient.submitted, "the real recalibration ran and placed orders"
+    ev = d["rebalance_history"][-1]
+    assert ev["trigger"] == "proactive" and "SEC accounting probe" in ev["reason"]
+    assert d["next_rebalance_date"] == (TODAY + timedelta(days=21)).isoformat(), "the cadence restarts from today"
+    assert d["proactive_checks"][-1]["action"] == "recalibrated" and d["proactive_checks"][-1]["recalibration"]["orders"] > 0
+    prompt = st["claude"].calls[0]["messages"][0]["content"]
+    assert "AAA discloses SEC probe" in prompt and "AAA: " in prompt and "CCC: " in prompt, \
+        "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"
+    ok(f"orders {FakeTradingClient.submitted}; history tagged proactive; next scheduled date pushed to {d['next_rebalance_date']}")
+
+    print("SCENARIO C: running again the same day does nothing — guardrails, no model call, no orders")
+    n_orders, n_calls = len(FakeTradingClient.submitted), len(st["claude"].calls)
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert r["results"][0]["action"] == "skipped" and "0 day(s) ago" in r["results"][0]["reason"]
+    assert len(FakeTradingClient.submitted) == n_orders and len(st["claude"].calls) == n_calls
+    ok(r["results"][0]["reason"])
+
+    print("SCENARIO D: dry run and a closed market FLAG instead of trading")
+    for query, kw, needle in (("?dry_run=1", {}, "dry run"), ("", {"market_open": False}, "market closed")):
+        fake = install(doc())
+        st = world(news=NEWS, **kw)
+        r = c.post("/portfolios/proactive_check" + query, headers=TOKEN).get_json()
+        assert r["results"][0]["action"] == "flagged" and needle in r["results"][0]["reason"], r
+        assert st["recommend_calls"] == 0 and not [x for x in FakeTradingClient.submitted]
+        assert fake.docs["p1"]["proactive_checks"][-1]["action"] == "flagged"
+    ok("dry_run=1 and market-closed both flagged, zero orders, still logged")
+
+    print("SCENARIO E: a quiet day -> hold, no model call, logged")
+    # on target (AAA 1200 / BBB 600 / cash 1000 at $12) and nothing in flight: no drift flag either
+    fake = install(doc(pending_order_ids={}, rebalance_history=[
+        {"date": (TODAY - timedelta(days=10)).isoformat(), "target_weights": {"AAA": 0.43, "BBB": 0.21}}]))
+    st = world(news={})
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert r["results"][0]["action"] == "hold" and not st["claude"].calls and st["recommend_calls"] == 0
+    ok(r["results"][0]["reason"])
+
+    print("SCENARIO F: the model says wait -> hold with its reason")
+    fake = install(doc())
+    st = world(news=NEWS, verdict={"recalibrate": False, "confidence": 0.8, "urgency": "low",
+                                   "reason": "Probe is preliminary; next scheduled rebalance is close enough."})
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert r["results"][0]["action"] == "hold" and "preliminary" in r["results"][0]["reason"]
+    assert not FakeTradingClient.submitted
+    ok("held")
+
+    print("SCENARIO G: the page shows the news watch and tags each recalibration with its trigger")
+    fake = install(doc())
+    st = world(news=NEWS)
+    c.post("/portfolios/proactive_check", headers=TOKEN)
+    html = c.get("/portfolios/p1").get_data(as_text=True)
+    assert "Mid-day news watch" in html and "recalibrated" in html and "SEC accounting probe" in html
+    assert ">proactive<" in html
+    ok("news-watch table and 'proactive' badge rendered")
+
+    print("SCENARIO H: the scheduled due-check and the manual button are tagged too")
+    fake = install(doc(next_rebalance_date=TODAY.isoformat()))
+    world()
+    c.post("/portfolios/recalibrate_due", headers=TOKEN)
+    assert fake.docs["p1"]["rebalance_history"][-1]["trigger"] == "scheduled"
+    fake = install(doc())
+    world()
+    c.post("/portfolios/p1/recalibrate")
+    assert fake.docs["p1"]["rebalance_history"][-1]["trigger"] == "manual"
+    ok("scheduled / manual")
+
+    print("\nAll proactive-recalibration integration scenarios passed.")

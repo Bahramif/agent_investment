@@ -110,3 +110,24 @@ day_trading:
     lesson_ttl_days: 60          # active lessons with no live evidence by then expire
     max_proposals_per_day: 3
     post_exit_minutes: 30        # watch price after an exit (was the stop just noise?)
+
+# =============================================================================
+# proactive_recalibration — the mid-day news watch (proactive_recal.py).
+# Once per trading day it reads each open portfolio's headlines and price moves
+# and decides whether to recalibrate NOW instead of waiting for the scheduled
+# date. It only ever runs the same recalibration the "Recalibrate Now" button
+# does. Not part of `buckets` (mandate_allocator.py never reads this block).
+# =============================================================================
+proactive_recalibration:
+  enabled: true
+  dry_run: false                  # true = assess and log only, never trade
+  act_on_manual_portfolios: false # manual-recalibration portfolios are flagged, not traded
+  min_days_since_last_recal: 3    # no proactive recalibration within 3 days of any other
+  skip_if_scheduled_within_days: 1  # the planned one is due today/tomorrow -> let it run
+  max_proactive_per_30d: 2
+  min_confidence: 0.7             # the news model must be at least this sure acting now beats waiting
+  news_lookback_days: 1
+  material_weight: 0.05           # holdings under 5% don't raise price flags on their own
+  big_move_pct: 0.06              # a material holding moving 6%+ today is flagged to the model
+  fallback_drop_pct: 0.10         # model unavailable: act only on a 10%+ drop in a material holding...
+  max_drift: 0.15                 # ...or 15%+ total drift from target weights
