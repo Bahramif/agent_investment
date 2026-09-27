@@ -25,7 +25,7 @@ from test_portfolio_page_reconcile import FakeTradingClient, base_doc, install
 
 web_ui = harness.web_ui
 import alpaca.trading.client as alpaca_trading_client   # noqa: E402
-import claude_reasoning                                  # noqa: E402
+import anthropic                                         # noqa: E402
 
 TODAY = datetime.now(timezone.utc).date()
 TOKEN = {"X-Recalibrate-Token": "stub"}                  # what the stubbed Secret Manager returns
@@ -40,7 +40,10 @@ def doc(**over):
 
 class FakeClaude:
     def __init__(self, verdict):
-        self.verdict, self.calls, self.messages = verdict, [], self
+        self.verdict, self.calls, self.messages, self.client_kwargs = verdict, [], self, None
+    def bind(self, kwargs):
+        self.client_kwargs = kwargs          # how web_ui constructed the Vertex client
+        return self
     def create(self, **kw):
         self.calls.append(kw)
         return NS(stop_reason="tool_use", content=[NS(type="tool_use", name="decide_recalibration", input=self.verdict)])
@@ -56,7 +59,7 @@ def world(news=None, verdict=YES, market_open=True):
     web_ui._intraday_quotes = lambda syms: {s: {"price": 12.0, "prev_close": 12.2} for s in syms}
     web_ui._headlines = lambda s, days: (news or {}).get(s, [])
     web_ui._market_open = lambda: market_open
-    claude_reasoning._client = lambda: state["claude"]
+    anthropic.AnthropicVertex = lambda **kw: state["claude"].bind(kw)
 
     def fake_recommend(sectors, top_n):
         state["recommend_calls"] += 1
@@ -93,6 +96,7 @@ if __name__ == "__main__":
     assert ev["trigger"] == "proactive" and "SEC accounting probe" in ev["reason"]
     assert d["next_rebalance_date"] == (TODAY + timedelta(days=21)).isoformat(), "the cadence restarts from today"
     assert d["proactive_checks"][-1]["action"] == "recalibrated" and d["proactive_checks"][-1]["recalibration"]["orders"] > 0
+    assert st["claude"].client_kwargs == {"project_id": web_ui.PROJECT, "region": "global"}, st["claude"].client_kwargs
     prompt = st["claude"].calls[0]["messages"][0]["content"]
     assert "AAA discloses SEC probe" in prompt and "AAA: " in prompt and "CCC: " in prompt, \
         "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"

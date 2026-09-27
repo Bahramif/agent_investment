@@ -2944,8 +2944,11 @@ def proactive_check_route():
         return recalibrate_portfolio(pid, trigger="proactive", reason=reason)
 
     def client():
-        from claude_reasoning import _client
-        return _client()
+        # Same construction as ask_claude(): this service has no
+        # ANTHROPIC_VERTEX_PROJECT_ID, which claude_reasoning._client() requires —
+        # going through it would silently leave the news watch on its fallback.
+        from anthropic import AnthropicVertex
+        return AnthropicVertex(project_id=PROJECT, region="global")
 
     cfg = _proactive_cfg()
     portfolios = []
