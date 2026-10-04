@@ -4,6 +4,7 @@ google-cloud-aiplatform[reasoningengine,agent-engines]
 google-cloud-secret-manager
 google-cloud-firestore
 alpaca-py
+anthropic[vertex]
 yfinance
 scipy
 pyyaml

@@ -2814,12 +2814,25 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
 
     portfolio_store.record_rebalance(
         portfolio_id, new_holdings, new_cash, new_pending,
-        event={"date": rebalance_date, "orders": orders_placed, "errors": errors,
+        event={"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(),
+               "orders": orders_placed, "errors": errors,
               "portfolio_value_before": current_value, "target_weights": weights,
               "trigger": trigger, "reason": reason[:1000]},
         next_rebalance_date=next_date,
     )
     return {"orders": orders_placed, "errors": errors, "portfolio_value_before": current_value}
+
+
+@app.template_filter("et_time")
+def _et_time(iso: str) -> str:
+    """ISO timestamp -> 'HH:MM' New York time (scheduled recalibrations run
+    at 17:00 ET, the mid-day news watch around 12:30 ET)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        return datetime.fromisoformat(iso).astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")
+    except Exception:
+        return ""
 
 
 @app.route("/portfolios/<portfolio_id>/news_watch", methods=["POST"])
@@ -3112,11 +3125,17 @@ PORTFOLIO_DETAIL_PAGE = """
   <h2>Recalibration history</h2>
   <div class="table-wrap">
   <table>
-    <tr><th>Date</th><th>Orders placed</th><th>Portfolio value before</th></tr>
+    <tr><th>Date</th><th>Type</th><th>Orders placed</th><th>Portfolio value before</th></tr>
     {% for ev in p.rebalance_history|reverse %}
+    {% set kind = {'scheduled': ('📅 Scheduled', '#e8f0fe', '#1a56db'),
+                   'proactive': ('📰 Mid-day news watch', '#fff4e5', '#b45309'),
+                   'manual': ('👆 Manual (Recalibrate Now)', '#eef0f5', '#555')}.get(ev.trigger,
+                  ('Not recorded', '#f6f6f6', '#999')) %}
     <tr>
-      <td>{{ ev.date }}{% if ev.trigger %}<div class="act" style="background:#eef0f5;color:#555;">{{ ev.trigger }}</div>{% endif %}
-        {% if ev.reason %}<div style="color:#6a7280;font-size:0.8rem;max-width:260px;white-space:normal;">{{ ev.reason }}</div>{% endif %}</td>
+      <td>{{ ev.date }}{% if ev.at %}<div style="color:#888;font-size:0.8rem;">{{ ev.at|et_time }} ET</div>{% endif %}</td>
+      <td style="white-space:normal;"><span class="act" style="background:{{ kind[1] }};color:{{ kind[2] }};">{{ kind[0] }}</span>
+        {% if not ev.trigger %}<div style="color:#999;font-size:0.75rem;">before labels were added</div>{% endif %}
+        {% if ev.reason %}<div style="color:#6a7280;font-size:0.8rem;max-width:280px;">{{ ev.reason }}</div>{% endif %}</td>
       <td>{% for o in ev.orders %}<span class="act {{ o.side }}">{{ o.side }} {{ o.qty }} {{ o.symbol }}</span> {% endfor %}
         {% if not ev.orders %}no changes needed{% endif %}
         {% if ev.errors %}<div style="color:#a3312f;">{{ ev.errors|length }} error(s)</div>{% endif %}</td>
