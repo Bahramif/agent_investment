@@ -144,8 +144,9 @@ if __name__ == "__main__":
     c.post("/portfolios/proactive_check", headers=TOKEN)
     html = c.get("/portfolios/p1").get_data(as_text=True)
     assert "Mid-day news watch" in html and "recalibrated" in html and "SEC accounting probe" in html
-    assert ">proactive<" in html
-    ok("news-watch table and 'proactive' badge rendered")
+    history = html.split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
+    assert "📰 Mid-day news watch" in history and " ET</div>" in history, "type label + New York time on the row"
+    ok("news-watch table rendered; history row labelled '📰 Mid-day news watch' with its ET time")
 
     print("SCENARIO H: the scheduled due-check and the manual button are tagged too")
     fake = install(doc(next_rebalance_date=TODAY.isoformat()))
@@ -156,6 +157,17 @@ if __name__ == "__main__":
     world()
     c.post("/portfolios/p1/recalibrate")
     assert fake.docs["p1"]["rebalance_history"][-1]["trigger"] == "manual"
+    fake = install(doc(rebalance_history=[
+        {"date": "2026-09-01", "orders": [], "portfolio_value_before": 1.0},                              # pre-label
+        {"date": "2026-09-08", "at": "2026-09-08T21:00:00+00:00", "trigger": "scheduled", "orders": [],
+         "portfolio_value_before": 1.0},
+        {"date": "2026-09-10", "at": "2026-09-10T16:31:00+00:00", "trigger": "proactive", "reason": "probe",
+         "orders": [], "portfolio_value_before": 1.0}]))
+    world()
+    history = c.get("/portfolios/p1").get_data(as_text=True).split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
+    for needle in ("📅 Scheduled", "17:00 ET", "📰 Mid-day news watch", "12:31 ET", "Not recorded", "before labels"):
+        assert needle in history, needle
+    assert history.index("2026-09-10") < history.index("2026-09-08") < history.index("2026-09-01"), "newest first"
     ok("scheduled / manual")
 
     print("SCENARIO I: the owner's switch — OFF is never checked; the page toggles it")
