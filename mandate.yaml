@@ -116,12 +116,13 @@ day_trading:
 # Once per trading day it reads each open portfolio's headlines and price moves
 # and decides whether to recalibrate NOW instead of waiting for the scheduled
 # date. It only ever runs the same recalibration the "Recalibrate Now" button
-# does. Not part of `buckets` (mandate_allocator.py never reads this block).
+# does, and only for portfolios whose owner switched the news watch ON (per
+# portfolio, on the Portfolio tab; off by default). These settings apply to
+# those. Not part of `buckets` (mandate_allocator.py never reads this block).
 # =============================================================================
 proactive_recalibration:
   enabled: true
   dry_run: false                  # true = assess and log only, never trade
-  act_on_manual_portfolios: false # manual-recalibration portfolios are flagged, not traded
   min_days_since_last_recal: 3    # no proactive recalibration within 3 days of any other
   skip_if_scheduled_within_days: 1  # the planned one is due today/tomorrow -> let it run
   max_proactive_per_30d: 2

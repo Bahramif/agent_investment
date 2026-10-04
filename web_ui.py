@@ -1570,6 +1570,10 @@ PAGE = """
               {% endfor %}
             </select>
           </label>
+          <label style="display:flex;gap:8px;align-items:flex-start;font-weight:400;">
+            <input type="checkbox" name="news_watch" value="1" style="margin-top:3px;">
+            <span>Mid-day news watch — check this portfolio's news every trading day at 12:30 ET and
+              recalibrate early when it materially changes the picture. You can turn it on or off later.</span></label>
           <button type="submit" class="execute-btn">Launch as New Portfolio (Alpaca Paper)</button>
         </form>
       </div>
@@ -1844,6 +1848,7 @@ def execute():
     batch_id = request.form.get("batch_id", "") or uuid.uuid4().hex[:10]
     portfolio_name = request.form.get("portfolio_name", "").strip()
     rebalance_every_days = int(float(request.form.get("rebalance_cadence", 0) or 0))
+    news_watch = request.form.get("news_watch") == "1"
     fills, error, portfolio_id = [], None, None
 
     if not _LAST_CONTEXT or not _LAST_CONTEXT.get("rows"):
@@ -1944,6 +1949,7 @@ def execute():
                 holdings=holdings, cash_remaining=max(0.0, capital - spent), errors=errors,
                 pending_order_ids=pending_order_ids, rebalance_every_days=rebalance_every_days,
                 estimated_1mo_return=_LAST_CONTEXT.get("expected_return"),
+                news_watch=news_watch,
             )
         elif not error:
             error = "Nothing to execute — no name had both a live price and a whole-share allocation."
@@ -2816,6 +2822,16 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     return {"orders": orders_placed, "errors": errors, "portfolio_value_before": current_value}
 
 
+@app.route("/portfolios/<portfolio_id>/news_watch", methods=["POST"])
+def news_watch_route(portfolio_id: str):
+    """The owner's on/off switch for the mid-day news watch. Same trust model
+    as "Recalibrate Now" and "Close & Liquidate" on this page (the app is
+    deliberately public; the scheduled endpoints are what carry the token)."""
+    import portfolio_store
+    portfolio_store.set_news_watch(portfolio_id, request.form.get("enabled") == "1")
+    return redirect(f"/portfolios/{portfolio_id}")
+
+
 @app.route("/portfolios/<portfolio_id>/recalibrate", methods=["POST"])
 def recalibrate_route(portfolio_id: str):
     """Manual "Recalibrate Now" trigger — the same real logic the scheduled
@@ -3010,6 +3026,18 @@ PORTFOLIO_DETAIL_PAGE = """
     {% else %}· manual recalibration only
     {% endif %}</div>
   <div class="paper-banner">📝 Alpaca PAPER account — not real money.</div>
+  {% if p.status == 'open' %}
+  <form method="post" action="/portfolios/{{ p.id }}/news_watch" style="margin:0 0 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"
+        {% if not p.news_watch %}onsubmit="return confirm('Turn on the mid-day news watch for {{ p.name }}? Each trading day at 12:30 ET it reads this portfolio\'s news and may recalibrate it (real paper orders) ahead of schedule.');"{% endif %}>
+    <input type="hidden" name="enabled" value="{{ '0' if p.news_watch else '1' }}">
+    <span style="font-size:0.9rem;">📰 Mid-day news watch:
+      <b style="color:{{ '#00a340' if p.news_watch else '#888' }};">{{ 'ON' if p.news_watch else 'OFF' }}</b>
+      <span style="color:#6a7280;">{{ '— checks news daily at 12:30 ET and may recalibrate early' if p.news_watch else '— recalibrates only on schedule or when you click' }}</span></span>
+    <button type="submit" style="background:{{ '#fee' if p.news_watch else '#0d1117' }};color:{{ '#a3312f' if p.news_watch else '#fff' }};
+            border:none;font-size:0.8rem;padding:6px 12px;border-radius:8px;cursor:pointer;font-weight:600;">
+      {{ 'Turn off' if p.news_watch else 'Turn on' }}</button>
+  </form>
+  {% endif %}
 
   {% if error %}<div class="warn">{{ error }}</div>{% endif %}
 

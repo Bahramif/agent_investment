@@ -32,9 +32,10 @@ TOKEN = {"X-Recalibrate-Token": "stub"}                  # what the stubbed Secr
 
 
 def doc(**over):
-    """A portfolio launched 20 days ago, next scheduled recalibration 12 days out."""
+    """A portfolio launched 20 days ago, next scheduled recalibration 12 days
+    out, with its owner's news-watch switch ON."""
     fields = {"created_at": (TODAY - timedelta(days=20)).isoformat() + "T15:00:00+00:00",
-              "next_rebalance_date": (TODAY + timedelta(days=12)).isoformat()}
+              "next_rebalance_date": (TODAY + timedelta(days=12)).isoformat(), "news_watch": True}
     return base_doc(**{**fields, **over})
 
 
@@ -156,5 +157,40 @@ if __name__ == "__main__":
     c.post("/portfolios/p1/recalibrate")
     assert fake.docs["p1"]["rebalance_history"][-1]["trigger"] == "manual"
     ok("scheduled / manual")
+
+    print("SCENARIO I: the owner's switch — OFF is never checked; the page toggles it")
+    fake = install(doc(news_watch=False))
+    st = world(news=NEWS)
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert r["checked"] == 0 and not st["claude"].calls and not FakeTradingClient.submitted
+    assert "proactive_checks" not in fake.docs["p1"], "an OFF portfolio leaves no trace"
+    html = c.get("/portfolios/p1").get_data(as_text=True)
+    assert "Mid-day news watch:" in html and ">OFF<" in html and "Turn on" in html
+    assert c.post("/portfolios/p1/news_watch", data={"enabled": "1"}).status_code == 302
+    assert fake.docs["p1"]["news_watch"] is True and fake.docs["p1"]["news_watch_changed_at"]
+    assert ">ON<" in c.get("/portfolios/p1").get_data(as_text=True)
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert r["checked"] == 1 and r["results"][0]["action"] == "recalibrated"
+    c.post("/portfolios/p1/news_watch", data={"enabled": "0"})
+    assert fake.docs["p1"]["news_watch"] is False
+    ok("off -> not checked, no log; Turn on -> next run acts; Turn off -> back off")
+
+    print("SCENARIO J: the launch form's checkbox sets the switch on the new portfolio")
+    import portfolio_store as ps
+    seen = {}
+    real_create = ps.create_portfolio
+    ps.create_portfolio = lambda **kw: seen.update(kw) or "new1"
+    web_ui._LAST_CONTEXT.clear()
+    web_ui._LAST_CONTEXT.update({"rows": [{"name": "AAA", "price": 12.0, "shares": 10, "action": "BUY",
+                                           "weight": 1.0, "action_notional": 120.0}],
+                                 "expected_return": 0.01, "batch_id": "b1"})
+    install(doc())
+    for form, want in (({"news_watch": "1"}, True), ({}, False)):
+        seen.clear()
+        c.post("/execute", data={"sectors": "tech_ai", "capital": "1000", "top_n": "5", "batch_id": "b1",
+                                 "rebalance_cadence": "21", **form})
+        assert seen.get("news_watch") is want, (form, seen.get("news_watch"))
+    ps.create_portfolio = real_create
+    ok("checked -> news_watch=True, unchecked -> False")
 
     print("\nAll proactive-recalibration integration scenarios passed.")
