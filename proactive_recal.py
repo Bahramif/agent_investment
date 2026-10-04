@@ -3,7 +3,9 @@ proactive_recal.py
 ===================
 The mid-day NEWS WATCH for launched portfolios: once per trading day (a Cloud
 Scheduler job hits /portfolios/proactive_check around 12:30 ET), look at each
-open portfolio's holdings — today's headlines, today's price moves, how far
+open portfolio whose owner has turned the news watch ON (the per-portfolio
+`news_watch` switch on the Portfolio tab — off by default; portfolios with it
+off are not looked at, logged or traded) and check its holdings — today's headlines, today's price moves, how far
 the book has drifted from its last target weights — and decide whether it
 should be recalibrated NOW instead of waiting for its scheduled date. If so,
 the SAME recalibrate_portfolio() the scheduled due-check and the "Recalibrate
@@ -34,11 +36,11 @@ Pipeline per portfolio (evaluate_portfolio):
      output falls back to the deterministic rule: act only on a severe
      trigger (a material holding down >= fallback_drop_pct, or drift >=
      max_drift).
-  5. POLICY (decide): recalibrate only if the model says so with confidence
-     >= min_confidence (or the fallback rule fires). Portfolios on manual
-     recalibration (rebalance_every_days == 0) are only FLAGGED unless
-     act_on_manual_portfolios is set — their owner chose not to automate.
-     dry_run flags instead of trading, everywhere.
+  5. POLICY: recalibrate only if the model says so with confidence
+     >= min_confidence (or the fallback rule fires). Turning the switch on IS
+     the owner's consent, so this applies to portfolios on manual
+     recalibration too. dry_run (config or ?dry_run=1) and a closed market
+     flag instead of trading.
 
 Every check — including holds and skips — is logged on the portfolio
 (portfolio_store.record_proactive_check), so the page shows what the news
@@ -71,7 +73,6 @@ PROACTIVE = "proactive"
 class ProactiveConfig:
     enabled: bool = True
     dry_run: bool = False                     # assess and log, never trade
-    act_on_manual_portfolios: bool = False    # manual-only portfolios are flagged, not traded
     min_days_since_last_recal: int = 3
     skip_if_scheduled_within_days: int = 1    # 1 = skip if the scheduled one is due today or tomorrow
     max_proactive_per_30d: int = 2
@@ -148,10 +149,17 @@ def target_weights(p: Dict[str, Any]) -> Dict[str, float]:
 # -----------------------------------------------------------------------------
 # Guardrails
 # -----------------------------------------------------------------------------
+def watching(p: Dict[str, Any]) -> bool:
+    """The owner's per-portfolio switch. Off (or never set) = not watched."""
+    return p.get("status") == "open" and p.get("news_watch") is True
+
+
 def precheck(p: Dict[str, Any], cfg: ProactiveConfig, today: date) -> Optional[str]:
     """Reason this portfolio must not be proactively recalibrated today, or None."""
     if p.get("status") != "open":
         return "not open"
+    if p.get("news_watch") is not True:
+        return "news watch is off for this portfolio"
     if not p.get("holdings"):
         return "no holdings to watch"
     if p.get("pending_order_ids"):
@@ -389,10 +397,8 @@ def evaluate_portfolio(p: Dict[str, Any], cfg: ProactiveConfig, deps: ProactiveD
         if review["recalibrate"]:
             reason = f"confidence {review['confidence']:.2f} below {cfg.min_confidence:.2f}: {reason}"
         return CheckResult(pid, name, "hold", reason, source, review, trig)
-    manual = not (p.get("rebalance_every_days") or 0)
-    if dry_run or cfg.dry_run or (manual and not cfg.act_on_manual_portfolios):
-        note = "dry run" if (dry_run or cfg.dry_run) else "manual-recalibration portfolio — flagged for you to decide"
-        return CheckResult(pid, name, "flagged", f"{review['reason']} ({note})", source, review, trig)
+    if dry_run or cfg.dry_run:
+        return CheckResult(pid, name, "flagged", f"{review['reason']} (dry run)", source, review, trig)
     if not deps.market_open_fn():
         return CheckResult(pid, name, "flagged", f"{review['reason']} (market closed — not trading now)",
                            source, review, trig)
@@ -407,8 +413,9 @@ def evaluate_portfolio(p: Dict[str, Any], cfg: ProactiveConfig, deps: ProactiveD
 
 def run_proactive_check(portfolios: Sequence[Dict[str, Any]], cfg: ProactiveConfig, deps: ProactiveDeps,
                         now: Optional[datetime] = None, dry_run: bool = False) -> List[CheckResult]:
-    """One mid-day pass over every portfolio. Never raises; every outcome is
-    recorded on its portfolio."""
+    """One mid-day pass over every portfolio whose news watch is ON. Never
+    raises; every outcome is recorded on its portfolio. Portfolios with the
+    switch off are not evaluated and leave no trace."""
     now = now or datetime.now(timezone.utc)
     today = now.date()
     if not cfg.enabled:
@@ -421,7 +428,7 @@ def run_proactive_check(portfolios: Sequence[Dict[str, Any]], cfg: ProactiveConf
             print(f"[proactive_recal] Claude client unavailable ({e}) — deterministic fallback only")
     out = []
     for p in portfolios:
-        if p.get("status") != "open":
+        if not watching(p):
             continue
         try:
             res = evaluate_portfolio(p, cfg, deps, today, client, dry_run)
@@ -446,7 +453,8 @@ if __name__ == "__main__":
              "created_at": "2026-09-01T15:00:00+00:00", "cash_remaining": 1_000.0, "pending_order_ids": {},
              "holdings": {"AAA": {"shares": 100, "entry_price": 50.0, "cost": 5000.0},
                           "BBB": {"shares": 40, "entry_price": 100.0, "cost": 4000.0}},
-             "rebalance_history": [], "rebalance_every_days": 21, "next_rebalance_date": "2026-10-12"}
+             "rebalance_history": [], "rebalance_every_days": 21, "next_rebalance_date": "2026-10-12",
+             "news_watch": True}
         d.update(over)
         return d
 
@@ -496,7 +504,7 @@ if __name__ == "__main__":
              (pf(next_rebalance_date="2026-09-29"), "will handle this"),
              (pf(rebalance_history=[{"date": "2026-09-10", "trigger": "proactive"},
                                     {"date": "2026-09-20", "trigger": "proactive"}]), "already 2"),
-             (pf(holdings={}), "no holdings")]
+             (pf(holdings={}), "no holdings"), (pf(news_watch=False), "is off")]
     for p, needle in cases:
         why = precheck(p, cfg, today)
         assert why and needle in why, (needle, why)
@@ -576,20 +584,24 @@ if __name__ == "__main__":
     assert run_proactive_check([pf()], cfg, d, NOW)[0].source == "fallback"
     print("✓ -12% with the model down -> recalibrate; -6% with the model down -> hold")
 
-    print("TEST 9: manual portfolios, dry runs and a closed market FLAG instead of trading")
-    for p, kw, c2, needle in ((pf(rebalance_every_days=0, next_rebalance_date=None), {}, cfg, "manual"),
-                              (pf(), {"dry_run": True}, cfg, "dry run"),
+    print("TEST 9: dry runs and a closed market FLAG instead of trading")
+    for p, kw, c2, needle in ((pf(), {"dry_run": True}, cfg, "dry run"),
                               (pf(), {}, ProactiveConfig(dry_run=True), "dry run")):
         d, log = deps(news=FRAUD, client=FakeClient(YES))
         r = run_proactive_check([p], c2, d, NOW, **kw)[0]
         assert r.action == "flagged" and needle in r.reason and not log["recal"], r
     d, log = deps(news=FRAUD, client=FakeClient(YES), market_open=False)
     assert run_proactive_check([pf()], cfg, d, NOW)[0].action == "flagged" and not log["recal"]
-    d, log = deps(news=FRAUD, client=FakeClient(YES))
-    r = run_proactive_check([pf(rebalance_every_days=0, next_rebalance_date=None)],
-                            ProactiveConfig(act_on_manual_portfolios=True), d, NOW)[0]
-    assert r.action == "recalibrated"
     print("✓ ok")
+
+    print("TEST 9b: the owner's switch — OFF is never looked at; ON acts, manual-cadence portfolios included")
+    fc = FakeClient(YES)
+    d, log = deps(news=FRAUD, client=fc)
+    res = run_proactive_check([pf(id="off", news_watch=False), pf(id="unset", news_watch=None),
+                               pf(id="manual", rebalance_every_days=0, next_rebalance_date=None)], cfg, d, NOW)
+    assert [(r.portfolio_id, r.action) for r in res] == [("manual", "recalibrated")], res
+    assert [pid for pid, _ in log["records"]] == ["manual"] and len(fc.calls) == 1
+    print("✓ off / never-set portfolios: no model call, no log, no trade; switched-on manual portfolio recalibrated")
 
     print("TEST 10: one portfolio failing never stops the others; recalibration errors are reported")
     d, log = deps(news=FRAUD, client=FakeClient(YES))

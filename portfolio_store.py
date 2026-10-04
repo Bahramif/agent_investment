@@ -47,7 +47,8 @@ def create_portfolio(name: str, sectors: List[str], capital: float, top_n: int,
                      errors: Optional[List[Dict[str, str]]] = None,
                      pending_order_ids: Optional[Dict[str, str]] = None,
                      rebalance_every_days: int = 0,
-                     estimated_1mo_return: Optional[float] = None) -> str:
+                     estimated_1mo_return: Optional[float] = None,
+                     news_watch: bool = False) -> str:
     """holdings: {symbol: {"shares": int, "entry_price": float, "cost": float}}
     for whatever actually filled. pending_order_ids: {symbol: client_order_id}
     for orders accepted by Alpaca but not yet resolved (e.g. placed after
@@ -67,6 +68,10 @@ def create_portfolio(name: str, sectors: List[str], capital: float, top_n: int,
     the Portfolio tab can later show what was naively projected vs. what
     actually happened — None if it wasn't available for some reason,
     never recomputed after the fact.
+
+    news_watch: the owner's switch for the mid-day news watch
+    (proactive_recal.py) — off unless they turned it on at launch; flip it
+    later with set_news_watch().
     Returns the new portfolio_id."""
     portfolio_id = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc)
@@ -87,6 +92,7 @@ def create_portfolio(name: str, sectors: List[str], capital: float, top_n: int,
                                if rebalance_every_days > 0 else None,
         "rebalance_history": [],
         "estimated_1mo_return": estimated_1mo_return,
+        "news_watch": bool(news_watch),
     }
     _get_client().collection(_COLLECTION).document(portfolio_id).set(doc)
     return portfolio_id
@@ -161,6 +167,18 @@ def record_rebalance(portfolio_id: str, new_holdings: Dict[str, Dict[str, float]
         "rebalance_history": history,
         "next_rebalance_date": next_rebalance_date,
     })
+
+
+def set_news_watch(portfolio_id: str, enabled: bool) -> bool:
+    """Turns the mid-day news watch on/off for one OPEN portfolio. Returns
+    False if there is no such open portfolio."""
+    doc_ref = _get_client().collection(_COLLECTION).document(portfolio_id)
+    snap = doc_ref.get()
+    if not snap.exists or (snap.to_dict() or {}).get("status") != "open":
+        return False
+    doc_ref.update({"news_watch": bool(enabled),
+                    "news_watch_changed_at": datetime.now(timezone.utc).isoformat()})
+    return True
 
 
 def record_proactive_check(portfolio_id: str, entry: Dict[str, Any], keep: int = 30) -> None:
