@@ -135,6 +135,41 @@ def _alpaca_credentials() -> tuple[str, str]:
 
 _ALPACA_API_KEY, _ALPACA_SECRET_KEY = _alpaca_credentials()
 
+_ANTHROPIC_KEY: Optional[str] = None
+_ANTHROPIC_KEY_CHECKED = -1e9
+
+
+def _anthropic_api_key() -> Optional[str]:
+    """Anthropic API key from Secret Manager (`anthropic-api-key`), or None.
+    A found key is cached; a missing one is re-checked at most every 5
+    minutes, so adding the secret takes effect without a redeploy."""
+    import time
+    global _ANTHROPIC_KEY, _ANTHROPIC_KEY_CHECKED
+    if _ANTHROPIC_KEY or time.monotonic() - _ANTHROPIC_KEY_CHECKED < 300:
+        return _ANTHROPIC_KEY
+    _ANTHROPIC_KEY_CHECKED = time.monotonic()
+    try:
+        from google.cloud import secretmanager
+        _ANTHROPIC_KEY = secretmanager.SecretManagerServiceClient().access_secret_version(
+            name=f"projects/{PROJECT}/secrets/anthropic-api-key/versions/latest"
+        ).payload.data.decode("utf-8").strip() or None
+    except Exception:
+        _ANTHROPIC_KEY = None
+    return _ANTHROPIC_KEY
+
+
+def _claude_client():
+    """The ONE place this app builds a Claude client. Anthropic's own API when
+    an `anthropic-api-key` secret exists; otherwise Claude on Vertex AI (this
+    project's Vertex quota for Claude may be zero — see the news-watch log).
+    Same model IDs and messages.create() surface either way."""
+    key = _anthropic_api_key()
+    if key:
+        from anthropic import Anthropic
+        return Anthropic(api_key=key)
+    from anthropic import AnthropicVertex
+    return AnthropicVertex(project_id=PROJECT, region="global")
+
 # In-memory cache of the last recommendation, so /chat has context without
 # needing a real session store — fine for a single-user local tool.
 _LAST_CONTEXT: Dict[str, Any] = {}
@@ -405,8 +440,7 @@ def enrich(result: dict, selected_sectors: List[str], capital: float) -> Dict[st
 def ask_claude(question: str, context: Dict[str, Any]) -> str:
     """Answers a free-form question about the current recommendation. Fresh
     client per call (cheap; avoids holding a long-lived client across
-    requests) — same AnthropicVertex path claude_reasoning.py uses."""
-    from anthropic import AnthropicVertex
+    requests) — built by _claude_client() (Anthropic API, or Vertex)."""
 
     if not context:
         return "Get a recommendation first — there's nothing to discuss yet."
@@ -429,7 +463,7 @@ def ask_claude(question: str, context: Dict[str, Any]) -> str:
         "investment advice and you should say so if the question implies otherwise."
     )
     try:
-        client = AnthropicVertex(project_id=PROJECT, region="global")
+        client = _claude_client()
         response = client.messages.create(
             model="claude-sonnet-5",
             max_tokens=500,
@@ -2973,11 +3007,9 @@ def proactive_check_route():
         return recalibrate_portfolio(pid, trigger="proactive", reason=reason)
 
     def client():
-        # Same construction as ask_claude(): this service has no
-        # ANTHROPIC_VERTEX_PROJECT_ID, which claude_reasoning._client() requires —
-        # going through it would silently leave the news watch on its fallback.
-        from anthropic import AnthropicVertex
-        return AnthropicVertex(project_id=PROJECT, region="global")
+        # Not claude_reasoning._client(): this service has no
+        # ANTHROPIC_VERTEX_PROJECT_ID, which that factory requires.
+        return _claude_client()
 
     cfg = _proactive_cfg()
     portfolios = []

@@ -17,6 +17,7 @@ Run:  python test_proactive_recal.py
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
@@ -60,7 +61,11 @@ def world(news=None, verdict=YES, market_open=True):
     web_ui._intraday_quotes = lambda syms: {s: {"price": 12.0, "prev_close": 12.2} for s in syms}
     web_ui._headlines = lambda s, days: (news or {}).get(s, [])
     web_ui._market_open = lambda: market_open
-    anthropic.AnthropicVertex = lambda **kw: state["claude"].bind(kw)
+    # the harness's fake Secret Manager returns "stub" for ANY secret; default
+    # these worlds to "no anthropic-api-key" (absent, checked just now)
+    web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
+    anthropic.AnthropicVertex = lambda **kw: state["claude"].bind(dict(kw, via="vertex"))
+    anthropic.Anthropic = lambda **kw: state["claude"].bind(dict(kw, via="anthropic"))
 
     def fake_recommend(sectors, top_n):
         state["recommend_calls"] += 1
@@ -97,7 +102,8 @@ if __name__ == "__main__":
     assert ev["trigger"] == "proactive" and "SEC accounting probe" in ev["reason"]
     assert d["next_rebalance_date"] == (TODAY + timedelta(days=21)).isoformat(), "the cadence restarts from today"
     assert d["proactive_checks"][-1]["action"] == "recalibrated" and d["proactive_checks"][-1]["recalibration"]["orders"] > 0
-    assert st["claude"].client_kwargs == {"project_id": web_ui.PROJECT, "region": "global"}, st["claude"].client_kwargs
+    assert st["claude"].client_kwargs == {"project_id": web_ui.PROJECT, "region": "global", "via": "vertex"}, \
+        "no anthropic-api-key secret -> Vertex"
     prompt = st["claude"].calls[0]["messages"][0]["content"]
     assert "AAA discloses SEC probe" in prompt and "AAA: " in prompt and "CCC: " in prompt, \
         "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"
@@ -169,6 +175,18 @@ if __name__ == "__main__":
         assert needle in history, needle
     assert history.index("2026-09-10") < history.index("2026-09-08") < history.index("2026-09-01"), "newest first"
     ok("scheduled / manual")
+
+    print("SCENARIO H2: with an anthropic-api-key secret, the news watch uses Anthropic's own API")
+    fake = install(doc())
+    st = world(news=NEWS)
+    web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = "sk-ant-test", -1e9
+    try:
+        r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    finally:
+        web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
+    assert r["results"][0]["source"] == "claude"
+    assert st["claude"].client_kwargs == {"api_key": "sk-ant-test", "via": "anthropic"}, st["claude"].client_kwargs
+    ok("key present -> Anthropic(api_key=...); same review, same decision path")
 
     print("SCENARIO I: the owner's switch — OFF is never checked; the page toggles it")
     fake = install(doc(news_watch=False))
