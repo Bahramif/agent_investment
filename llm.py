@@ -43,11 +43,13 @@ gemini-3.1-pro-preview before this was written.
 from __future__ import annotations
 
 import os
+import threading
 from types import SimpleNamespace as NS
 from typing import Any, Dict, List, Optional
 
 DEFAULT_STRONG = "gemini-3.1-pro-preview"
 DEFAULT_FAST = "gemini-3.8-flash"
+MAX_OUTPUT_TOKENS = 65536        # Gemini's per-request output limit (thinking counts against it)
 
 
 def provider() -> str:
@@ -94,12 +96,19 @@ class GeminiClaudeShim:
             "MERIDIAN_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
         self.location = location or os.environ.get("MERIDIAN_GEMINI_LOCATION", "global")
         self._genai = genai_client
+        self._lock = threading.Lock()
         self.messages = self            # so client.messages.create(...) works
 
     def _client(self) -> Any:
+        """ONE google-genai client per shim, created under a lock. Callers
+        fan out across threads (desk batches); without the lock each thread
+        built its own client and the losers were garbage-collected — which
+        closes their HTTP connection mid-request ("client has been closed")."""
         if self._genai is None:
-            from google import genai
-            self._genai = genai.Client(vertexai=True, project=self.project, location=self.location)
+            with self._lock:
+                if self._genai is None:
+                    from google import genai
+                    self._genai = genai.Client(vertexai=True, project=self.project, location=self.location)
         return self._genai
 
     def create(self, *, model: str, max_tokens: int, messages: List[Dict[str, Any]],
@@ -113,7 +122,8 @@ class GeminiClaudeShim:
                                   parts=[types.Part(text=_text_of(m.get("content")))])
                     for m in messages if m.get("role") in ("user", "assistant")]
         cfg: Dict[str, Any] = {
-            "max_output_tokens": int(max_tokens) + budget,   # thinking draws from the same output budget
+            # thinking draws from the same output budget; never ask past the model's limit (400 otherwise)
+            "max_output_tokens": min(int(max_tokens) + budget, MAX_OUTPUT_TOKENS - 1),
             "thinking_config": types.ThinkingConfig(thinking_budget=budget, include_thoughts=False),
         }
         sys_text = _text_of(system) if system else ""
@@ -226,6 +236,32 @@ if __name__ == "__main__":
     assert r.content[0].name == "decide" and r.content[0].input == {"go": True}, "thought part never surfaces"
     assert r.usage.thinking_tokens == 340 and r.model == DEFAULT_STRONG
     print("✓ opus -> strong model, budget 2048, thought hidden, tool_use block returned")
+
+    print("TEST 1b: an oversized request is capped at the model's output limit instead of a 400")
+    s, fm = shim(fake_response([NS(thought=False, text="ok", function_call=None)]))
+    s.messages.create(model="claude-haiku-4-5", max_tokens=68000, messages=[{"role": "user", "content": "x"}])
+    assert fm.calls[0]["config"].max_output_tokens == MAX_OUTPUT_TOKENS - 1
+    print("✓ 68000 + thinking -> capped at 65535")
+
+    print("TEST 1c: concurrent first use builds exactly ONE underlying client")
+    import sys, time as _t
+    from concurrent.futures import ThreadPoolExecutor
+    built = []
+    class SlowClient:
+        def __init__(self, **kw):
+            _t.sleep(0.05); built.append(self); self.models = FakeModels(fake_response([]))
+    fake_genai = NS(Client=SlowClient)
+    real = sys.modules.get("google.genai")
+    sys.modules["google"].genai = sys.modules["google.genai"] = fake_genai     # what `from google import genai` resolves
+    try:
+        lazy = GeminiClaudeShim(project="p")
+        with ThreadPoolExecutor(8) as pool:
+            clients = list(pool.map(lambda _: lazy._client(), range(8)))
+    finally:
+        sys.modules["google.genai"] = real
+        sys.modules["google"].genai = real
+    assert len(built) == 1 and all(c is built[0] for c in clients), len(built)
+    print("✓ 8 threads -> 1 client")
 
     print("TEST 2: tier mapping and overrides")
     assert gemini_model_for("claude-haiku-4-5@20251001") == DEFAULT_FAST
