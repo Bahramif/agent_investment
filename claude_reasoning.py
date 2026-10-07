@@ -42,7 +42,6 @@ the same functions and nothing else changes.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Callable, List, Optional, Tuple
 
 from macro_reasoning import (
@@ -112,28 +111,34 @@ def _prompt_for(snap: MacroSnapshot, horizon: str) -> str:
 
 
 def _client():
-    if os.environ.get("CLAUDE_USE_DIRECT_API"):
-        from anthropic import Anthropic
-        return Anthropic()   # reads ANTHROPIC_API_KEY from env
-    from anthropic import AnthropicVertex
-    return AnthropicVertex(
-        project_id=os.environ["ANTHROPIC_VERTEX_PROJECT_ID"],
-        region=os.environ.get("CLOUD_ML_REGION", "us-east5"),
-    )
+    """Provider chosen in llm.py: Gemini on Vertex by default (behind the same
+    messages.create() surface everything here calls), or Anthropic with
+    MERIDIAN_LLM_PROVIDER=anthropic. Model IDs below stay Claude names; llm.py
+    maps them to a Gemini tier (opus -> strong, haiku -> fast)."""
+    from llm import make_client
+    return make_client()
 
 
-def _call_claude(client: Any, model: str, prompt: str) -> dict:
+def _call_claude(client: Any, model: str, prompt: str, tool: Optional[dict] = None,
+                 max_tokens: int = 400) -> dict:
+    """Forced call of ONE tool. `tool` defaults to the strategist's
+    assess_theme; desk scoring passes SCORE_INSTRUMENTS_TOOL.
+
+    BUG FIX: this used to hard-code assess_theme for EVERY caller, so desk
+    scoring forced the model to answer with a theme view (no `scores`) and
+    every desk silently fell back to the heuristic for every instrument."""
+    tool = tool or ASSESS_THEME_TOOL
     response = client.messages.create(
         model=model,
-        max_tokens=400,
-        tools=[ASSESS_THEME_TOOL],
-        tool_choice={"type": "tool", "name": "assess_theme"},
+        max_tokens=max_tokens,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": tool["name"]},
         messages=[{"role": "user", "content": prompt}],
     )
     for block in response.content:
-        if block.type == "tool_use" and block.name == "assess_theme":
+        if block.type == "tool_use" and block.name == tool["name"]:
             return block.input
-    raise ValueError("Claude did not return the expected assess_theme tool call")
+    raise ValueError(f"model did not return the expected {tool['name']} tool call")
 
 
 def _view_from_tool_output(output: dict, half_life_days: float, max_age_days: float) -> HorizonView:
@@ -260,7 +265,8 @@ def reason_desk_convictions_claude(
     client = client or _client()
     by_name = {s.name: s for s in snapshots}
     try:
-        output = _call_claude(client, "claude-haiku-4-5@20251001", _desk_prompt(snapshots))
+        output = _call_claude(client, "claude-haiku-4-5@20251001", _desk_prompt(snapshots),
+                              tool=SCORE_INSTRUMENTS_TOOL, max_tokens=300 * len(snapshots) + 500)
         signals: List[Signal] = []
         seen = set()
         for entry in output.get("scores", []):
@@ -341,12 +347,15 @@ class FakeAnthropicClient:
             "rationale": "Strong secular tailwind, valuation not yet stretched.",
         }
         self.raise_error = raise_error
+        self.calls = []
         self.messages = self   # so client.messages.create(...) resolves to self.create(...)
 
     def create(self, **kwargs):
+        self.calls.append(kwargs)
         if self.raise_error:
             raise ConnectionError("simulated network failure")
-        return _FakeResponse([_FakeToolUseBlock("assess_theme", self.canned_input)])
+        # answer with whichever tool the request forced, like the real API
+        return _FakeResponse([_FakeToolUseBlock(kwargs["tool_choice"]["name"], self.canned_input)])
 
 
 if __name__ == "__main__":
@@ -411,6 +420,9 @@ if __name__ == "__main__":
     by_name = {s.name: s for s in signals}
     print(f"  {[(s.name, round(s.score, 2)) for s in signals]}")
     assert len(signals) == 2 and by_name["NVDA"].score == 0.85 and by_name["CAT"].score == 0.4
+    sent = fake_desk.calls[-1]
+    assert sent["tools"][0]["name"] == "score_instruments" and sent["tool_choice"]["name"] == "score_instruments", \
+        "desk scoring must SEND the desk tool (it used to send assess_theme, so every desk fell back)"
     print("✓ all instruments scored from the model's output")
 
     print("\n" + "=" * 70)

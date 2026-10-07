@@ -26,7 +26,9 @@ from test_portfolio_page_reconcile import FakeTradingClient, base_doc, install
 
 web_ui = harness.web_ui
 import alpaca.trading.client as alpaca_trading_client   # noqa: E402
+import os                                                # noqa: E402
 import anthropic                                         # noqa: E402
+import llm                                               # noqa: E402
 
 TODAY = datetime.now(timezone.utc).date()
 TOKEN = {"X-Recalibrate-Token": "stub"}                  # what the stubbed Secret Manager returns
@@ -48,7 +50,8 @@ class FakeClaude:
         return self
     def create(self, **kw):
         self.calls.append(kw)
-        return NS(stop_reason="tool_use", content=[NS(type="tool_use", name="decide_recalibration", input=self.verdict)])
+        return NS(stop_reason="tool_use", model="fake-model",
+                  content=[NS(type="tool_use", name="decide_recalibration", input=self.verdict)])
 
 
 YES = {"recalibrate": True, "confidence": 0.92, "urgency": "high", "key_symbols": ["AAA"],
@@ -64,6 +67,8 @@ def world(news=None, verdict=YES, market_open=True):
     # the harness's fake Secret Manager returns "stub" for ANY secret; default
     # these worlds to "no anthropic-api-key" (absent, checked just now)
     web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
+    os.environ.pop("MERIDIAN_LLM_PROVIDER", None)                                   # default provider: gemini
+    llm.GeminiClaudeShim = lambda **kw: state["claude"].bind(dict(kw, via="gemini"))
     anthropic.AnthropicVertex = lambda **kw: state["claude"].bind(dict(kw, via="vertex"))
     anthropic.Anthropic = lambda **kw: state["claude"].bind(dict(kw, via="anthropic"))
 
@@ -102,8 +107,9 @@ if __name__ == "__main__":
     assert ev["trigger"] == "proactive" and "SEC accounting probe" in ev["reason"]
     assert d["next_rebalance_date"] == (TODAY + timedelta(days=21)).isoformat(), "the cadence restarts from today"
     assert d["proactive_checks"][-1]["action"] == "recalibrated" and d["proactive_checks"][-1]["recalibration"]["orders"] > 0
-    assert st["claude"].client_kwargs == {"project_id": web_ui.PROJECT, "region": "global", "via": "vertex"}, \
-        "no anthropic-api-key secret -> Vertex"
+    assert st["claude"].client_kwargs == {"project": web_ui.PROJECT, "via": "gemini"}, \
+        "default provider -> Gemini on this project"
+    assert d["proactive_checks"][-1]["review"]["model"] == "fake-model", "the model that decided is recorded"
     prompt = st["claude"].calls[0]["messages"][0]["content"]
     assert "AAA discloses SEC probe" in prompt and "AAA: " in prompt and "CCC: " in prompt, \
         "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"
@@ -176,17 +182,20 @@ if __name__ == "__main__":
     assert history.index("2026-09-10") < history.index("2026-09-08") < history.index("2026-09-01"), "newest first"
     ok("scheduled / manual")
 
-    print("SCENARIO H2: with an anthropic-api-key secret, the news watch uses Anthropic's own API")
-    fake = install(doc())
-    st = world(news=NEWS)
-    web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = "sk-ant-test", -1e9
-    try:
-        r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
-    finally:
-        web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
-    assert r["results"][0]["source"] == "claude"
-    assert st["claude"].client_kwargs == {"api_key": "sk-ant-test", "via": "anthropic"}, st["claude"].client_kwargs
-    ok("key present -> Anthropic(api_key=...); same review, same decision path")
+    print("SCENARIO H2: MERIDIAN_LLM_PROVIDER=anthropic -> Anthropic API with the key, else Claude on Vertex")
+    for key, want in (("sk-ant-test", {"api_key": "sk-ant-test", "via": "anthropic"}),
+                      (None, {"project_id": web_ui.PROJECT, "region": "global", "via": "vertex"})):
+        fake = install(doc())
+        st = world(news=NEWS)
+        os.environ["MERIDIAN_LLM_PROVIDER"] = "anthropic"
+        web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = key, (-1e9 if key else time.monotonic())
+        try:
+            r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+        finally:
+            os.environ.pop("MERIDIAN_LLM_PROVIDER", None)
+            web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
+        assert r["results"][0]["source"] == "claude" and st["claude"].client_kwargs == want, st["claude"].client_kwargs
+    ok("anthropic provider: key -> Anthropic(api_key=...), no key -> AnthropicVertex")
 
     print("SCENARIO I: the owner's switch — OFF is never checked; the page toggles it")
     fake = install(doc(news_watch=False))
