@@ -196,23 +196,30 @@ def make_strategist_reasoning_node(
         elapsed = state.get("elapsed_days", 1.0)
         forced = state.get("force_refresh_themes", set())
 
-        updated: Dict[str, ThemeStrategy] = {}
-        all_themes = set(prior_memory) | set(snapshots)
-        for theme in all_themes:
+        def resolve(theme: str) -> Optional[ThemeStrategy]:
             prior = prior_memory.get(theme)
             snap = snapshots.get(theme)
             if snap is None:                                   # case 3: data gap
                 if prior is None:
-                    continue                                    # no data, no memory — nothing to do
-                updated[theme] = ThemeStrategy(theme, _age_view(prior.strategic, elapsed),
-                                              _age_view(prior.tactical, elapsed))
-                continue
+                    return None                                 # no data, no memory — nothing to do
+                return ThemeStrategy(theme, _age_view(prior.strategic, elapsed), _age_view(prior.tactical, elapsed))
             tactical = reason_tactical(snap)                     # cheap — refresh whenever data arrives
             if _strategic_due(prior, elapsed, theme in forced):  # case 1
                 strategic = reason_strategic(snap)
             else:                                                # case 2
                 strategic = _age_view(prior.strategic, elapsed)
-            updated[theme] = ThemeStrategy(theme, strategic, tactical)
+            return ThemeStrategy(theme, strategic, tactical)
+
+        # Themes are independent, so they are resolved CONCURRENTLY: with an LLM
+        # behind the reasoners each call takes seconds (Gemini Pro thinks 10-30s),
+        # and one-after-another over every theme pushed the whole recommendation
+        # toward the 5-minute budget recalibrations wait on. Output order and
+        # content are identical to the sequential loop.
+        from concurrent.futures import ThreadPoolExecutor
+        all_themes = sorted(set(prior_memory) | set(snapshots))
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(all_themes)))) as pool:
+            resolved = list(pool.map(resolve, all_themes))
+        updated: Dict[str, ThemeStrategy] = {t: r for t, r in zip(all_themes, resolved) if r is not None}
 
         return {"theme_strategies": list(updated.values()), "theme_memory": updated}
     return _node
@@ -754,6 +761,42 @@ if __name__ == "__main__":
         print("  In production: build_compiled_graph(execute_trigger=make_execution_trigger(...))")
     except ImportError as e:
         print(f"(execution_workflow module not available here: {e})")
+
+    print("\n" + "=" * 70)
+    print("TEST: strategist resolves themes CONCURRENTLY, with the same result as sequentially")
+    print("=" * 70)
+    import threading
+    import time as _time
+    themes = ["ai", "energy", "health", "fin", "industrials", "materials"]
+    snaps = [MacroSnapshot(t, momentum_1m=0.01 * i, news_sentiment=0.1 * i, valuation_percentile=0.5,
+                           secular_score=0.2) for i, t in enumerate(themes)]
+    live = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def slow(fn):
+        def _f(snap):
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            _time.sleep(0.2)                                  # an LLM call takes seconds
+            with lock:
+                live["now"] -= 1
+            return fn(snap)
+        return _f
+
+    node = make_strategist_reasoning_node(slow(reason_strategic_view), slow(reason_tactical_view))
+    t0 = _time.time()
+    out = node({"macro_snapshots": snaps, "theme_memory": {}, "elapsed_days": 1.0})
+    took = _time.time() - t0
+    seq_node = make_strategist_reasoning_node(reason_strategic_view, reason_tactical_view)
+    seq = seq_node({"macro_snapshots": snaps, "theme_memory": {}, "elapsed_days": 1.0})
+    assert out["theme_memory"] == seq["theme_memory"], "parallel must equal sequential"
+    assert [ts.theme for ts in out["theme_strategies"]] == sorted(themes)
+    assert live["peak"] > 1 and took < 6 * 2 * 0.2, (live["peak"], took)
+    gap = node({"macro_snapshots": [], "theme_memory": out["theme_memory"], "elapsed_days": 3.0})
+    assert len(gap["theme_strategies"]) == 6 and all(ts.strategic.age_days == 3.0 for ts in gap["theme_strategies"])
+    print(f"✓ 6 themes x 2 slow calls in {took:.1f}s (sequential would be {6 * 2 * 0.2:.1f}s), "
+          f"peak {live['peak']} concurrent; identical to the sequential result; data gaps still just age")
 
     print("\n" + "=" * 70)
     print("ATTEMPTING build_compiled_graph() — requires `pip install langgraph`")

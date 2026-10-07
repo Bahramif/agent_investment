@@ -258,7 +258,7 @@ def _desk_prompt(snapshots: List[InstrumentSnapshot]) -> str:
 
 
 DESK_BATCH = 40          # instruments per scoring call
-DESK_PARALLEL = 6        # batches scored concurrently
+DESK_PARALLEL = 4        # batches scored concurrently (more just meets Vertex's burst 429s)
 
 
 def reason_desk_convictions_claude(

@@ -50,6 +50,9 @@ from typing import Any, Dict, List, Optional
 DEFAULT_STRONG = "gemini-3.1-pro-preview"
 DEFAULT_FAST = "gemini-3.8-flash"
 MAX_OUTPUT_TOKENS = 65536        # Gemini's per-request output limit (thinking counts against it)
+# Vertex answers bursts with 429 RESOURCE_EXHAUSTED ("try again later"); Google's
+# guidance is retry with exponential backoff. 4 attempts: ~2s, 4s, 8s (+jitter).
+RETRY_STATUS = [429, 500, 502, 503, 504]
 
 
 def provider() -> str:
@@ -108,7 +111,11 @@ class GeminiClaudeShim:
             with self._lock:
                 if self._genai is None:
                     from google import genai
-                    self._genai = genai.Client(vertexai=True, project=self.project, location=self.location)
+                    from google.genai import types
+                    retry = types.HttpRetryOptions(attempts=4, initial_delay=2.0, max_delay=20.0, exp_base=2.0,
+                                                   jitter=1.0, http_status_codes=RETRY_STATUS)
+                    self._genai = genai.Client(vertexai=True, project=self.project, location=self.location,
+                                               http_options=types.HttpOptions(retry_options=retry))
         return self._genai
 
     def create(self, *, model: str, max_tokens: int, messages: List[Dict[str, Any]],
@@ -249,8 +256,9 @@ if __name__ == "__main__":
     built = []
     class SlowClient:
         def __init__(self, **kw):
-            _t.sleep(0.05); built.append(self); self.models = FakeModels(fake_response([]))
-    fake_genai = NS(Client=SlowClient)
+            _t.sleep(0.05); self.kw = kw; built.append(self); self.models = FakeModels(fake_response([]))
+    from google.genai import types as real_types
+    fake_genai = NS(Client=SlowClient, types=real_types)
     real = sys.modules.get("google.genai")
     sys.modules["google"].genai = sys.modules["google.genai"] = fake_genai     # what `from google import genai` resolves
     try:
@@ -261,7 +269,9 @@ if __name__ == "__main__":
         sys.modules["google.genai"] = real
         sys.modules["google"].genai = real
     assert len(built) == 1 and all(c is built[0] for c in clients), len(built)
-    print("✓ 8 threads -> 1 client")
+    ro = built[0].kw["http_options"].retry_options
+    assert ro.attempts == 4 and 429 in ro.http_status_codes and 503 in ro.http_status_codes
+    print("✓ 8 threads -> 1 client, built with 429/5xx retries (4 attempts, exponential backoff)")
 
     print("TEST 2: tier mapping and overrides")
     assert gemini_model_for("claude-haiku-4-5@20251001") == DEFAULT_FAST
