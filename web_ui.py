@@ -159,10 +159,13 @@ def _anthropic_api_key() -> Optional[str]:
 
 
 def _claude_client():
-    """The ONE place this app builds a Claude client. Anthropic's own API when
-    an `anthropic-api-key` secret exists; otherwise Claude on Vertex AI (this
-    project's Vertex quota for Claude may be zero — see the news-watch log).
-    Same model IDs and messages.create() surface either way."""
+    """The ONE place this app builds its AI client. Gemini on Vertex by
+    default (llm.GeminiClaudeShim — same messages.create() surface, thinking
+    on). With MERIDIAN_LLM_PROVIDER=anthropic: Anthropic's own API when an
+    `anthropic-api-key` secret exists, else Claude on Vertex AI."""
+    import llm
+    if llm.provider() == "gemini":
+        return llm.GeminiClaudeShim(project=PROJECT)
     key = _anthropic_api_key()
     if key:
         from anthropic import Anthropic
@@ -3188,7 +3191,7 @@ PORTFOLIO_DETAIL_PAGE = """
     {% for c in (p.proactive_checks|reverse|list)[:7] %}
     <tr>
       <td>{{ c.at[:10] }}</td>
-      <td><b>{{ c.action }}</b>{% if c.source and c.source != 'rules' %}<div style="color:#888;font-size:0.78rem;">{{ c.source }}{% if c.review and c.review.confidence is not none %} · {{ '%.0f'|format(c.review.confidence * 100) }}%{% endif %}</div>{% endif %}</td>
+      <td><b>{{ c.action }}</b>{% if c.source and c.source != 'rules' %}<div style="color:#888;font-size:0.78rem;">{{ (c.review.model if c.review and c.review.model else c.source) if c.source != 'fallback' else 'backup rule' }}{% if c.source != 'fallback' and c.review and c.review.confidence is not none %} · {{ '%.0f'|format(c.review.confidence * 100) }}%{% endif %}</div>{% endif %}</td>
       <td style="white-space:normal;">{{ c.reason }}{% if c.triggers %}<div style="color:#888;font-size:0.8rem;">{{ c.triggers|join('; ') }}</div>{% endif %}</td>
     </tr>
     {% endfor %}

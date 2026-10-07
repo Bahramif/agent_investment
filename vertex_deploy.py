@@ -400,6 +400,7 @@ _REQUIREMENTS = [
                                         # set_up()'s comment above the FirestoreSaver() call)
     "google-cloud-firestore",
     "google-cloud-secret-manager",      # fetches Alpaca creds — see _resolve_secret()
+    "google-genai",        # Gemini on Vertex — the default provider (llm.py)
     "anthropic[vertex]",   # [vertex] extra needed for AnthropicVertex; drop it if
                           # use_direct_anthropic_api=True and you only need the base package
     "alpaca-py",           # equities + crypto broker, market data, (not forex)
@@ -425,7 +426,8 @@ _EXTRA_PACKAGES = [
     "strategist.py",
     "macro_reasoning.py",     # MacroSnapshot + heuristic reasoning (strategist's fallback path)
     "analyst_reasoning.py",   # InstrumentSnapshot + heuristic scoring (analysts' fallback path)
-    "claude_reasoning.py",    # actual Claude-backed reasoning for both strategist and analysts
+    "claude_reasoning.py",    # LLM-backed reasoning for both strategist and analysts
+    "llm.py",                 # provider switch: Gemini (default) behind the Anthropic call shape
     "data_ingestion.py",      # turns market/news data into snapshots
     "alpaca_clients.py",      # real broker/market-data clients (equities+crypto; no forex yet)
     "execution_workflow.py",  # order-delta + saga logic; the actual Temporal worker deploys

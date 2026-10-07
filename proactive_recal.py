@@ -299,8 +299,8 @@ def call_claude(client: Any, prompt: str, model: str = DECIDE_MODEL) -> Dict[str
         raise ValueError("model declined the request (stop_reason=refusal)")
     for block in response.content:
         if block.type == "tool_use" and block.name == "decide_recalibration":
-            return dict(block.input)
-    raise ValueError("Claude did not return the expected decide_recalibration tool call")
+            return {**dict(block.input), "_model": str(getattr(response, "model", "") or model)}
+    raise ValueError("the model did not return the expected decide_recalibration tool call")
 
 
 def clamp_review(raw: Dict[str, Any], holdings: Sequence[str]) -> Dict[str, Any]:
@@ -313,7 +313,7 @@ def clamp_review(raw: Dict[str, Any], holdings: Sequence[str]) -> Dict[str, Any]
     keys = [str(s).upper() for s in (raw.get("key_symbols") or []) if str(s).upper() in held][:10]
     urgency = raw.get("urgency") if raw.get("urgency") in ("low", "medium", "high") else "low"
     return {"recalibrate": raw.get("recalibrate") is True, "confidence": round(conf, 3), "urgency": urgency,
-            "reason": str(raw.get("reason", ""))[:1000], "key_symbols": keys}
+            "reason": str(raw.get("reason", ""))[:1000], "key_symbols": keys, "model": str(raw.get("_model", ""))[:60]}
 
 
 def fallback_review(ev: Dict[str, Any], cfg: ProactiveConfig, why: str) -> Dict[str, Any]:

@@ -5,6 +5,7 @@ google-cloud-secret-manager
 google-cloud-firestore
 alpaca-py
 anthropic[vertex]
+google-genai
 yfinance
 scipy
 pyyaml
