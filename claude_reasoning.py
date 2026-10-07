@@ -257,16 +257,33 @@ def _desk_prompt(snapshots: List[InstrumentSnapshot]) -> str:
     )
 
 
+DESK_BATCH = 40          # instruments per scoring call
+DESK_PARALLEL = 6        # batches scored concurrently
+
+
 def reason_desk_convictions_claude(
     snapshots: List[InstrumentSnapshot], client: Any = None,
 ) -> List[Signal]:
+    """Large desks are scored in batches of DESK_BATCH, grouped by sector
+    path so each batch is still a relative comparison among peers, and run
+    concurrently. Why: one call over the full 225-name universe asked for
+    ~69k output tokens (past Gemini's 65,536 limit -> 400 -> the WHOLE desk
+    fell back) and would run long against the recommendation's 5-min budget.
+    A failing batch falls back on its own; the others keep their scores."""
     if not snapshots:
         return []
     client = client or _client()
+    if len(snapshots) > DESK_BATCH:
+        from concurrent.futures import ThreadPoolExecutor
+        ordered = sorted(snapshots, key=lambda s: (s.path, s.name))
+        batches = [ordered[i:i + DESK_BATCH] for i in range(0, len(ordered), DESK_BATCH)]
+        with ThreadPoolExecutor(max_workers=DESK_PARALLEL) as pool:
+            results = list(pool.map(lambda b: reason_desk_convictions_claude(b, client=client), batches))
+        return [sig for batch in results for sig in batch]
     by_name = {s.name: s for s in snapshots}
     try:
         output = _call_claude(client, "claude-haiku-4-5@20251001", _desk_prompt(snapshots),
-                              tool=SCORE_INSTRUMENTS_TOOL, max_tokens=300 * len(snapshots) + 500)
+                              tool=SCORE_INSTRUMENTS_TOOL, max_tokens=150 * len(snapshots) + 500)
         signals: List[Signal] = []
         seen = set()
         for entry in output.get("scores", []):
@@ -456,4 +473,39 @@ if __name__ == "__main__":
     print(f"  {[(s.name, round(s.score, 2)) for s in result]}")
     assert len(result) == 2
     print("✓ closure works identically to the direct call — safe to pass into")
+
+    print()
+    print("TEST 9: a large desk is scored in sector-grouped batches; one failing batch falls back alone")
+    import threading
+    big = [InstrumentSnapshot(f"S{i:03d}", f"equities.sector{i % 3}", momentum_1m=0.01, news_sentiment=0.0,
+                              quality_score=0.5) for i in range(95)]
+
+    class BatchClient:
+        def __init__(self):
+            self.calls, self.lock, self.messages = [], threading.Lock(), self
+        def create(self, **kw):
+            text = kw["messages"][0]["content"]
+            names = [s.name for s in big if f"- {s.name} (" in text]
+            with self.lock:
+                self.calls.append((names, kw["max_tokens"]))
+            if "S000" in names:
+                raise ConnectionError("this batch's call failed")
+            return _FakeResponse([_FakeToolUseBlock("score_instruments", {"scores": [
+                {"name": n, "conviction": 0.9, "rationale": "r", "key_risk": "k", "rating": "Buy",
+                 "expected_return": 0.05} for n in names]})])
+
+    bc = BatchClient()
+    sigs = reason_desk_convictions_claude(big, client=bc)
+    assert len(sigs) == 95 and {s.name for s in sigs} == {s.name for s in big}
+    assert [len(n) for n, _ in sorted(bc.calls)] and all(len(n) <= DESK_BATCH for n, _ in bc.calls) and len(bc.calls) == 3
+    ordered = sorted(big, key=lambda s: (s.path, s.name))
+    slices = {frozenset(x.name for x in ordered[i:i + DESK_BATCH]) for i in range(0, len(ordered), DESK_BATCH)}
+    for names, mt in bc.calls:
+        assert frozenset(names) in slices, "each batch is one contiguous slice of the sector-sorted desk"
+        assert mt == 150 * len(names) + 500
+    failed = next(n for n, _ in bc.calls if "S000" in n)
+    by = {s.name: s for s in sigs}
+    assert all(by[n].score != 0.9 for n in failed), "the failed batch fell back to the heuristic"
+    assert sum(1 for s in sigs if s.score == 0.9) == 95 - len(failed), "every other batch kept its model scores"
+    print(f"✓ 95 names -> 3 batches of <= {DESK_BATCH}; failed batch ({len(failed)} names) fell back, the rest model-scored")
     print("  firm_graph.build_compiled_graph(reason_equities=analyst_fn, ...)")
