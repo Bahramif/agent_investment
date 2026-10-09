@@ -13,14 +13,11 @@ Now" button use is run, tagged trigger="proactive" with the reason.
 
 Pipeline per portfolio (evaluate_portfolio):
 
-  1. GUARDRAILS first, before any model call — an ineligible portfolio costs
-     nothing and can never trade:
-       * not open, or orders from a previous rebalance still in flight;
-       * recalibrated within min_days_since_last_recal (also prevents two
-         rebalances on the same date, whose order IDs would collide);
-       * a scheduled recalibration is already due within
-         skip_if_scheduled_within_days (the planned one will handle it);
-       * max_proactive_per_30d proactive recalibrations already used.
+  1. THE REVIEW ALWAYS RUNS for every open portfolio with the switch ON and
+     holdings to look at — however recently it was recalibrated and whenever
+     its next scheduled date is. (An earlier version skipped the review for 3
+     days after any recalibration and when a scheduled one was due within a
+     day; in practice that skipped almost every review.)
   2. EVIDENCE (build_evidence): per holding — current vs. target weight,
      today's move vs. yesterday's close, move since entry, recent headlines;
      SPY's move for context; total weight drift; deterministic TRIGGERS
@@ -39,8 +36,14 @@ Pipeline per portfolio (evaluate_portfolio):
   5. POLICY: recalibrate only if the model says so with confidence
      >= min_confidence (or the fallback rule fires). Turning the switch on IS
      the owner's consent, so this applies to portfolios on manual
-     recalibration too. dry_run (config or ?dry_run=1) and a closed market
-     flag instead of trading.
+     recalibration too. A "recalibrate" verdict is FLAGGED instead of traded
+     (the review and its reason are still logged) when trade_block() says so:
+       * already recalibrated TODAY — rebalance order IDs are date-stamped, so
+         a second rebalance on the same date would collide with the first;
+       * orders from the last rebalance are still in flight — trading again
+         would double up;
+       * max_proactive_per_30d early recalibrations already used;
+     and on dry_run (config or ?dry_run=1) or a closed market.
 
 Every check — including holds and skips — is logged on the portfolio
 (portfolio_store.record_proactive_check), so the page shows what the news
@@ -73,8 +76,6 @@ PROACTIVE = "proactive"
 class ProactiveConfig:
     enabled: bool = True
     dry_run: bool = False                     # assess and log, never trade
-    min_days_since_last_recal: int = 3
-    skip_if_scheduled_within_days: int = 1    # 1 = skip if the scheduled one is due today or tomorrow
     max_proactive_per_30d: int = 2
     min_confidence: float = 0.7
     news_lookback_days: int = 1
@@ -90,12 +91,9 @@ def config_from_dict(raw: Optional[Dict[str, Any]]) -> ProactiveConfig:
     if unknown:
         raise ValueError(f"proactive_recalibration: unknown key(s) {sorted(unknown)}")
     cfg = ProactiveConfig(**raw)
-    if cfg.min_days_since_last_recal < 1:
-        raise ValueError("proactive_recalibration.min_days_since_last_recal must be >= 1 "
-                         "(two rebalances on one date would reuse the same order IDs)")
     if not 0.0 < cfg.min_confidence <= 1.0:
         raise ValueError("proactive_recalibration.min_confidence must be in (0, 1]")
-    if cfg.max_proactive_per_30d < 0 or cfg.news_lookback_days < 1 or cfg.skip_if_scheduled_within_days < 0:
+    if cfg.max_proactive_per_30d < 0 or cfg.news_lookback_days < 1:
         raise ValueError("proactive_recalibration: counts must be non-negative, news_lookback_days >= 1")
     for k in ("material_weight", "big_move_pct", "fallback_drop_pct", "max_drift"):
         if not 0.0 < getattr(cfg, k) < 1.0:
@@ -155,23 +153,25 @@ def watching(p: Dict[str, Any]) -> bool:
 
 
 def precheck(p: Dict[str, Any], cfg: ProactiveConfig, today: date) -> Optional[str]:
-    """Reason this portfolio must not be proactively recalibrated today, or None."""
+    """Reason there is nothing to REVIEW, or None. Deliberately independent of
+    when the portfolio was last recalibrated — the review always runs."""
     if p.get("status") != "open":
         return "not open"
     if p.get("news_watch") is not True:
         return "news watch is off for this portfolio"
     if not p.get("holdings"):
         return "no holdings to watch"
+    return None
+
+
+def trade_block(p: Dict[str, Any], cfg: ProactiveConfig, today: date) -> Optional[str]:
+    """Reason a "recalibrate" verdict must be flagged rather than traded, or None."""
+    if last_recal_date(p) == today:
+        return "already recalibrated today (a second rebalance on the same date would reuse its order IDs)"
     if p.get("pending_order_ids"):
-        return "orders from the last rebalance are still in flight"
-    last = last_recal_date(p)
-    if last and (today - last).days < cfg.min_days_since_last_recal:
-        return f"recalibrated {(today - last).days} day(s) ago (min {cfg.min_days_since_last_recal})"
-    nxt = _d(p.get("next_rebalance_date"))
-    if nxt and (nxt - today).days <= cfg.skip_if_scheduled_within_days:
-        return f"scheduled recalibration is due {nxt.isoformat()} — it will handle this"
+        return "orders from the last rebalance are still being filled"
     if proactive_count(p, today) >= cfg.max_proactive_per_30d:
-        return f"already {cfg.max_proactive_per_30d} proactive recalibration(s) in the last 30 days"
+        return f"already {cfg.max_proactive_per_30d} early recalibration(s) in the last 30 days"
     return None
 
 
@@ -399,6 +399,9 @@ def evaluate_portfolio(p: Dict[str, Any], cfg: ProactiveConfig, deps: ProactiveD
         return CheckResult(pid, name, "hold", reason, source, review, trig)
     if dry_run or cfg.dry_run:
         return CheckResult(pid, name, "flagged", f"{review['reason']} (dry run)", source, review, trig)
+    blocked = trade_block(p, cfg, today)
+    if blocked:
+        return CheckResult(pid, name, "flagged", f"{review['reason']} (not traded: {blocked})", source, review, trig)
     if not deps.market_open_fn():
         return CheckResult(pid, name, "flagged", f"{review['reason']} (market closed — not trading now)",
                            source, review, trig)
@@ -498,23 +501,37 @@ if __name__ == "__main__":
             pass
     print("✓ ok")
 
-    print("TEST 2: guardrails skip before any data or model call")
-    cases = [(pf(status="closed"), "not open"), (pf(pending_order_ids={"AAA": "x"}), "in flight"),
-             (pf(rebalance_history=[{"date": "2026-09-27", "trigger": "scheduled"}]), "1 day(s) ago"),
-             (pf(next_rebalance_date="2026-09-29"), "will handle this"),
-             (pf(rebalance_history=[{"date": "2026-09-10", "trigger": "proactive"},
-                                    {"date": "2026-09-20", "trigger": "proactive"}]), "already 2"),
-             (pf(holdings={}), "no holdings"), (pf(news_watch=False), "is off")]
-    for p, needle in cases:
-        why = precheck(p, cfg, today)
-        assert why and needle in why, (needle, why)
-    assert precheck(pf(created_at="2026-09-27T15:00:00+00:00"), cfg, today), "a brand-new portfolio is left alone"
-    assert precheck(pf(), cfg, today) is None
-    fc = FakeClient(YES)
-    d, log = deps(news=FRAUD, client=fc)
-    r = run_proactive_check([pf(pending_order_ids={"AAA": "x"})], cfg, d, NOW)[0]
-    assert r.action == "skipped" and not fc.calls and not log["recal"] and log["records"][0][1]["action"] == "skipped"
-    print("✓ closed / in-flight / recent / due-soon / cap / empty all skipped; skip is still logged")
+    print("TEST 2: the review ALWAYS runs — recent recalibrations and upcoming schedules don't skip it")
+    for p, label in ((pf(rebalance_history=[{"date": "2026-09-27", "trigger": "scheduled"}]), "recalibrated yesterday"),
+                     (pf(next_rebalance_date="2026-09-29"), "scheduled one due tomorrow"),
+                     (pf(created_at="2026-09-28T15:00:00+00:00"), "launched today"),
+                     (pf(pending_order_ids={"AAA": "x"}), "orders in flight"),
+                     (pf(rebalance_history=[{"date": "2026-09-10", "trigger": "proactive"},
+                                            {"date": "2026-09-20", "trigger": "proactive"}]), "monthly cap used")):
+        assert precheck(p, cfg, today) is None, label
+        fc = FakeClient(dict(YES, recalibrate=False, reason="Routine."))
+        d, log = deps(news=FRAUD, client=fc)
+        r = run_proactive_check([p], cfg, d, NOW)[0]
+        assert r.action == "hold" and len(fc.calls) == 1, (label, r)
+    for p, needle in ((pf(status="closed"), "not open"), (pf(holdings={}), "no holdings"), (pf(news_watch=False), "is off")):
+        assert needle in (precheck(p, cfg, today) or ""), needle
+    print("✓ recalibrated yesterday / due tomorrow / launched today / in flight / cap used -> Gemini still reviews")
+
+    print("TEST 2b: those rules only stop a TRADE — the verdict is logged as 'flagged' with the reason")
+    for p, needle in ((pf(rebalance_history=[{"date": "2026-09-28", "trigger": "scheduled"}]), "already recalibrated today"),
+                      (pf(created_at="2026-09-28T15:00:00+00:00"), "already recalibrated today"),
+                      (pf(pending_order_ids={"AAA": "x"}), "still being filled"),
+                      (pf(rebalance_history=[{"date": "2026-09-10", "trigger": "proactive"},
+                                             {"date": "2026-09-20", "trigger": "proactive"}]), "already 2 early")):
+        d, log = deps(news=FRAUD, client=FakeClient(YES))
+        r = run_proactive_check([p], cfg, d, NOW)[0]
+        assert r.action == "flagged" and needle in r.reason and "Fraud probe" in r.reason and not log["recal"], (needle, r)
+        assert log["records"][0][1]["action"] == "flagged"
+    d, log = deps(news=FRAUD, client=FakeClient(YES))
+    r = run_proactive_check([pf(rebalance_history=[{"date": "2026-09-27", "trigger": "scheduled"}],
+                                next_rebalance_date="2026-09-29")], cfg, d, NOW)[0]
+    assert r.action == "recalibrated", "yesterday's recalibration / tomorrow's schedule no longer block acting"
+    print("✓ same day / in flight / cap -> flagged with reason; recalibrated yesterday + due tomorrow -> acts")
 
     print("TEST 3: evidence — weights, target from launch cost, moves, drift, triggers")
     ev = build_evidence(pf(), {**QUOTES, "AAA": {"price": 44.0, "prev_close": 50.0}}, FRAUD, cfg, today)

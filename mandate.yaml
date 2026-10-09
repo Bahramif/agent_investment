@@ -123,9 +123,7 @@ day_trading:
 proactive_recalibration:
   enabled: true
   dry_run: false                  # true = assess and log only, never trade
-  min_days_since_last_recal: 3    # no proactive recalibration within 3 days of any other
-  skip_if_scheduled_within_days: 1  # the planned one is due today/tomorrow -> let it run
-  max_proactive_per_30d: 2
+  max_proactive_per_30d: 2         # the review runs every day; this only caps how often it may TRADE
   min_confidence: 0.7             # the news model must be at least this sure acting now beats waiting
   news_lookback_days: 1
   material_weight: 0.05           # holdings under 5% don't raise price flags on their own

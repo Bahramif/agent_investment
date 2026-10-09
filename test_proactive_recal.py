@@ -115,12 +115,14 @@ if __name__ == "__main__":
         "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"
     ok(f"orders {FakeTradingClient.submitted}; history tagged proactive; next scheduled date pushed to {d['next_rebalance_date']}")
 
-    print("SCENARIO C: running again the same day does nothing — guardrails, no model call, no orders")
+    print("SCENARIO C: running again the same day still REVIEWS, but a 'recalibrate' verdict is flagged, not traded")
     n_orders, n_calls = len(FakeTradingClient.submitted), len(st["claude"].calls)
+    web_ui._headlines = lambda s, days: {"BBB": ["BBB recalls its flagship product"]}.get(s, [])   # AAA was sold in B
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
-    assert r["results"][0]["action"] == "skipped" and "0 day(s) ago" in r["results"][0]["reason"]
-    assert len(FakeTradingClient.submitted) == n_orders and len(st["claude"].calls) == n_calls
-    ok(r["results"][0]["reason"])
+    assert r["results"][0]["action"] == "flagged" and "already recalibrated today" in r["results"][0]["reason"], r
+    assert len(st["claude"].calls) == n_calls + 1, "the model reviewed the news again"
+    assert len(FakeTradingClient.submitted) == n_orders, "no second rebalance on the same date"
+    ok(r["results"][0]["reason"][-90:])
 
     print("SCENARIO D: dry run and a closed market FLAG instead of trading")
     for query, kw, needle in (("?dry_run=1", {}, "dry run"), ("", {"market_open": False}, "market closed")):
