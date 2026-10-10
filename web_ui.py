@@ -2962,9 +2962,11 @@ def _intraday_quotes(symbols: List[str]) -> Dict[str, Dict[str, float]]:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockSnapshotRequest
     sc = apply_default_timeout(StockHistoricalDataClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
-    snaps = sc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols))
+    snaps: Dict[str, Any] = {}
+    for i in range(0, len(symbols), 100):          # a sector pool can be 100+ names; keep each request modest
+        snaps.update(sc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols[i:i + 100])) or {})
     out: Dict[str, Dict[str, float]] = {}
-    for sym, sn in (snaps or {}).items():
+    for sym, sn in snaps.items():
         trade, prev = getattr(sn, "latest_trade", None), getattr(sn, "previous_daily_bar", None)
         if trade is not None and prev is not None and trade.price and prev.close:
             out[sym] = {"price": float(trade.price), "prev_close": float(prev.close)}
@@ -2981,6 +2983,32 @@ def _headlines(symbol: str, days: int) -> List[str]:
         from alpaca_clients import AlpacaNewsClient
         _NEWS_CLIENT = AlpacaNewsClient(NewsClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
     return _NEWS_CLIENT.get_recent_headlines(symbol, days)
+
+
+_NEWS_RAW = None
+
+
+def _headlines_many(symbols: List[str], days: int) -> Dict[str, List[str]]:
+    """{symbol: [headline, ...]} for many symbols in ONE batched Alpaca news
+    request (the SDK pages internally; capped at 500 articles). Each article
+    lists the tickers it covers, so it is filed under every watched one."""
+    global _NEWS_RAW
+    from datetime import datetime, timedelta, timezone
+    from alpaca.data.historical.news import NewsClient
+    from alpaca.data.requests import NewsRequest
+    if _NEWS_RAW is None:
+        _NEWS_RAW = apply_default_timeout(NewsClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
+    wanted = set(symbols)
+    out: Dict[str, List[str]] = {}
+    news = _NEWS_RAW.get_news(NewsRequest(symbols=",".join(sorted(wanted)), limit=500,
+                                          start=datetime.now(timezone.utc) - timedelta(days=days)))
+    for a in (news.data.get("news", []) if news else []):
+        headline = a["headline"] if isinstance(a, dict) else a.headline
+        tickers = a["symbols"] if isinstance(a, dict) else a.symbols
+        for t in tickers or []:
+            if t in wanted and headline not in out.setdefault(t, []):
+                out[t].append(headline)
+    return out
 
 
 def _market_open() -> bool:
@@ -3024,7 +3052,7 @@ def proactive_check_route():
         portfolios.append(p)
     deps = ProactiveDeps(quotes_fn=_intraday_quotes, news_fn=_headlines, recalibrate_fn=recalibrate,
                          record_fn=portfolio_store.record_proactive_check, client_fn=client,
-                         market_open_fn=_market_open)
+                         market_open_fn=_market_open, news_many_fn=_headlines_many)
     results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
     return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
             "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,
@@ -3192,7 +3220,8 @@ PORTFOLIO_DETAIL_PAGE = """
     <tr>
       <td>{{ c.at[:10] }}</td>
       <td><b>{{ c.action }}</b>{% if c.source and c.source != 'rules' %}<div style="color:#888;font-size:0.78rem;">{{ (c.review.model if c.review and c.review.model else c.source) if c.source != 'fallback' else 'backup rule' }}{% if c.source != 'fallback' and c.review and c.review.confidence is not none %} · {{ '%.0f'|format(c.review.confidence * 100) }}%{% endif %}</div>{% endif %}</td>
-      <td style="white-space:normal;">{{ c.reason }}{% if c.triggers %}<div style="color:#888;font-size:0.8rem;">{{ c.triggers|join('; ') }}</div>{% endif %}</td>
+      <td style="white-space:normal;">{{ c.reason }}{% if c.triggers %}<div style="color:#888;font-size:0.8rem;">{{ c.triggers|join('; ') }}</div>{% endif %}
+        {% if c.coverage %}<div style="color:#888;font-size:0.78rem;">watched {{ c.coverage.holdings }} holdings + {{ c.coverage.sector_stocks }} other {{ p.sectors|join('/') }} stocks · {{ c.coverage.with_news }} with news{% if c.coverage.big_movers %} · {{ c.coverage.big_movers }} big movers{% endif %}</div>{% endif %}</td>
     </tr>
     {% endfor %}
   </table>
