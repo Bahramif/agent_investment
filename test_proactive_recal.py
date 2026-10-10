@@ -63,6 +63,11 @@ def world(news=None, verdict=YES, market_open=True):
     state = {"recommend_calls": 0, "claude": FakeClaude(verdict)}
     web_ui._intraday_quotes = lambda syms: {s: {"price": 12.0, "prev_close": 12.2} for s in syms}
     web_ui._headlines = lambda s, days: (news or {}).get(s, [])
+    state["batched_news"] = []
+    def many(syms, days):
+        state["batched_news"].append(sorted(syms))
+        return {s: (news or {}).get(s, []) for s in syms}
+    web_ui._headlines_many = many
     web_ui._market_open = lambda: market_open
     # the harness's fake Secret Manager returns "stub" for ANY secret; default
     # these worlds to "no anthropic-api-key" (absent, checked just now)
@@ -117,7 +122,7 @@ if __name__ == "__main__":
 
     print("SCENARIO C: running again the same day still REVIEWS, but a 'recalibrate' verdict is flagged, not traded")
     n_orders, n_calls = len(FakeTradingClient.submitted), len(st["claude"].calls)
-    web_ui._headlines = lambda s, days: {"BBB": ["BBB recalls its flagship product"]}.get(s, [])   # AAA was sold in B
+    web_ui._headlines_many = lambda syms, days: {"BBB": ["BBB recalls its flagship product"]}   # AAA was sold in B
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
     assert r["results"][0]["action"] == "flagged" and "already recalibrated today" in r["results"][0]["reason"], r
     assert len(st["claude"].calls) == n_calls + 1, "the model reviewed the news again"
@@ -160,6 +165,11 @@ if __name__ == "__main__":
     assert "Mid-day news watch" in html and "recalibrated" in html and "SEC accounting probe" in html
     history = html.split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
     assert "📰 Mid-day news watch" in history and " ET</div>" in history, "type label + New York time on the row"
+    from universe import EQUITIES
+    n_tech = sum(1 for _, path, _ in EQUITIES if path.endswith(".tech_ai"))
+    assert "other tech_ai stocks" in html and f"+ {n_tech} other" in html, "coverage line: holdings + sector pool"
+    assert len(st["batched_news"]) == 1 and len(st["batched_news"][0]) >= n_tech, \
+        "one batched news request covering the holdings AND the whole tech_ai pool"
     ok("news-watch table rendered; history row labelled '📰 Mid-day news watch' with its ET time")
 
     print("SCENARIO H: the scheduled due-check and the manual button are tagged too")
