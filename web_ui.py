@@ -2849,14 +2849,14 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     cadence = p.get("rebalance_every_days", 0) or 0
     next_date = (datetime.now(timezone.utc) + timedelta(days=cadence)).date().isoformat() if cadence > 0 else None
 
-    portfolio_store.record_rebalance(
-        portfolio_id, new_holdings, new_cash, new_pending,
-        event={"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(),
-               "orders": orders_placed, "errors": errors,
-              "portfolio_value_before": current_value, "target_weights": weights,
-              "trigger": trigger, "reason": reason[:1000]},
-        next_rebalance_date=next_date,
-    )
+    event = {"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(),
+             "orders": orders_placed, "errors": errors,
+             "portfolio_value_before": current_value, "target_weights": weights,
+             "trigger": trigger, "reason": reason[:1000]}
+    portfolio_store.record_rebalance(portfolio_id, new_holdings, new_cash, new_pending, event=event,
+                                     next_rebalance_date=next_date)
+    from whatsapp_notify import recalibration_message
+    _notify_whatsapp(portfolio_id, *recalibration_message(event))     # never raises
     return {"orders": orders_placed, "errors": errors, "portfolio_value_before": current_value}
 
 
@@ -3022,6 +3022,98 @@ def _proactive_cfg():
     return load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
 
 
+# =============================================================================
+# WhatsApp notifications (optional, per portfolio) — whatsapp_notify.py.
+# Credentials in Secret Manager: whatsapp-access-token, whatsapp-phone-number-id.
+# =============================================================================
+_WA_CREDS: Optional[Tuple[str, str]] = None
+_WA_CHECKED = -1e9
+
+
+def _whatsapp_credentials() -> Optional[Tuple[str, str]]:
+    """(access token, phone number id) or None. Found credentials are cached;
+    missing ones are re-checked at most every 5 minutes, so adding the
+    secrets takes effect without a redeploy."""
+    import time
+    global _WA_CREDS, _WA_CHECKED
+    if _WA_CREDS or time.monotonic() - _WA_CHECKED < 300:
+        return _WA_CREDS
+    _WA_CHECKED = time.monotonic()
+    try:
+        from google.cloud import secretmanager
+        sm = secretmanager.SecretManagerServiceClient()
+        get = lambda n: sm.access_secret_version(
+            name=f"projects/{PROJECT}/secrets/{n}/versions/latest").payload.data.decode("utf-8").strip()
+        token, phone_id = get("whatsapp-access-token"), get("whatsapp-phone-number-id")
+        _WA_CREDS = (token, phone_id) if token and phone_id else None
+    except Exception:
+        _WA_CREDS = None
+    return _WA_CREDS
+
+
+def _whatsapp_cfg():
+    from whatsapp_notify import load_config
+    return load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
+
+
+def _notify_whatsapp(portfolio_id: str, headline: str, details: str, force: bool = False) -> Dict[str, Any]:
+    """Send (if this portfolio has notifications on) and log the outcome on the
+    portfolio. NEVER raises — a notification must not affect a trade."""
+    out: Dict[str, Any] = {}
+    try:
+        import portfolio_store
+        from datetime import datetime, timezone
+        from whatsapp_notify import notify
+        p = portfolio_store.get_portfolio(portfolio_id) or {}
+        out = notify(p, headline, details, _whatsapp_cfg(), _whatsapp_credentials, force=force)
+        if not out.get("skipped") or force:
+            portfolio_store.record_notification(portfolio_id, {**out, "at": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        print(f"[web_ui] WhatsApp notification for {portfolio_id} failed: {e}")
+        out = {"sent": False, "error": str(e)[:300]}
+    return out
+
+
+@app.route("/portfolios/<portfolio_id>/whatsapp", methods=["POST"])
+def whatsapp_settings_route(portfolio_id: str):
+    """Turn WhatsApp notifications on/off and set the number. Needs the
+    recalibrate token (when configured): this app is otherwise public, and an
+    open form would let anyone point your WhatsApp sender at any number."""
+    import portfolio_store
+    from urllib.parse import quote
+    from whatsapp_notify import normalize_number
+    expected = _recalibrate_token()
+    if expected and request.form.get("token") != expected:
+        return redirect(f"/portfolios/{portfolio_id}?wa_msg=" + quote("Wrong or missing token — nothing changed."))
+    enabled = request.form.get("enabled") == "1"
+    raw = (request.form.get("number") or "").strip()
+    number = None
+    if raw:
+        try:
+            number = normalize_number(raw)
+        except ValueError as e:
+            return redirect(f"/portfolios/{portfolio_id}?wa_msg=" + quote(f"Not saved: {e}"))
+    p = portfolio_store.get_portfolio(portfolio_id) or {}
+    if enabled and not (number or p.get("whatsapp_number")):
+        return redirect(f"/portfolios/{portfolio_id}?wa_msg=" + quote("Not saved: enter a WhatsApp number first."))
+    portfolio_store.set_whatsapp(portfolio_id, enabled, number)
+    msg = "WhatsApp notifications are ON." if enabled else "WhatsApp notifications are OFF."
+    return redirect(f"/portfolios/{portfolio_id}?wa_msg=" + quote(msg))
+
+
+@app.route("/portfolios/<portfolio_id>/whatsapp/test", methods=["POST"])
+def whatsapp_test_route(portfolio_id: str):
+    from urllib.parse import quote
+    from whatsapp_notify import test_message
+    expected = _recalibrate_token()
+    if expected and request.form.get("token") != expected:
+        return redirect(f"/portfolios/{portfolio_id}?wa_msg=" + quote("Wrong or missing token — nothing sent."))
+    out = _notify_whatsapp(portfolio_id, *test_message(), force=True)
+    msg = (f"Test sent to {out.get('to')}." if out.get("sent")
+           else f"Test NOT sent: {out.get('error') or out.get('skipped')}")
+    return redirect(f"/portfolios/{portfolio_id}?wa_msg=" + quote(msg))
+
+
 @app.route("/portfolios/proactive_check", methods=["POST"])
 def proactive_check_route():
     """Hit once mid-day by Cloud Scheduler. PLACES REAL ORDERS for any
@@ -3054,6 +3146,11 @@ def proactive_check_route():
                          record_fn=portfolio_store.record_proactive_check, client_fn=client,
                          market_open_fn=_market_open, news_many_fn=_headlines_many)
     results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
+    if not (dry_run or cfg.dry_run):                    # a dry run never notifies
+        from whatsapp_notify import flag_message
+        for r in results:
+            if r.action == "flagged":                   # Gemini wanted to recalibrate; a rule stopped the trade
+                _notify_whatsapp(r.portfolio_id, *flag_message(r.reason, (r.review or {}).get("model", "")))
     return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
             "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,
                          "source": r.source} for r in results]}
@@ -3207,6 +3304,41 @@ PORTFOLIO_DETAIL_PAGE = """
     {% endfor %}
   </table>
   </div>
+  {% endif %}
+
+  {% if p.status == 'open' %}
+  <h2>📱 WhatsApp notifications</h2>
+  {% if wa_msg %}<div class="meta-row" style="background:#f6f8ff;padding:8px 12px;border-radius:8px;">{{ wa_msg }}</div>{% endif %}
+  <p class="meta-row">Get a WhatsApp message when this portfolio recalibrates (scheduled, mid-day or manual) or the
+    news watch flags it. Status: <b style="color:{{ '#00a340' if p.whatsapp_notify else '#888' }};">{{ 'ON' if p.whatsapp_notify else 'OFF' }}</b>
+    {% if p.whatsapp_number %}· to +{{ p.whatsapp_number[:2] }}…{{ p.whatsapp_number[-3:] }}{% endif %}</p>
+  <form method="post" action="/portfolios/{{ p.id }}/whatsapp" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+    <input type="tel" name="number" placeholder="{{ 'change number (+1 416 555 0100)' if p.whatsapp_number else '+1 416 555 0100' }}"
+           style="padding:7px;border:1px solid #ccc;border-radius:8px;font-size:0.85rem;min-width:200px;">
+    <input type="hidden" name="enabled" value="{{ '0' if p.whatsapp_notify else '1' }}">
+    {% if wa_token_required %}<input type="password" name="token" placeholder="token" required
+           style="padding:7px;border:1px solid #ccc;border-radius:8px;font-size:0.85rem;width:110px;">{% endif %}
+    <button type="submit" style="background:{{ '#fee' if p.whatsapp_notify else '#0d1117' }};color:{{ '#a3312f' if p.whatsapp_notify else '#fff' }};
+            border:none;font-size:0.8rem;padding:7px 12px;border-radius:8px;cursor:pointer;font-weight:600;">
+      {{ 'Turn off' if p.whatsapp_notify else 'Turn on' }}</button>
+  </form>
+  {% if p.whatsapp_number %}
+  <form method="post" action="/portfolios/{{ p.id }}/whatsapp/test" style="display:flex;gap:8px;align-items:center;">
+    {% if wa_token_required %}<input type="password" name="token" placeholder="token" required
+           style="padding:7px;border:1px solid #ccc;border-radius:8px;font-size:0.85rem;width:110px;">{% endif %}
+    <button type="submit" style="background:#eef0f5;color:#333;border:none;font-size:0.8rem;padding:7px 12px;border-radius:8px;cursor:pointer;">
+      Send test message</button>
+  </form>
+  {% endif %}
+  {% if p.notifications %}
+  <div class="table-wrap" style="margin-top:8px;"><table>
+    <tr><th>When</th><th>Message</th><th>Result</th></tr>
+    {% for n in (p.notifications|reverse|list)[:5] %}
+    <tr><td>{{ n.at[:10] }} {{ n.at|et_time }} ET</td><td style="white-space:normal;">{{ n.headline }}</td>
+      <td style="white-space:normal;">{% if n.sent %}✅ sent {{ n.to }}{% else %}⚠️ {{ n.error or n.skipped }}{% endif %}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% endif %}
   {% endif %}
 
   {% if p.proactive_checks %}
@@ -3363,7 +3495,8 @@ def portfolio_detail(portfolio_id: str):
 
     selector = _portfolio_selector(_all_portfolios_enriched(), f"/portfolios/{portfolio_id}")
     return render_template_string(PORTFOLIO_DETAIL_PAGE, p=p, chart=chart, error=error,
-                                  spy_return=spy_return, active_page="portfolios", selector=selector)
+                                  spy_return=spy_return, active_page="portfolios", selector=selector,
+                                  wa_msg=request.args.get("wa_msg"), wa_token_required=bool(_recalibrate_token()))
 
 
 # =============================================================================

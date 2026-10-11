@@ -181,6 +181,33 @@ def set_news_watch(portfolio_id: str, enabled: bool) -> bool:
     return True
 
 
+def set_whatsapp(portfolio_id: str, enabled: bool, number: Optional[str] = None) -> bool:
+    """WhatsApp notification settings for one OPEN portfolio. `number` is the
+    normalized international number as digits (whatsapp_notify.normalize_number);
+    None leaves the stored number unchanged. False if no such open portfolio."""
+    doc_ref = _get_client().collection(_COLLECTION).document(portfolio_id)
+    snap = doc_ref.get()
+    if not snap.exists or (snap.to_dict() or {}).get("status") != "open":
+        return False
+    fields: Dict[str, Any] = {"whatsapp_notify": bool(enabled),
+                              "whatsapp_changed_at": datetime.now(timezone.utc).isoformat()}
+    if number is not None:
+        fields["whatsapp_number"] = number
+    doc_ref.update(fields)
+    return True
+
+
+def record_notification(portfolio_id: str, entry: Dict[str, Any], keep: int = 30) -> None:
+    """Appends one notification attempt (sent, skipped or failed) to the
+    portfolio's `notifications` log, newest last, capped at `keep`."""
+    doc_ref = _get_client().collection(_COLLECTION).document(portfolio_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        return
+    log = (snap.to_dict() or {}).get("notifications", []) + [entry]
+    doc_ref.update({"notifications": log[-keep:]})
+
+
 def record_proactive_check(portfolio_id: str, entry: Dict[str, Any], keep: int = 30) -> None:
     """Appends one mid-day news-watch result (proactive_recal.py) — acted on
     or not — to the portfolio's `proactive_checks`, newest last, capped at

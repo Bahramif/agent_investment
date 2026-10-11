@@ -130,3 +130,17 @@ proactive_recalibration:
   big_move_pct: 0.06              # a material holding moving 6%+ today is flagged to the model
   fallback_drop_pct: 0.10         # model unavailable: act only on a 10%+ drop in a material holding...
   max_drift: 0.15                 # ...or 15%+ total drift from target weights
+
+# =============================================================================
+# notifications — optional WhatsApp messages (whatsapp_notify.py), turned on
+# per portfolio on its page. Sent on every recalibration and on news-watch
+# flags, through Meta's WhatsApp Cloud API with ONE approved template (see
+# whatsapp_notify.py for its exact text). Credentials are Secret Manager
+# secrets, never here: whatsapp-access-token, whatsapp-phone-number-id.
+# =============================================================================
+notifications:
+  whatsapp:
+    enabled: true
+    api_version: v26.0               # Graph API version; Meta retires each ~2 years after release
+    template_name: meridian_portfolio_update
+    language_code: en_US
