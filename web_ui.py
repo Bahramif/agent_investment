@@ -3452,13 +3452,13 @@ PORTFOLIO_DETAIL_PAGE = """
       <td>
         {% if e.no_change %}<span class="small">no changes needed</span>
         {% else %}
-          {% for s in e.exited %}<span class="chip out">−{{ s }}</span>{% endfor %}
-          {% for s in e.entered %}<span class="chip in">+{{ s }}</span>{% endfor %}
-          {% for s in e.resized %}<span class="chip rs">⇅{{ s }}</span>{% endfor %}
-          <div class="small">holds {{ e.n_holds }}</div>
+          {% for s in e.exited %}<span class="chip out" title="sold all {{ '%g'|format(e.exited_qty[s]) }} shares">−{{ s }} {{ '%g'|format(e.exited_qty[s]) }}</span>{% endfor %}
+          {% for s in e.entered %}<span class="chip in" title="bought {{ '%g'|format(e.entered_qty[s]) }} shares">+{{ s }} {{ '%g'|format(e.entered_qty[s]) }}</span>{% endfor %}
+          {% for s in e.resized %}<span class="chip rs" title="{{ 'bought' if e.resized_delta[s] > 0 else 'sold' }} {{ '%g'|format(e.resized_delta[s]|abs) }} shares">⇅{{ s }} {{ ('%+g'|format(e.resized_delta[s]))|replace('-', '−') }}</span>{% endfor %}
+          <div class="small">holds {{ e.n_holds }} · shares sold (−), bought (+), resized (⇅)</div>
         {% endif %}
+        {% if e.not_filled %}<div style="color:#b45309;font-size:0.78rem;">{% for k, v in e.not_filled|dictsort %}{{ v }} order{{ 's' if v > 1 }} {{ k }}{{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}
         {% if e.errors %}<div style="color:#a3312f;font-size:0.78rem;">{{ e.errors }} order error{{ 's' if e.errors > 1 }}</div>{% endif %}
-        {% if e.orders %}<details class="more"><summary>orders ▸</summary><div>{% for o in e.orders %}{{ o.side }} {{ o.qty }} {{ o.symbol }}{% if o.result and o.result != 'FILLED' %} ({{ o.result|lower }}){% endif %}{{ ', ' if not loop.last }}{% endfor %}</div></details>{% endif %}
       </td>
       <td style="white-space:normal;max-width:260px;font-size:0.84rem;">{{ e.why_short or '—' }}
         {% if e.why_full %}<details class="more"><summary>more ▸</summary><div>{{ e.why_full }}</div></details>{% endif %}</td>

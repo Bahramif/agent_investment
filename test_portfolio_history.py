@@ -80,16 +80,30 @@ if __name__ == "__main__":
     rows = hist.split("<tr>")[2:]
     newest, oldest = rows[0], rows[1]
     assert "📰 Mid-day" in newest and "12:31 ET" in newest
-    assert '<span class="chip out">−AMAT</span>' in newest and '<span class="chip in">+GOOGL</span>' in newest
+    assert ">−AMAT 3</span>" in newest and ">+GOOGL 6</span>" in newest, "share counts right on the chips"
     assert "holds 3" in newest
+    assert "orders ▸" not in newest, "no dropdown needed any more"
     short_why = "Rule — the portfolio is down 11.5% since its last recalibration (2026-10-06) while its own sector pool is -4.2%."
     assert short_why in newest and "more ▸" in newest and "Model&#39;s own view" in newest, "short line + full text in details"
     assert '<span class="grade B">B</span> Sound rotation out of a lagging sub-industry.' in newest
     assert "0 objections · ⚠️ 1 concern" in newest and "⚠️ AMAT: May be selling near a bottom." in newest
     assert "GOOGL: Quality" not in newest, "agreements aren't listed"
     assert "$9,001" in newest
-    assert "👆 Manual" in oldest and "−KEYS" in oldest and "+NVDA" in oldest and "Recalibrate Now clicked" in oldest
+    assert "👆 Manual" in oldest and ">−KEYS 4</span>" in oldest and ">+NVDA 10</span>" in oldest
+    assert "Recalibrate Now clicked" in oldest
     ok("6 short columns; chips for what changed; one-line why/reviewer with the rest behind 'more ▸' / 'details ▸'")
+
+    print("SCENARIO B2: a resized position shows its signed share change with a real minus sign")
+    resized_doc = base.doc(pending_order_ids={}, rebalance_history=[
+        {"date": "2026-10-16", "trigger": "scheduled", "portfolio_value_before": 1.0,
+         "orders": [{"symbol": "AAA", "side": "SELL", "qty": 40, "result": "FILLED"},
+                    {"symbol": "BBB", "side": "BUY", "qty": 5, "result": "TIMEOUT"}]}])
+    install(resized_doc)
+    base.world()
+    html = c.get("/portfolios/p1").get_data(as_text=True)
+    hist = html.split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
+    assert ">⇅AAA −40</span>" in hist and ">⇅BBB +5</span>" in hist and "1 order still filling" in hist, hist[-1500:]
+    ok("⇅AAA −40, ⇅BBB +5, '1 order still filling'")
 
     print("SCENARIO C: no launch record -> no 'Started with', but a real 'what changed' rebuilt from today's holdings")
     install(base.doc(pending_order_ids={}, rebalance_history=history[:1],

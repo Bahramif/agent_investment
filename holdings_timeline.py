@@ -47,6 +47,12 @@ def summarize_event(ev: Dict[str, Any], before: Dict[str, float], after: Dict[st
     exited = sorted(s for s in before if s not in after)
     entered = sorted(s for s in after if s not in before)
     resized = sorted(s for s in after if s in before and abs(after[s] - before[s]) > 1e-9)
+    not_filled: Dict[str, int] = {}
+    for o in ev.get("orders") or []:
+        res = str(o.get("result", "")).upper()
+        if res not in ("FILLED", "PARTIAL", ""):
+            label = "still filling" if res == "TIMEOUT" else res.lower()
+            not_filled[label] = not_filled.get(label, 0) + 1
     review = ev.get("review") or {}
     orders = review.get("orders") or {}
     objections = [(s, first_sentence(o.get("reason"), 110)) for s, o in sorted(orders.items())
@@ -60,6 +66,10 @@ def summarize_event(ev: Dict[str, Any], before: Dict[str, float], after: Dict[st
         "date": ev.get("date"), "at": ev.get("at"),
         "type": TYPE_LABEL.get(trigger, "Not recorded"), "trigger": trigger,
         "exited": exited, "entered": entered, "resized": resized,
+        # share counts shown right on the chips: sold / bought / change
+        "exited_qty": {s: before[s] for s in exited}, "entered_qty": {s: after[s] for s in entered},
+        "resized_delta": {s: after[s] - before[s] for s in resized},
+        "not_filled": not_filled,
         "holds": sorted(after), "n_holds": len(after),
         "no_change": not (exited or entered or resized),
         "errors": len(ev.get("errors") or []),
@@ -166,6 +176,9 @@ if __name__ == "__main__":
     assert old["exited"] == ["KEYS"] and old["entered"] == ["NVDA"] and old["holds"] == ["AMAT", "KLAC", "NVDA"]
     assert "XYZ" not in old["entered"], "rejected orders don't change holdings"
     assert new["exited"] == ["AMAT"] and new["entered"] == ["GOOGL"] and new["resized"] == ["KLAC"]
+    assert new["exited_qty"] == {"AMAT": 3.0} and new["entered_qty"] == {"GOOGL": 6.0}
+    assert new["resized_delta"] == {"KLAC": -4.0}, new["resized_delta"]
+    assert old["not_filled"] == {"rejected": 1} and new["not_filled"] == {}
     assert new["n_holds"] == 3 and new["type"] == "📰 Mid-day"
     print(f"✓ Oct 6: -KEYS +NVDA; Oct 16: -AMAT +GOOGL ⇅KLAC -> holds {new['holds']}")
 
