@@ -135,3 +135,16 @@ proactive_recalibration:
   lag_loss_pct: 0.05
   lag_vs_sector_pct: 0.04
   act_on_lagging: true
+
+# =============================================================================
+# evaluation — the evaluation agent (rec_evaluator.py). Reviews every
+# recalibration's orders BEFORE they are placed: hard checks may block a BUY
+# (concentration, red-flag news); the AI review is advisory only. Also powers
+# the 🧪 Evaluation page (track record of past calls vs. their sector).
+# =============================================================================
+evaluation:
+  enabled: true
+  max_single_weight: 0.40    # block a BUY that would put > 40% in one stock ...
+  min_names_for_cap: 3       # ... when the portfolio targets 3+ names
+  red_flag_days: 2           # block a BUY with fraud / SEC probe / bankruptcy / halt headlines this recent
+  ai_review: true            # advisory Gemini review (grade A-F + per-order verdicts)

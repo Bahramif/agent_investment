@@ -783,6 +783,7 @@ TOP_NAV = """
   <a href="/portfolios" class="{{ 'active' if active_page == 'portfolios' else '' }}">📊 Portfolio</a>
   <a href="/daytrade" class="{{ 'active' if active_page == 'daytrade' else '' }}">⚡ Day Trading</a>
   <a href="/simulate" class="{{ 'active' if active_page == 'simulate' else '' }}">📈 Simulate</a>
+  <a href="/evaluation" class="{{ 'active' if active_page == 'evaluation' else '' }}">🧪 Evaluation</a>
   <a href="/about" class="{{ 'active' if active_page == 'about' else '' }}">ℹ️ How This Works</a>
 </nav>
 """
@@ -2759,6 +2760,22 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     tc = TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True)
     broker = AlpacaBrokerClient(tc)
 
+    # ---- evaluation agent (rec_evaluator.py): plan the orders with the SAME
+    # arithmetic as the loop below, review them, and skip only vetoed BUYs.
+    plan: List[Dict[str, Any]] = []
+    for sym in all_symbols:
+        _px = new_prices.get(sym) or (old_holdings.get(sym) or {}).get("entry_price")
+        _cur = (old_holdings.get(sym) or {}).get("shares", 0)
+        if not _px:
+            continue
+        _tgt = math.floor((current_value * weights.get(sym, 0.0)) / _px) if weights.get(sym, 0.0) > 0 else 0
+        if _tgt != _cur:
+            plan.append({"symbol": sym, "side": "BUY" if _tgt > _cur else "SELL", "qty": abs(_tgt - _cur),
+                         "price": _px, "current_shares": _cur})
+    notes = result.get("book_notes") or {}
+    review = _review_plan(p, plan, weights, notes, trigger, reason)          # never raises
+    vetoed = review.get("vetoed") or {}
+
     rebalance_date = datetime.now(timezone.utc).date().isoformat()
     new_holdings: Dict[str, Dict[str, float]] = {}
     orders_placed: List[Dict[str, Any]] = []
@@ -2780,6 +2797,10 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
             continue
         target_shares = math.floor((current_value * target_weight) / price) if target_weight > 0 else 0
         delta = target_shares - current_shares
+        if delta > 0 and sym in vetoed:                 # the evaluator's hard check blocked this buy
+            if current_shares > 0:
+                new_holdings[sym] = old_holdings[sym]
+            continue
         if delta == 0:
             if current_shares > 0:
                 new_holdings[sym] = old_holdings[sym]
@@ -2854,7 +2875,11 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
         event={"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(),
                "orders": orders_placed, "errors": errors,
               "portfolio_value_before": current_value, "target_weights": weights,
-              "trigger": trigger, "reason": reason[:1000]},
+              "trigger": trigger, "reason": reason[:1000], "review": review,
+              # what drove each pick — the scorecard attributes outcomes to these
+              "signals": {s: {k: (notes.get(s) or {}).get(k) for k in
+                              ("dip_score", "drawdown_6m", "momentum_1m", "conviction", "rating", "quality_score")}
+                          for s in weights}},
         next_rebalance_date=next_date,
     )
     return {"orders": orders_placed, "errors": errors, "portfolio_value_before": current_value}
@@ -2953,6 +2978,150 @@ def recalibrate_due_route():
 # A holiday is handled here, not in the schedule: with the market closed a
 # "recalibrate" verdict is only flagged. POST ?dry_run=1 to see what it WOULD do.
 # =============================================================================
+# =============================================================================
+# Evaluation agent — pre-trade review + track-record scorecard (rec_evaluator.py)
+# =============================================================================
+def _eval_cfg():
+    from rec_evaluator import load_config
+    return load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
+
+
+def _review_plan(p: Dict[str, Any], plan: List[Dict[str, Any]], weights: Dict[str, float],
+                 notes: Dict[str, Dict[str, Any]], trigger: str, reason: str) -> Dict[str, Any]:
+    """Pre-trade review for one recalibration. NEVER raises: any failure
+    means "no review" (nothing vetoed), never a blocked recalibration."""
+    try:
+        from rec_evaluator import review_plan, track_record_lines
+        cfg = _eval_cfg()
+        symbols = sorted({o["symbol"] for o in plan})
+        heads: Dict[str, List[str]] = {}
+        try:
+            heads = _headlines_many(symbols, cfg.red_flag_days) if symbols else {}
+        except Exception as e:
+            print(f"[web_ui] reviewer headlines unavailable: {e}")
+        track: List[str] = []
+        try:
+            track = track_record_lines(_scorecard()[1])
+        except Exception as e:
+            print(f"[web_ui] reviewer track record unavailable: {e}")
+        client = None
+        try:
+            client = _claude_client()
+        except Exception as e:
+            print(f"[web_ui] reviewer model unavailable: {e}")
+        return review_plan(p, plan, weights, notes, heads, cfg, client, trigger, reason, track)
+    except Exception as e:
+        print(f"[web_ui] pre-trade review failed: {e}")
+        return {"grade": None, "summary": f"review failed: {e}", "orders": {}, "vetoed": {}, "source": "error"}
+
+
+def _daily_closes(symbols: List[str], start: Any) -> Dict[str, Dict[Any, float]]:
+    """{symbol: {date: close}} from `start` to today, batched."""
+    from datetime import datetime, time as dtime, timezone
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    sc = apply_default_timeout(StockHistoricalDataClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
+    out: Dict[str, Dict[Any, float]] = {}
+    for i in range(0, len(symbols), 100):
+        bars = sc.get_stock_bars(StockBarsRequest(symbol_or_symbols=symbols[i:i + 100], timeframe=TimeFrame.Day,
+                                                  start=datetime.combine(start, dtime(0), tzinfo=timezone.utc)))
+        for sym, bs in (getattr(bars, "data", None) or {}).items():
+            out[sym] = {b.timestamp.date(): float(b.close) for b in bs}
+    return out
+
+
+_SCORECARD: Dict[str, Any] = {"at": -1e9, "value": None}
+
+
+def _scorecard(max_age: float = 1800.0):
+    """(graded decisions, aggregate) over every portfolio's recalibration
+    orders, cached for 30 minutes (one batched price request per refresh)."""
+    import time
+    if _SCORECARD["value"] is not None and time.monotonic() - _SCORECARD["at"] < max_age:
+        return _SCORECARD["value"]
+    import portfolio_store
+    from datetime import timedelta
+    from rec_evaluator import aggregate, decisions_from_portfolios, grade_decisions
+    sector_of = {sym: path.split(".")[-1] for sym, path, _ in UNIVERSE}
+    pools: Dict[str, List[str]] = {}
+    for sym, sector in sector_of.items():
+        pools.setdefault(sector, []).append(sym)
+    decisions = decisions_from_portfolios(portfolio_store.list_portfolios(), sector_of)
+    if not decisions:
+        value = ([], aggregate([]))
+    else:
+        sectors = {d["sector"] for d in decisions}
+        syms = sorted({d["symbol"] for d in decisions} | {s for sec in sectors for s in pools.get(sec, [])} | {"SPY"})
+        closes = _daily_closes(syms, min(d["date"] for d in decisions) - timedelta(days=7))
+        graded = grade_decisions(decisions, closes, pools)
+        value = (graded, aggregate(graded))
+    _SCORECARD.update(at=time.monotonic(), value=value)
+    return value
+
+
+EVALUATION_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian — Evaluation</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 860px;
+        margin: 0 auto; padding: 32px 16px 64px; color: #0d1117; line-height: 1.45; }
+  h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin: 26px 0 8px; }
+  .meta { color: #6a7280; font-size: 0.86rem; }
+  .table-wrap { overflow-x: auto; } table { width: 100%; min-width: 560px; border-collapse: collapse; font-size: 0.86rem; }
+  th, td { text-align: left; padding: 6px 6px; border-bottom: 1px solid #eee; } th { color: #888; font-weight: 500; }
+  .pos { color: #00a340; } .neg { color: #d43f3f; }
+  .warn { color: #a3312f; background: #fee; padding: 12px; border-radius: 10px; }
+  .card { background: #f6f8ff; border-radius: 12px; padding: 12px 16px; display: inline-block; margin: 0 8px 8px 0; min-width: 150px; }
+  .card .big { font-size: 1.3rem; font-weight: 800; }
+</style></head><body>
+<h1>🧪 How good have the recommendations been?</h1>
+<p class="meta">Every buy and sell placed by a recalibration, graded on what the market did NEXT — the stock vs. its
+  own sector (all its universe stocks, equal-weighted) over 1, 5 and 20 trading days. A buy is a hit if the stock beat
+  its sector; a sell is a hit if it lagged after we sold. "Value added" is that gap (for sells, the loss avoided).
+  Paper trading. Recalibrations made before signal tracking began show their signal as "unrecorded".
+  <a href="/evaluation?refresh=1">Refresh now</a></p>
+{% if error %}<div class="warn">{{ error }}</div>{% endif %}
+{% macro cell(s) %}{% if s and s.n %}<td>{{ s.n }}</td><td>{{ '{:.0%}'.format(s.hit_rate) }}</td>
+  <td class="{{ 'pos' if s.avg_value_added > 0 else 'neg' }}">{{ '{:+.1%}'.format(s.avg_value_added) }}</td>
+  {% else %}<td>0</td><td>—</td><td>—</td>{% endif %}{% endmacro %}
+{% macro table(title, groups) %}<h2>{{ title }}</h2><div class="table-wrap"><table>
+  <tr><th></th>{% for h in horizons %}<th>n ({{ h }}d)</th><th>hit rate</th><th>value added</th>{% endfor %}</tr>
+  {% for k, v in groups.items() %}<tr><td><b>{{ k }}</b></td>{% for h in horizons %}{{ cell(v[h]) }}{% endfor %}</tr>
+  {% else %}<tr><td class="meta">nothing graded yet</td></tr>{% endfor %}</table></div>{% endmacro %}
+{% if agg %}
+  {% for h in horizons %}{% set s = agg.overall[h] %}<div class="card"><div class="meta">{{ h }} trading day{{ 's' if h > 1 }} after</div>
+    <div class="big {{ 'pos' if s.n and s.avg_value_added > 0 else 'neg' if s.n else '' }}">{{ '{:+.1%}'.format(s.avg_value_added) if s.n else '—' }}</div>
+    <div class="meta">{{ s.n }} calls{% if s.n %} · {{ '{:.0%}'.format(s.hit_rate) }} hit rate{% endif %}</div></div>{% endfor %}
+  {{ table("By what triggered the recalibration", agg.by_trigger) }}
+  {{ table("Buys, by the signal behind them", agg.by_signal) }}
+  {{ table("Buys vs sells", agg.by_side) }}
+  {{ table("By portfolio", agg.by_portfolio) }}
+  <h2>Worst and best calls (5 trading days after)</h2><div class="table-wrap"><table>
+    <tr><th>Date</th><th>Portfolio</th><th>Call</th><th>Trigger · signal</th><th>Stock</th><th>Sector</th><th>Value added</th></tr>
+    {% for r in worst + best %}<tr><td>{{ r.date }}</td><td>{{ r.portfolio }}</td><td>{{ r.side }} {{ r.symbol }}</td>
+      <td>{{ r.trigger }} · {{ r.signal }}</td><td>{{ '{:+.1%}'.format(r.ret_5) }}</td><td>{{ '{:+.1%}'.format(r.sector_5) }}</td>
+      {% set va = r.excess_5 if r.side == 'BUY' else -r.excess_5 %}<td class="{{ 'pos' if va > 0 else 'neg' }}">{{ '{:+.1%}'.format(va) }}</td></tr>
+    {% if loop.index == worst|length %}<tr><td colspan="7" style="border-bottom:2px solid #ddd;"></td></tr>{% endif %}{% endfor %}
+  </table></div>
+{% endif %}
+</body></html>"""
+EVALUATION_PAGE = EVALUATION_PAGE.replace("<body>", "<body>\n" + TOP_NAV, 1)
+
+
+@app.route("/evaluation")
+def evaluation_route():
+    from rec_evaluator import HORIZONS, worst_and_best
+    graded, agg, error = [], None, None
+    try:
+        graded, agg = _scorecard(max_age=0 if request.args.get("refresh") else 1800.0)
+    except Exception as e:
+        error = f"Could not compute the scorecard: {e}"
+    worst, best = worst_and_best(graded) if graded else ([], [])
+    return render_template_string(EVALUATION_PAGE, agg=agg, horizons=HORIZONS, worst=worst, best=best,
+                                  error=error, active_page="evaluation")
+
+
 def _intraday_quotes(symbols: List[str]) -> Dict[str, Dict[str, float]]:
     """{symbol: {"price": latest trade, "prev_close": previous session close}}
     from Alpaca's snapshot endpoint (one request for all symbols). A symbol
@@ -3220,7 +3389,12 @@ PORTFOLIO_DETAIL_PAGE = """
       <td>{{ ev.date }}{% if ev.at %}<div style="color:#888;font-size:0.8rem;">{{ ev.at|et_time }} ET</div>{% endif %}</td>
       <td style="white-space:normal;"><span class="act" style="background:{{ kind[1] }};color:{{ kind[2] }};">{{ kind[0] }}</span>
         {% if not ev.trigger %}<div style="color:#999;font-size:0.75rem;">before labels were added</div>{% endif %}
-        {% if ev.reason %}<div style="color:#6a7280;font-size:0.8rem;max-width:280px;">{{ ev.reason }}</div>{% endif %}</td>
+        {% if ev.reason %}<div style="color:#6a7280;font-size:0.8rem;max-width:280px;">{{ ev.reason }}</div>{% endif %}
+        {% if ev.review and (ev.review.grade or ev.review.vetoed) %}<div style="font-size:0.8rem;margin-top:4px;max-width:300px;">
+          🧪 Reviewer{% if ev.review.grade %}: <b>{{ ev.review.grade }}</b>{% endif %} — {{ ev.review.summary }}
+          {% for sym, why in (ev.review.vetoed or {}).items() %}<div style="color:#a3312f;">⛔ blocked BUY {{ sym }}: {{ why }}</div>{% endfor %}
+          {% for sym, o in (ev.review.orders or {}).items() %}{% if o.verdict != 'agree' %}<div style="color:#b45309;">{{ '⚠️' if o.verdict == 'concern' else '✋' }} {{ sym }}: {{ o.reason }}</div>{% endif %}{% endfor %}
+        </div>{% endif %}</td>
       <td>{% for o in ev.orders %}<span class="act {{ o.side }}">{{ o.side }} {{ o.qty }} {{ o.symbol }}</span> {% endfor %}
         {% if not ev.orders %}no changes needed{% endif %}
         {% if ev.errors %}<div style="color:#a3312f;">{{ ev.errors|length }} error(s)</div>{% endif %}</td>

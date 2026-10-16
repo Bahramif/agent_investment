@@ -70,7 +70,8 @@ def world(news=None, verdict=YES, market_open=True):
     web_ui._headlines_many = many
     web_ui._market_open = lambda: market_open
     web_ui._closes_on = lambda syms, day: {}            # no price history unless a scenario sets it
-    # the harness's fake Secret Manager returns "stub" for ANY secret; default
+    web_ui._daily_closes = lambda syms, start: {}       # the evaluator's scorecard: no history in these tests
+    web_ui._SCORECARD.update(at=-1e9, value=None)    # the harness's fake Secret Manager returns "stub" for ANY secret; default
     # these worlds to "no anthropic-api-key" (absent, checked just now)
     web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
     os.environ.pop("MERIDIAN_LLM_PROVIDER", None)                                   # default provider: gemini
@@ -169,8 +170,10 @@ if __name__ == "__main__":
     from universe import EQUITIES
     n_tech = sum(1 for _, path, _ in EQUITIES if path.endswith(".tech_ai"))
     assert "other tech_ai stocks" in html and f"+ {n_tech} other" in html, "coverage line: holdings + sector pool"
-    assert len(st["batched_news"]) == 1 and len(st["batched_news"][0]) >= n_tech, \
-        "one batched news request covering the holdings AND the whole tech_ai pool"
+    assert len(st["batched_news"]) >= 1 and len(st["batched_news"][0]) >= n_tech, \
+        "the news watch's batched request covers the holdings AND the whole tech_ai pool"
+    assert all(len(x) < n_tech for x in st["batched_news"][1:]), \
+        "any later request is the pre-trade reviewer's, for just the stocks being traded"
     ok("news-watch table rendered; history row labelled '📰 Mid-day news watch' with its ET time")
 
     print("SCENARIO H: the scheduled due-check and the manual button are tagged too")
