@@ -3450,10 +3450,7 @@ PORTFOLIO_DETAIL_PAGE = """
       <td style="white-space:nowrap;">{{ e.date }}{% if e.at %}<div class="small">{{ e.at|et_time }} ET</div>{% endif %}</td>
       <td style="white-space:nowrap;">{{ e.type }}</td>
       <td>
-        {% if e.unknown_holdings %}
-          {% for o in e.orders %}<span class="chip {{ 'in' if o.side == 'BUY' else 'out' }}">{{ '+' if o.side == 'BUY' else '−' }}{{ o.symbol }}</span>{% endfor %}
-          {% if not e.orders %}<span class="small">no changes</span>{% endif %}
-        {% elif e.no_change %}<span class="small">no changes needed</span>
+        {% if e.no_change %}<span class="small">no changes needed</span>
         {% else %}
           {% for s in e.exited %}<span class="chip out">−{{ s }}</span>{% endfor %}
           {% for s in e.entered %}<span class="chip in">+{{ s }}</span>{% endfor %}

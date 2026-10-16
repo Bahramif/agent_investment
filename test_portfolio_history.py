@@ -91,14 +91,16 @@ if __name__ == "__main__":
     assert "👆 Manual" in oldest and "−KEYS" in oldest and "+NVDA" in oldest and "Recalibrate Now clicked" in oldest
     ok("6 short columns; chips for what changed; one-line why/reviewer with the rest behind 'more ▸' / 'details ▸'")
 
-    print("SCENARIO C: a portfolio with no launch record shows its orders, not a made-up holdings diff")
-    install(base.doc(pending_order_ids={}, rebalance_history=history[:1]))
+    print("SCENARIO C: no launch record -> no 'Started with', but a real 'what changed' rebuilt from today's holdings")
+    install(base.doc(pending_order_ids={}, rebalance_history=history[:1],
+                     holdings={"AAA": {"shares": 100, "entry_price": 10.0, "cost": 1000.0},
+                               "NVDA": {"shares": 10, "entry_price": 100.0, "cost": 1000.0}}))
     base.world()
     html = c.get("/portfolios/p1").get_data(as_text=True)
     assert "<h2>Started with</h2>" not in html
     hist = html.split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
-    assert "−KEYS" in hist and "+NVDA" in hist and "holds" not in hist
-    ok("no 'Started with' section; history shows the orders as +/- chips")
+    assert "−KEYS" in hist and "+NVDA" in hist and "holds 2" in hist
+    ok("no 'Started with' section; history row: −KEYS +NVDA, holds 2")
 
     print("SCENARIO D: launches record initial_holdings; recalibrations record holdings_after")
     seen = {}
