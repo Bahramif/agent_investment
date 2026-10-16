@@ -48,7 +48,7 @@ def create_portfolio(name: str, sectors: List[str], capital: float, top_n: int,
                      pending_order_ids: Optional[Dict[str, str]] = None,
                      rebalance_every_days: int = 0,
                      estimated_1mo_return: Optional[float] = None,
-                     news_watch: bool = False) -> str:
+                     news_watch: bool = False, n_stocks: Optional[int] = None) -> str:
     """holdings: {symbol: {"shares": int, "entry_price": float, "cost": float}}
     for whatever actually filled. pending_order_ids: {symbol: client_order_id}
     for orders accepted by Alpaca but not yet resolved (e.g. placed after
@@ -93,6 +93,8 @@ def create_portfolio(name: str, sectors: List[str], capital: float, top_n: int,
         "rebalance_history": [],
         "estimated_1mo_return": estimated_1mo_return,
         "news_watch": bool(news_watch),
+        # how many stocks it STARTED with — every recalibration re-selects exactly this many
+        "n_stocks": int(n_stocks) if n_stocks else len(holdings),
     }
     _get_client().collection(_COLLECTION).document(portfolio_id).set(doc)
     return portfolio_id

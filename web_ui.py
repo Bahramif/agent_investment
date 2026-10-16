@@ -103,7 +103,21 @@ def _max_per_name_for(top_n: int) -> float:
     re-scoring happens between them, so an identical mandate/signals just
     produces the identical rejection three times — see
     firm_graph.risk_check_node's own bug-fix comment)."""
-    return min(1.0, max(0.10, 2.0 / max(top_n, 1)))
+    cap = min(1.0, max(0.10, 2.0 / max(top_n, 1)))
+    # Never propose what the pre-trade reviewer would block (rec_evaluator hard
+    # check: > max_single_weight in one name when the book holds >=
+    # min_names_for_cap names). Without this a 3-stock book got a 67% cap and
+    # its biggest buy was vetoed every time. Still >= an equal share (1/n), so
+    # the budget can always be fully placed.
+    try:
+        from rec_evaluator import load_config
+        ev = load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
+        limit, min_names = ev.max_single_weight, ev.min_names_for_cap
+    except Exception:
+        limit, min_names = 0.40, 3
+    if top_n >= min_names:
+        cap = max(1.0 / top_n, min(cap, limit))
+    return cap
 # With 223 real candidates, the heuristic scorer's convictions cluster too
 # closely together to differentiate meaningfully — without a cap, water_fill
 # spreads the budget near-equally across 50-70+ names instead of
@@ -1749,6 +1763,7 @@ def index():
         try:
             result = recommend(selected, top_n)
             ctx = enrich(result, selected, capital)
+            _LAST_CONTEXT["top_n"] = top_n
         except Exception as e:
             error = str(e)
     elif _LAST_CONTEXT:
@@ -1757,6 +1772,10 @@ def index():
         ctx = _LAST_CONTEXT
         selected = _LAST_CONTEXT.get("selected_sectors", selected)
         capital = _LAST_CONTEXT.get("capital", capital)
+        # BUG FIX: this reload used to fall back to the default (12), so every
+        # portfolio was LAUNCHED with top_n=12 whatever was chosen — and every
+        # recalibration then re-selected 12.
+        top_n = int(_LAST_CONTEXT.get("top_n") or top_n)
     return render_template_string(PAGE, sectors=SECTORS, selected=selected, capital=capital,
                                   top_n=top_n, universe_size=len(UNIVERSE), active_page="home",
                                   rebalance_options=REBALANCE_OPTIONS,
@@ -1790,6 +1809,7 @@ def recommend_stream():
                     yield f"data: {json.dumps({'step': label, 'node': node_name})}\n\n"
             final_state = _call_with_timeout(_remote_agent.get_final_state, thread_id=thread_id, timeout=60.0)
             enrich(final_state, selected, capital)   # populates _LAST_CONTEXT
+            _LAST_CONTEXT["top_n"] = top_n           # the launch form must carry THIS, not the default
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -1986,6 +2006,7 @@ def execute():
                 name=portfolio_name, sectors=selected, capital=capital, top_n=top_n,
                 holdings=holdings, cash_remaining=max(0.0, capital - spent), errors=errors,
                 pending_order_ids=pending_order_ids, rebalance_every_days=rebalance_every_days,
+                n_stocks=len(set(holdings) | set(pending_order_ids)),
                 estimated_1mo_return=_LAST_CONTEXT.get("expected_return"),
                 news_watch=news_watch,
             )
@@ -2749,7 +2770,11 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     live = _live_prices(list(old_holdings.keys()))
     current_value = _mark_to_market(p, live)["mtm_value"]
 
-    result = recommend(p["sectors"], p.get("top_n", TOP_N_TOTAL))
+    # Keep the number of stocks the portfolio was LAUNCHED with: recalibration
+    # changes which stocks, never how many. Older portfolios without n_stocks
+    # (see backfill_n_stocks.py) keep their current count.
+    n_stocks = int(p.get("n_stocks") or len(old_holdings) or p.get("top_n") or TOP_N_TOTAL)
+    result = recommend(p["sectors"], n_stocks)
     weights = result.get("final_weights") or {}
     if not weights:
         return {"error": f"Recalibration produced no recommendation "
@@ -3287,7 +3312,7 @@ PORTFOLIO_DETAIL_PAGE = """
 <body>
   <h1>{{ p.name }}<span class="status {{ p.status }}">{{ p.status }}</span></h1>
   {{ selector|safe }}
-  <div class="sub">Launched {{ p.created_at[:10] }} · {{ p.sectors|join(', ') }} · top {{ p.top_n }} names total
+  <div class="sub">Launched {{ p.created_at[:10] }} · {{ p.sectors|join(', ') }} · {{ p.n_stocks or p.holdings|length }} stocks (kept at every recalibration)
     {% if p.status == 'closed' %}· closed {{ p.closed_at[:10] }}
     {% elif p.next_rebalance_date %}· auto-recalibrates on {{ p.next_rebalance_date }}
     {% else %}· manual recalibration only
