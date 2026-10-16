@@ -69,6 +69,7 @@ def world(news=None, verdict=YES, market_open=True):
         return {s: (news or {}).get(s, []) for s in syms}
     web_ui._headlines_many = many
     web_ui._market_open = lambda: market_open
+    web_ui._closes_on = lambda syms, day: {}            # no price history unless a scenario sets it
     # the harness's fake Secret Manager returns "stub" for ANY secret; default
     # these worlds to "no anthropic-api-key" (absent, checked just now)
     web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
