@@ -2985,6 +2985,28 @@ def _headlines(symbol: str, days: int) -> List[str]:
     return _NEWS_CLIENT.get_recent_headlines(symbol, days)
 
 
+def _closes_on(symbols: List[str], day: Any) -> Dict[str, float]:
+    """{symbol: daily close on `day`} — or on the last trading day before it,
+    when `day` was a weekend/holiday. Powers the news watch's 'performance
+    since the last recalibration' block and its lagging rule."""
+    from datetime import datetime, time as dtime, timedelta, timezone
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    sc = apply_default_timeout(StockHistoricalDataClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
+    start = datetime.combine(day - timedelta(days=7), dtime(0), tzinfo=timezone.utc)
+    end = datetime.combine(day + timedelta(days=1), dtime(0), tzinfo=timezone.utc)
+    out: Dict[str, float] = {}
+    for i in range(0, len(symbols), 100):
+        bars = sc.get_stock_bars(StockBarsRequest(symbol_or_symbols=symbols[i:i + 100], timeframe=TimeFrame.Day,
+                                                  start=start, end=end))
+        for sym, bs in (getattr(bars, "data", None) or {}).items():
+            on_or_before = [b for b in bs if b.timestamp.date() <= day]
+            if on_or_before:
+                out[sym] = float(on_or_before[-1].close)
+    return out
+
+
 _NEWS_RAW = None
 
 
@@ -3052,7 +3074,7 @@ def proactive_check_route():
         portfolios.append(p)
     deps = ProactiveDeps(quotes_fn=_intraday_quotes, news_fn=_headlines, recalibrate_fn=recalibrate,
                          record_fn=portfolio_store.record_proactive_check, client_fn=client,
-                         market_open_fn=_market_open, news_many_fn=_headlines_many)
+                         market_open_fn=_market_open, news_many_fn=_headlines_many, history_fn=_closes_on)
     results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
     return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
             "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,

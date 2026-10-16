@@ -130,3 +130,8 @@ proactive_recalibration:
   big_move_pct: 0.06              # a material holding moving 6%+ today is flagged to the model
   fallback_drop_pct: 0.10         # model unavailable: act only on a 10%+ drop in a material holding...
   max_drift: 0.15                 # ...or 15%+ total drift from target weights
+  # LAGGING rule: a portfolio down >= lag_loss_pct since its last recalibration AND trailing its own
+  # sector pool by >= lag_vs_sector_pct recalibrates even if the model says hold (trade limits still apply).
+  lag_loss_pct: 0.05
+  lag_vs_sector_pct: 0.04
+  act_on_lagging: true
