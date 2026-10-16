@@ -49,13 +49,17 @@ def launch_count(orders: List[Any], created_at: datetime) -> Optional[Dict[str, 
         filled = float(getattr(o, "filled_qty", 0) or 0)
         if status in ("rejected", "canceled", "expired") and filled <= 0:
             continue
-        b = batches.setdefault(m.group(1), {"latest": sub, "symbols": set()})
+        b = batches.setdefault(m.group(1), {"latest": sub, "symbols": set(), "holdings": {}})
         b["symbols"].add(m.group(2))
         b["latest"] = max(b["latest"], sub)
+        avg = getattr(o, "filled_avg_price", None)
+        b["holdings"][m.group(2)] = {"shares": filled if filled > 0 else float(getattr(o, "qty", 0) or 0),
+                                     "entry_price": float(avg) if avg else None}
     if not batches:
         return None
     batch, info = max(batches.items(), key=lambda kv: kv[1]["latest"])
-    return {"n": len(info["symbols"]), "batch": batch, "symbols": sorted(info["symbols"])}
+    return {"n": len(info["symbols"]), "batch": batch, "symbols": sorted(info["symbols"]),
+            "holdings": {s: info["holdings"][s] for s in sorted(info["symbols"])}}
 
 
 def main(argv=None) -> int:
@@ -70,8 +74,8 @@ def main(argv=None) -> int:
                                    capture_output=True, text=True, check=True).stdout.strip()
     tc = TradingClient(sec("alpaca-api-key"), sec("alpaca-secret-key"), paper=True)
     for p in ps.list_portfolios():
-        if p.get("n_stocks"):
-            print(f"{p['name'][:30]:30} already has n_stocks={p['n_stocks']}")
+        if p.get("n_stocks") and p.get("initial_holdings"):
+            print(f"{p['name'][:30]:30} already has n_stocks={p['n_stocks']} and initial holdings")
             continue
         created = datetime.fromisoformat(p["created_at"])
         # Alpaca filters this query on SUBMISSION time, which for an after-hours launch is the next
@@ -85,9 +89,17 @@ def main(argv=None) -> int:
             continue
         print(f"{p['name'][:30]:30} ({p.get('status')}) launched with {found['n']} stocks {found['symbols']} "
               f"[batch {found['batch']}; saved top_n was {p.get('top_n')}]")
+        print(f"{'':30}   initial holdings: " + ", ".join(
+            f"{s} {h['shares']:g}" + (f" @ ${h['entry_price']:,.2f}" if h["entry_price"] else "")
+            for s, h in found["holdings"].items()))
         if a.apply:
-            ps._get_client().collection(ps._COLLECTION).document(p["id"]).update(
-                {"n_stocks": found["n"], "n_stocks_source": f"alpaca launch batch {found['batch']}"})
+            fields: Dict[str, Any] = {}
+            if not p.get("n_stocks"):
+                fields.update(n_stocks=found["n"], n_stocks_source=f"alpaca launch batch {found['batch']}")
+            if not p.get("initial_holdings"):
+                fields.update(initial_holdings=found["holdings"],
+                              initial_holdings_source=f"alpaca launch batch {found['batch']}")
+            ps._get_client().collection(ps._COLLECTION).document(p["id"]).update(fields)
     print("\n(dry run — nothing written; re-run with --apply)" if not a.apply else "\nwritten.")
     return 0
 
@@ -106,7 +118,9 @@ if __name__ == "__main__":
               O("webui-bbbbbbbbbb-XOM-BUY", -40),                                      # an older launch
               O("webui-rc-p1-2026-09-16-NVDA-BUY", -1), O("webui-close-p1-AMD-SELL", -1)]
     r = launch_count(orders, t0)
-    assert r == {"n": 3, "batch": "aaaaaaaaaa", "symbols": ["AMD", "MSFT", "NVDA"]}, r
+    assert {k: r[k] for k in ("n", "batch", "symbols")} == {"n": 3, "batch": "aaaaaaaaaa",
+                                                            "symbols": ["AMD", "MSFT", "NVDA"]}, r
+    assert r["holdings"]["NVDA"] == {"shares": 5.0, "entry_price": None} and set(r["holdings"]) == {"AMD", "MSFT", "NVDA"}
     assert launch_count(orders, t0 + timedelta(hours=2)) is None
     print("✓ counts the launch batch created just before the portfolio (even if routed hours later); "
           "ignores rejected, older launches, rc/close orders")

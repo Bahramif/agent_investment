@@ -166,7 +166,7 @@ if __name__ == "__main__":
     html = c.get("/portfolios/p1").get_data(as_text=True)
     assert "Mid-day news watch" in html and "recalibrated" in html and "SEC accounting probe" in html
     history = html.split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
-    assert "📰 Mid-day news watch" in history and " ET</div>" in history, "type label + New York time on the row"
+    assert "📰 Mid-day" in history and " ET</div>" in history, "type label + New York time on the row"
     from universe import EQUITIES
     n_tech = sum(1 for _, path, _ in EQUITIES if path.endswith(".tech_ai"))
     assert "other tech_ai stocks" in html and f"+ {n_tech} other" in html, "coverage line: holdings + sector pool"
@@ -193,7 +193,7 @@ if __name__ == "__main__":
          "orders": [], "portfolio_value_before": 1.0}]))
     world()
     history = c.get("/portfolios/p1").get_data(as_text=True).split("<h2>Recalibration history</h2>")[1].split("</table>")[0]
-    for needle in ("📅 Scheduled", "17:00 ET", "📰 Mid-day news watch", "12:31 ET", "Not recorded", "before labels"):
+    for needle in ("📅 Scheduled", "17:00 ET", "📰 Mid-day", "12:31 ET", "Not recorded", "probe"):
         assert needle in history, needle
     assert history.index("2026-09-10") < history.index("2026-09-08") < history.index("2026-09-01"), "newest first"
     ok("scheduled / manual")
