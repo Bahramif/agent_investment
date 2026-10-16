@@ -224,6 +224,25 @@ def _weight_rationale(sig: "Signal", weight: float, budget: float, cap: float,
             f"equal-weight baseline for this {n}-name group, driven mainly by {driver_text}.")
 
 
+# DIVERSIFICATION FLOOR: every SELECTED name gets at least this fraction of an
+# equal-weight share (0.5 -> with 12 names, >= 4.2% each). Without it the
+# mean-variance optimizer filled the top names to the per-name cap and gave the
+# rest zero, so a portfolio set to "12 stocks" held 6 (and "6" held 3). 0 turns
+# the floor off (the old behaviour).
+MIN_WEIGHT_FRACTION = 0.5
+
+
+def _water_fill_with_floor(items: List[Tuple[str, float]], budget: float, cap: float,
+                           floor: float) -> Dict[str, float]:
+    """Everyone gets `floor` first; the rest is water-filled by score with
+    each name's remaining headroom (cap - floor)."""
+    if floor <= 1e-12 or not items:
+        return _water_fill(items, budget, cap)
+    base = {n: floor for n, _ in items}
+    extra = _water_fill(items, budget - floor * len(items), max(cap - floor, 0.0))
+    return {n: base[n] + extra.get(n, 0.0) for n in base}
+
+
 def _allocate_within_bucket(signals_subset: List["Signal"], budget: float, cap: float,
                             book: "Book") -> Dict[str, float]:
     """WEIGHT OPTIMIZATION entry point for an already-SELECTED set of names
@@ -256,14 +275,16 @@ def _allocate_within_bucket(signals_subset: List["Signal"], budget: float, cap: 
     "Sized at X% ... equal-weight baseline ..." rationale already makes:
     that equal-weight is the thing being measured against, not just a
     number quoted in a sentence."""
+    n_sel = len(signals_subset)
+    floor = min(cap, MIN_WEIGHT_FRACTION * budget / n_sel) if n_sel else 0.0
     w = None
     try:
         from portfolio_optimizer import optimize_weights
-        w = optimize_weights(signals_subset, budget, cap)
+        w = optimize_weights(signals_subset, budget, cap, floor=floor)
     except Exception:
         w = None
     if w is None:
-        w = _water_fill([(s.name, _risk_adjusted_score(s)) for s in signals_subset], budget, cap)
+        w = _water_fill_with_floor([(s.name, _risk_adjusted_score(s)) for s in signals_subset], budget, cap, floor)
 
     by_name = {s.name: s for s in signals_subset}
     n = len(signals_subset)
@@ -571,3 +592,29 @@ if __name__ == "__main__":
         print("\nWARNINGS")
         for w in book.warnings:
             print(f"  ! {w}")
+
+    print("\n" + "=" * 70)
+    print("TEST: diversification floor — a '12 stocks' book holds 12, not 6")
+    print("=" * 70)
+    import random as _random
+    import mandate_allocator as _ma
+    _rng = _random.Random(7)
+    sigs12 = [Signal(f"N{i:02d}", "equities.tech_ai", 0.9 - 0.03 * i, expected_return=0.30 - 0.02 * i,
+                     returns_window=[_rng.gauss(0.001, 0.02) for _ in range(20)]) for i in range(12)]
+    cap12 = min(1.0, max(0.10, 2.0 / 12))                      # web_ui._max_per_name_for(12) = 16.7%
+    def funded(frac):
+        _ma.MIN_WEIGHT_FRACTION = frac
+        return _ma._allocate_within_bucket(sigs12, 1.0, cap12, _ma.Book())
+    old = funded(0.0)
+    new = funded(0.5)
+    _ma.MIN_WEIGHT_FRACTION = 0.5
+    print(f"  floor off: {len(old)} names funded {sorted(round(v, 3) for v in old.values())[-3:]}…")
+    print(f"  floor 0.5: {len(new)} names, min {min(new.values()):.1%}, max {max(new.values()):.1%}")
+    assert len(old) < 12, "reproduces the corner solution the floor fixes"
+    assert len(new) == 12 and min(new.values()) >= 0.5 / 12 - 1e-6 and max(new.values()) <= cap12 + 1e-6
+    assert abs(sum(new.values()) - 1.0) < 1e-6
+    assert new["N00"] > new["N11"], "the optimizer still tilts toward its favourites"
+    wf = _ma._water_fill_with_floor([(s.name, s.score) for s in sigs12], 1.0, cap12, 0.5 / 12)
+    assert len(wf) == 12 and abs(sum(wf.values()) - 1.0) < 1e-9 and min(wf.values()) >= 0.5 / 12 - 1e-12
+    assert max(wf.values()) <= cap12 + 1e-12
+    print("✓ every selected name funded at >= half an equal share; still tilted; fallback path floored too")

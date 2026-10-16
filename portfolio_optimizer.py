@@ -62,10 +62,17 @@ _TRADING_DAYS_PER_YEAR = 252
 
 def optimize_weights(
     signals: "List[Signal]", budget: float, cap: float, risk_aversion: float = 6.0,
+    floor: float = 0.0,
 ) -> Optional[Dict[str, float]]:
     """Real mean-variance optimization over an already-selected set of
     signals. Returns None (caller falls back to water-fill) rather than
-    raising on any data/solver problem — see module docstring."""
+    raising on any data/solver problem — see module docstring.
+
+    `floor` is a per-name MINIMUM weight. Mean-variance with return-dominated
+    objectives is notorious for corner solutions — confirmed live here: it
+    filled the top names to the cap and gave every other SELECTED name zero,
+    so a "12 stocks" portfolio held 6. The floor keeps every selected name
+    in the book while the optimizer still tilts toward its favourites."""
     try:
         import numpy as np
     except ImportError:
@@ -113,7 +120,8 @@ def optimize_weights(
         return -(mu_z @ w - (risk_aversion / 2.0) * (w @ sigma_annual @ w))
 
     x0 = np.full(n, budget / n)
-    bounds = [(0.0, min(cap, budget)) for _ in range(n)]
+    lo = max(0.0, min(floor, cap, budget / n))
+    bounds = [(lo, min(cap, budget)) for _ in range(n)]
     constraints = [{"type": "eq", "fun": lambda w: w.sum() - budget}]
     result = minimize(neg_objective, x0, method="SLSQP", bounds=bounds, constraints=constraints,
                       options={"maxiter": 200, "ftol": 1e-10})
