@@ -51,6 +51,7 @@ from macro_reasoning import (
 )
 from analyst_reasoning import (
     InstrumentSnapshot,
+    dip_opportunity,
     reason_instrument_conviction as _fallback_instrument,
     reason_desk as _fallback_desk,
     _rating_from_conviction,
@@ -94,11 +95,16 @@ def _prompt_for(snap: MacroSnapshot, horizon: str) -> str:
     if horizon == "strategic":
         ask = ("Assess the LONG-TERM (1-3 year) structural case for this theme. "
               "Weigh secular tailwinds (capex cycles, TAM expansion, policy) "
-              "against how much of that is already priced in.")
+              "against how much of that is already priced in. A theme that has "
+              "CORRECTED (low valuation percentile, negative momentum) while its "
+              "long-term case is intact is an opportunity to add at better prices, "
+              "not a reason to underweight; only a broken thesis is.")
     else:
         ask = ("Assess the SHORT-TERM (days-to-weeks) tactical read for this "
               "theme. Weigh recent momentum and news flow — is it overbought "
-              "or oversold relative to the move?")
+              "or oversold relative to the move? A sharp, news-light pullback "
+              "in a structurally strong theme is a buying opportunity; a drop "
+              "driven by deteriorating fundamentals or real bad news is not.")
     return (
         f"{ask}\n\n"
         f"Theme: {snap.theme}\n"
@@ -230,12 +236,15 @@ SCORE_INSTRUMENTS_TOOL = {
 
 
 def _desk_prompt(snapshots: List[InstrumentSnapshot]) -> str:
-    lines = "\n".join(
-        f"- {s.name} ({s.path}): 1-month momentum {s.momentum_1m:+.1%}, "
-        f"news sentiment {s.news_sentiment:+.2f}, quality {s.quality_score:+.2f}, "
-        f"volatility {s.volatility:.1%} daily stdev"
-        for s in snapshots
-    )
+    def _line(s: InstrumentSnapshot) -> str:
+        upside = (f"analyst upside {s.analyst_expected_return:+.0%} ({s.analyst_count} analysts)"
+                  if s.analyst_expected_return is not None else "no analyst coverage")
+        dip = " — DIP CANDIDATE (quality name on sale, no thesis-breaking news)" if dip_opportunity(s) else ""
+        return (f"- {s.name} ({s.path}): 1-month momentum {s.momentum_1m:+.1%}, "
+                f"{abs(s.drawdown_6m):.0%} below its 6-month high, 5-day {s.pullback_5d:+.1%}, "
+                f"news sentiment {s.news_sentiment:+.2f}, quality {s.quality_score:+.2f}, "
+                f"volatility {s.volatility:.1%} daily stdev, {upside}{dip}")
+    lines = "\n".join(_line(s) for s in snapshots)
     return (
         "Score each candidate instrument's investment conviction from 0 "
         "(avoid) to 1 (high conviction), RELATIVE to each other — you're "
@@ -243,7 +252,17 @@ def _desk_prompt(snapshots: List[InstrumentSnapshot]) -> str:
         "isolation. Weigh RISK, not just return: a name with strong momentum "
         "but much higher volatility than its peers should generally score "
         "lower than an equally-strong but steadier one — conviction should "
-        f"reflect a risk/reward tradeoff, not raw upside alone.\n\n{lines}\n\n"
+        "reflect a risk/reward tradeoff, not raw upside alone.\n\n"
+        "BUY THE DIP, NOT THE KNIFE: a high-quality company trading well below "
+        "its recent high because of a market or sector correction — with no "
+        "thesis-breaking news and analysts still seeing upside — is an "
+        "OPPORTUNITY: score it on its quality and upside, and do not punish it "
+        "for the negative momentum the correction caused. A drop explained by "
+        "real bad news (earnings or guidance miss, fraud, lost customers, "
+        "weak fundamentals) is NOT a dip — score that down. Lines marked DIP "
+        "CANDIDATE already passed those checks on the numbers; you can still "
+        "overrule them with judgment.\n\n"
+        f"{lines}\n\n"
         "For each one, also give a one-sentence rationale (why this "
         "conviction) and a one-sentence key_risk (the single biggest way "
         "this call could be wrong — call out high volatility explicitly "
@@ -313,7 +332,8 @@ def reason_desk_convictions_claude(
                                   momentum_1m=snap.momentum_1m, news_sentiment=snap.news_sentiment,
                                   quality_score=snap.quality_score, volatility=snap.volatility,
                                   expected_return=expected_return, rating=rating,
-                                  analyst_count=analyst_count, returns_window=snap.returns_window))
+                                  analyst_count=analyst_count, returns_window=snap.returns_window,
+                                  dip_score=dip_opportunity(snap), drawdown_6m=snap.drawdown_6m))
             seen.add(snap.name)
         # A partial miss shouldn't zero out the whole desk — fall back to the
         # heuristic individually for anything the model skipped.
@@ -438,6 +458,16 @@ if __name__ == "__main__":
     print(f"  {[(s.name, round(s.score, 2)) for s in signals]}")
     assert len(signals) == 2 and by_name["NVDA"].score == 0.85 and by_name["CAT"].score == 0.4
     sent = fake_desk.calls[-1]
+    dip_desk = [InstrumentSnapshot("ONSALE", "equities.tech_ai", momentum_1m=-0.08, news_sentiment=0.0,
+                                   quality_score=0.8, analyst_expected_return=0.25, analyst_count=18,
+                                   drawdown_6m=-0.22, pullback_5d=-0.06)]
+    p = _desk_prompt(dip_desk)
+    for needle in ("22% below its 6-month high", "5-day -6.0%", "analyst upside +25% (18 analysts)",
+                   "DIP CANDIDATE", "BUY THE DIP, NOT THE KNIFE"):
+        assert needle in p, needle
+    plain = [ln for ln in _desk_prompt(desk).splitlines() if ln.startswith("- ")]
+    assert all("no analyst coverage" in ln and "DIP CANDIDATE" not in ln for ln in plain), \
+        "names that aren't dips carry no marker"
     assert sent["tools"][0]["name"] == "score_instruments" and sent["tool_choice"]["name"] == "score_instruments", \
         "desk scoring must SEND the desk tool (it used to send assess_theme, so every desk fell back)"
     print("✓ all instruments scored from the model's output")

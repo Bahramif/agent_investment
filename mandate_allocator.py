@@ -62,6 +62,11 @@ class Signal:
     # across whichever names survive top-N selection, instead of only ever
     # seeing each name's own volatility in isolation.
     returns_window: List[float] = field(default_factory=list)
+    # Buy-the-dip read (analyst_reasoning.dip_opportunity): 0 = not a dip
+    # opportunity; >0 = a quality name trading well below its recent high
+    # with an intact outlook. drawdown_6m is the distance from that high.
+    dip_score: float = 0.0
+    drawdown_6m: float = 0.0
 
 
 @dataclass
@@ -350,6 +355,7 @@ def allocate(mandate: Dict[str, Any], signals: List[Signal],
                 "conviction": s.score,
                 "expected_return": s.expected_return, "rating": s.rating,
                 "analyst_count": s.analyst_count,
+                "dip_score": s.dip_score, "drawdown_6m": s.drawdown_6m,
                 "weight_rationale": book.weight_rationale.get(s.name, ""),
             }
     return book

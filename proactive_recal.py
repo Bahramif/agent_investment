@@ -352,8 +352,10 @@ def build_prompt(ev: Dict[str, Any], today: date) -> str:
         "it rallies; a sell-off is concentrated in what this portfolio holds (a sub-industry, theme or factor — "
         "it does not need to be company-specific); a meaningful holding gets thesis-changing news (an earnings or "
         "guidance shock, being ACQUIRED or a deal large relative to its size, legal/regulatory action, a CEO/CFO "
-        "exit) or a not-held stock gets news that would plausibly displace one; or the weights have drifted far "
-        "from target.",
+        "exit) or a not-held stock gets news that would plausibly displace one; a broad correction or a sharp, "
+        "news-light drop puts high-quality stocks in these sectors on sale (recalibrating lets the recommendation "
+        "— which favours quality names well below their recent highs — buy them at a discount); or the weights "
+        "have drifted far from target.",
         "Do NOT recalibrate a portfolio that is keeping up with or beating its sector pool unless the news is "
         "clearly thesis-changing: routine items — small tuck-in acquisitions BY a holding, product launches, "
         "analyst price-target changes, single-day noise — are not reasons. Churning a portfolio that is working "

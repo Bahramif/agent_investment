@@ -120,13 +120,29 @@ def score_headline_sentiment(headlines: List[str]) -> float:
 # -----------------------------------------------------------------------------
 # Snapshot builders
 # -----------------------------------------------------------------------------
+HISTORY_DAYS = 190        # calendar days fetched per instrument (~6 months) — for the buy-the-dip drawdown
+
+
+def compute_drawdown(prices: List[float]) -> float:
+    """Latest price vs. the highest price in the window, <= 0."""
+    if not prices or max(prices) <= 0:
+        return 0.0
+    return min(0.0, prices[-1] / max(prices) - 1.0)
+
+
 def build_instrument_snapshot(
     symbol: str, path: str, quality_score: float,
     market_client: MarketDataClient, news_client: NewsClient,
     lookback_days: int = 21,
 ) -> InstrumentSnapshot:
+    """ONE price request covers ~6 months (HISTORY_DAYS): the recent slice —
+    the trading days inside `lookback_days` calendar days, as before — feeds
+    momentum/volatility/returns_window unchanged; the whole window feeds the
+    buy-the-dip drawdown. No extra API calls per instrument."""
     from fundamentals import get_quality_score, get_analyst_forecast
-    prices = market_client.get_price_history(symbol, lookback_days)
+    history = market_client.get_price_history(symbol, max(HISTORY_DAYS, lookback_days))
+    recent_bars = max(2, round(lookback_days * 252 / 365))
+    prices = history[-recent_bars:]
     headlines = news_client.get_recent_headlines(symbol, days=7)
     # None (not 0.0/"") when there's no real analyst coverage — the scorer
     # distinguishes "genuinely no coverage" from "a real 0% expected return"
@@ -146,6 +162,8 @@ def build_instrument_snapshot(
         analyst_rating=analyst_rating,
         analyst_count=analyst_count,
         returns_window=compute_returns(prices),
+        drawdown_6m=compute_drawdown(history),
+        pullback_5d=(history[-1] / history[-6] - 1.0) if len(history) >= 6 and history[-6] else 0.0,
     )
 
 
@@ -321,3 +339,22 @@ if __name__ == "__main__":
     assert len(signals) == 2
     print("✓ ingestion output is directly consumable by the existing analyst scorer —")
     print("  no adapter needed between this module and firm_graph.py")
+
+    print("TEST: ONE ~6-month fetch -> recent slice for momentum, whole window for the buy-the-dip drawdown")
+    import fundamentals as _f
+    _f.get_quality_score = lambda sym, fallback=0.5: 0.8
+    _f.get_analyst_forecast = lambda sym, current_price=None: (0.2, "Buy", 15)
+    asked = []
+    class LongFake(FakeMarketDataClient):
+        def get_price_history(self, symbol, days):
+            asked.append(days)
+            return [100 + i for i in range(100)] + [150 - 2 * i for i in range(30)]   # ran to ~199, fell to 92
+    snap = build_instrument_snapshot("DIP", "equities.tech_ai", 0.5, LongFake({}), FakeNewsClient({}))
+    hist = [100 + i for i in range(100)] + [150 - 2 * i for i in range(30)]
+    assert asked == [HISTORY_DAYS], "one request, ~6 months"
+    recent = hist[-round(21 * 252 / 365):]
+    assert abs(snap.momentum_1m - (recent[-1] - recent[0]) / recent[0]) < 1e-12, "momentum still on the ~21-day slice"
+    assert len(snap.returns_window) == len(recent) - 1
+    assert abs(snap.drawdown_6m - (hist[-1] / max(hist) - 1)) < 1e-12 and snap.drawdown_6m < -0.5
+    assert abs(snap.pullback_5d - (hist[-1] / hist[-6] - 1)) < 1e-12
+    print(f"✓ momentum {snap.momentum_1m:+.1%} on {len(recent)} bars; {snap.drawdown_6m:+.0%} from the 6-month high")
