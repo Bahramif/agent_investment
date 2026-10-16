@@ -45,16 +45,59 @@ class InstrumentSnapshot:
     # both this module's and mandate_allocator.py's docstrings flagged as
     # the missing piece for real mean-variance optimization).
     returns_window: List[float] = field(default_factory=list)
+    # Longer-horizon context for buy-the-dip (data_ingestion fetches ~6 months):
+    drawdown_6m: float = 0.0   # latest price vs. the ~6-month high, <= 0 (-0.18 = 18% below the high)
+    pullback_5d: float = 0.0   # last 5 trading days' return
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+# -----------------------------------------------------------------------------
+# Buy-the-dip: a QUALITY name that has pulled back well below its recent high,
+# WITHOUT thesis-breaking news, is an opportunity — not a momentum loser.
+# Every gate below exists to tell that apart from a falling knife.
+# -----------------------------------------------------------------------------
+DIP_MIN_DRAWDOWN = 0.10       # at least 10% below the ~6-month high
+DIP_FULL_DRAWDOWN = 0.30      # depth that earns the full dip score
+DIP_MAX_DRAWDOWN = 0.35       # deeper than this is a crash / trend change, not a discount
+DIP_MIN_5D = -0.04            # still falling faster than this over 5 days = wait for it to stabilize
+DIP_MIN_QUALITY = 0.50        # fundamentals.score_from_info (0..1): margins, ROE, leverage, growth
+DIP_MAX_BAD_NEWS = -0.40      # news sentiment at/below this = something actually broke
+DIP_MIN_ANALYST_UPSIDE = 0.05 # if covered, the Street must still see upside
+
+
+def dip_opportunity(snap: InstrumentSnapshot) -> float:
+    """0 = not a dip opportunity; 0.4..1.0 = a quality name on sale, deeper
+    pullbacks scoring higher (10% below the high -> 0.4, 30-35% -> 1.0).
+    Calibrated on live data (Oct 2026 tech correction): without the depth
+    cap and the 5-day stabilization check, 22 of 59 tech names "qualified",
+    including 40-54% crashes still falling — exactly the names that had just
+    cost a portfolio 11.5%."""
+    dd = -min(0.0, snap.drawdown_6m)
+    if dd < DIP_MIN_DRAWDOWN or dd > DIP_MAX_DRAWDOWN:
+        return 0.0                                  # not a dip yet / a crash, not a discount
+    if snap.pullback_5d < DIP_MIN_5D:
+        return 0.0                                  # still in free fall: don't catch the knife
+    if snap.quality_score < DIP_MIN_QUALITY:
+        return 0.0                                  # cheap for a reason: weak fundamentals
+    if snap.news_sentiment <= DIP_MAX_BAD_NEWS:
+        return 0.0                                  # falling knife: the news explains the drop
+    if snap.analyst_expected_return is not None and snap.analyst_expected_return < DIP_MIN_ANALYST_UPSIDE:
+        return 0.0                                  # the analysts who follow it see no rebound
+    depth = _clip((dd - DIP_MIN_DRAWDOWN) / (DIP_FULL_DRAWDOWN - DIP_MIN_DRAWDOWN), 0.0, 1.0)
+    return round(0.4 + 0.6 * depth, 3)
+
+
 def _heuristic_rationale(snap: InstrumentSnapshot) -> str:
     """Plain-language gloss of the same three numbers the score itself is
     built from — not a separate judgment, just making the arithmetic legible."""
     parts = []
+    dip = dip_opportunity(snap)
+    if dip:
+        parts.append(f"BUY-THE-DIP: quality name {abs(snap.drawdown_6m):.0%} below its 6-month high "
+                     f"with no thesis-breaking news")
     if snap.momentum_1m > 0.02:
         parts.append(f"positive 1-month momentum ({snap.momentum_1m:+.1%})")
     elif snap.momentum_1m < -0.02:
@@ -107,8 +150,10 @@ def _heuristic_expected_return(snap: InstrumentSnapshot) -> float:
     arithmetic rather than a black box. This is a heuristic estimate, NOT a
     real forecast or guarantee (same honesty caveat web_ui.py already
     applies to its own momentum-only projection)."""
-    raw = (0.4 * snap.momentum_1m + 0.05 * snap.news_sentiment
-          + 0.08 * (snap.quality_score - 0.5) - 0.15 * snap.volatility)
+    dip = dip_opportunity(snap)
+    raw = (0.4 * snap.momentum_1m * (1.0 - dip) + 0.05 * snap.news_sentiment
+          + 0.08 * (snap.quality_score - 0.5) - 0.15 * snap.volatility
+          + 0.25 * dip * abs(snap.drawdown_6m))          # partial recovery toward the recent high
     return _clip(raw, -0.30, 0.30)
 
 
@@ -125,7 +170,11 @@ def reason_instrument_conviction(snap: InstrumentSnapshot):
     weighing correlations between holdings (mandate_allocator.py's own
     docstring already flags that as the production upgrade path)."""
     from mandate_allocator import Signal   # deferred: mandate_allocator stays independent
-    raw = 0.5 * snap.momentum_1m * 10 + 0.3 * snap.news_sentiment + 0.2 * snap.quality_score
+    # A qualifying dip REPLACES the momentum penalty (the drop is the opportunity,
+    # not the signal) and adds conviction in proportion to its depth.
+    dip = dip_opportunity(snap)
+    raw = (0.5 * snap.momentum_1m * 10 * (1.0 - dip) + 0.3 * snap.news_sentiment + 0.2 * snap.quality_score
+           + 0.5 * dip)
     risk_penalty = min(snap.volatility * 3.0, 0.3)   # capped so one wild name doesn't hit zero outright
     conviction = _clip(0.5 + 0.5 * raw - risk_penalty, 0.0, 1.0)
     # Prefer REAL analyst data (fundamentals.get_analyst_forecast, wired in
@@ -145,9 +194,58 @@ def reason_instrument_conviction(snap: InstrumentSnapshot):
                  momentum_1m=snap.momentum_1m, news_sentiment=snap.news_sentiment,
                  quality_score=snap.quality_score, volatility=snap.volatility,
                  expected_return=expected_return, rating=rating, analyst_count=analyst_count,
-                 returns_window=snap.returns_window)
+                 returns_window=snap.returns_window, dip_score=dip, drawdown_6m=snap.drawdown_6m)
 
 
 def reason_desk(snapshots: List[InstrumentSnapshot]):
     """A whole desk's worth of candidate instruments -> conviction signals."""
     return [reason_instrument_conviction(s) for s in snapshots]
+
+
+if __name__ == "__main__":
+    def snap(name="Q", momentum=-0.08, sentiment=0.0, quality=0.75, vol=0.02, dd=-0.20,
+             upside=0.25, count=20):
+        return InstrumentSnapshot(name, "equities.tech_ai", momentum_1m=momentum, news_sentiment=sentiment,
+                                  quality_score=quality, volatility=vol, analyst_expected_return=upside,
+                                  analyst_rating="Buy" if upside and upside > 0.05 else "Hold",
+                                  analyst_count=count, drawdown_6m=dd)
+
+    print("TEST 1: a quality name 20% below its high, no bad news, analysts see upside -> dip opportunity")
+    d = dip_opportunity(snap())
+    assert 0.4 <= d <= 1.0 and abs(d - (0.4 + 0.6 * 0.5)) < 1e-9, d
+    assert dip_opportunity(snap(dd=-0.10)) == 0.4 and dip_opportunity(snap(dd=-0.32)) == 1.0
+    print(f"✓ -20% -> {d}; -10% -> 0.4; -32% -> 1.0")
+
+    print("TEST 2: falling knives are NOT dips")
+    falling = snap()
+    falling.pullback_5d = -0.07
+    for label, s in (("only 6% off the high", snap(dd=-0.06)),
+                     ("a 45% crash, not a discount", snap(dd=-0.45)),
+                     ("still falling 7% in 5 days", falling),
+                     ("weak fundamentals", snap(quality=0.35)),
+                     ("the news explains the drop", snap(sentiment=-0.5)),
+                     ("analysts see no rebound", snap(upside=0.02)),
+                     ("analysts see downside", snap(upside=-0.10))):
+        assert dip_opportunity(s) == 0.0, label
+    assert dip_opportunity(snap(upside=None, count=0)) > 0, "no coverage is not a veto — the other gates still apply"
+    print("✓ shallow / crash / still-falling / low-quality / bad-news / no-upside all rejected; uncovered judged on the rest")
+
+    print("TEST 3: the dip replaces the momentum penalty — a quality name on sale outranks itself without the discount")
+    on_sale = reason_instrument_conviction(snap(name="ONSALE"))
+    no_dip = reason_instrument_conviction(snap(name="NODIP", dd=-0.05))           # same -8% month, not a dip
+    knife = reason_instrument_conviction(snap(name="KNIFE", sentiment=-0.6))     # same drop, bad news
+    winner = reason_instrument_conviction(snap(name="MOMO", momentum=0.06, dd=-0.01))
+    assert on_sale.score > no_dip.score and on_sale.score > knife.score, (on_sale.score, no_dip.score, knife.score)
+    assert on_sale.dip_score > 0 and no_dip.dip_score == 0 and on_sale.drawdown_6m == -0.20
+    assert "BUY-THE-DIP" in on_sale.rationale and "BUY-THE-DIP" not in knife.rationale
+    assert on_sale.score >= winner.score * 0.9, "a deep quality dip competes with a momentum winner"
+    print(f"✓ on sale {on_sale.score:.2f} vs same name no-dip {no_dip.score:.2f} vs bad-news knife {knife.score:.2f} "
+          f"vs momentum winner {winner.score:.2f}")
+
+    print("TEST 4: snapshots without the new fields (older callers) behave exactly as before")
+    old = InstrumentSnapshot("OLD", "equities.tech_ai", momentum_1m=0.03, news_sentiment=0.2, quality_score=0.6)
+    assert dip_opportunity(old) == 0.0
+    expected = max(0.0, min(1.0, 0.5 + 0.5 * (0.5 * 0.03 * 10 + 0.3 * 0.2 + 0.2 * 0.6) - 0.0))
+    assert abs(reason_instrument_conviction(old).score - expected) < 1e-9
+    print("✓ ok")
+    print("\nAll analyst_reasoning tests passed.")
