@@ -2007,6 +2007,11 @@ def execute():
                 holdings=holdings, cash_remaining=max(0.0, capital - spent), errors=errors,
                 pending_order_ids=pending_order_ids, rebalance_every_days=rebalance_every_days,
                 n_stocks=len(set(holdings) | set(pending_order_ids)),
+                # what it STARTED with — the Portfolio page tracks every change from here
+                initial_holdings={**{f["symbol"]: {"shares": f["shares"], "entry_price": None, "pending": True}
+                                     for f in fills if f.get("result") == "TIMEOUT"},
+                                  **{s: {"shares": h["shares"], "entry_price": h["entry_price"]}
+                                     for s, h in holdings.items()}},
                 estimated_1mo_return=_LAST_CONTEXT.get("expected_return"),
                 news_watch=news_watch,
             )
@@ -2901,6 +2906,11 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
                "orders": orders_placed, "errors": errors,
               "portfolio_value_before": current_value, "target_weights": weights,
               "trigger": trigger, "reason": reason[:1000], "review": review,
+              # holdings right after this recalibration (orders still filling counted at their size) — the
+              # Portfolio page's "what changed" column reads this instead of reconstructing it
+              "holdings_after": {**{s: {"shares": h["shares"]} for s, h in new_holdings.items()},
+                                 **{o["symbol"]: {"shares": o["current_shares"] + (o["qty"] if o["side"] == "BUY" else -o["qty"])}
+                                    for o in plan if o["symbol"] in new_pending}},
               # what drove each pick — the scorecard attributes outcomes to these
               "signals": {s: {k: (notes.get(s) or {}).get(k) for k in
                               ("dip_score", "drawdown_6m", "momentum_1m", "conviction", "rating", "quality_score")}
@@ -3400,30 +3410,75 @@ PORTFOLIO_DETAIL_PAGE = """
     (<a href="https://app.alpaca.markets/paper/dashboard/orders" target="_blank" rel="noopener">app.alpaca.markets → Orders</a>),
     search for order IDs starting with <code>webui-{{ p.id }}-</code>.</p>
 
+  <style>
+    .chip { display:inline-block; font-size:0.75rem; font-weight:700; padding:1px 7px; border-radius:6px; margin:1px 2px 1px 0; }
+    .chip.out { background:#fdeaea; color:#d43f3f; } .chip.in { background:#e6f9ec; color:#00a340; }
+    .chip.rs { background:#eef0f5; color:#555; }
+    .grade { display:inline-block; min-width:22px; text-align:center; font-weight:800; border-radius:6px; padding:1px 6px; }
+    .grade.A, .grade.B { background:#e6f9ec; color:#00a340; } .grade.C { background:#fff4e5; color:#b45309; }
+    .grade.D, .grade.F { background:#fdeaea; color:#d43f3f; }
+    .hist td { vertical-align:top; } .hist .small { color:#6a7280; font-size:0.78rem; }
+    details.more summary { cursor:pointer; color:#4a6cf7; font-size:0.78rem; list-style:none; }
+    details.more summary::-webkit-details-marker { display:none; }
+    details.more div { font-size:0.8rem; color:#555; margin-top:3px; max-width:340px; white-space:normal; }
+  </style>
+
+  {% if timeline and timeline.initial %}
+  <h2>Started with</h2>
+  <p class="meta-row">What this portfolio held at launch ({{ p.created_at[:10] }}) and what became of each position.</p>
+  <div class="table-wrap"><table>
+    <tr><th>Stock</th><th>Shares at launch</th><th>Launch price</th><th>Now</th></tr>
+    {% for r in timeline.initial %}
+    <tr><td><a href="/stock/{{ r.symbol }}">{{ r.symbol }}</a></td><td>{{ '%g'|format(r.shares) }}</td>
+      <td>{% if r.entry_price %}${{ '%.2f'|format(r.entry_price) }}{% else %}<span class="small">filled later</span>{% endif %}</td>
+      <td>{% if r.now_shares %}✓ held ({{ '%g'|format(r.now_shares) }} shares){% elif r.sold_on %}<span class="chip out">sold {{ r.sold_on }}</span>{% else %}<span class="small">not held</span>{% endif %}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% endif %}
+
   {% if p.rebalance_history %}
   <h2>Recalibration history</h2>
+  {% set sm = timeline.summary %}
+  <p class="meta-row">{{ sm.n }} recalibration{{ 's' if sm.n != 1 }} since launch
+    {%- if sm.by_type %} ({% for k, v in sm.by_type|dictsort %}{{ v }} {{ {'scheduled': '📅 scheduled', 'proactive': '📰 mid-day', 'manual': '👆 manual'}.get(k, 'unlabelled') }}{{ ', ' if not loop.last }}{% endfor %}){% endif %}.
+    {% if sm.started %}Started with {{ sm.started|join(', ') }} → now {{ sm.now|join(', ') }}{% if sm.kept %} (kept {{ sm.kept|join(', ') }}){% endif %}.{% endif %}</p>
   <div class="table-wrap">
-  <table>
-    <tr><th>Date</th><th>Type</th><th>Orders placed</th><th>Portfolio value before</th></tr>
-    {% for ev in p.rebalance_history|reverse %}
-    {% set kind = {'scheduled': ('📅 Scheduled', '#e8f0fe', '#1a56db'),
-                   'proactive': ('📰 Mid-day news watch', '#fff4e5', '#b45309'),
-                   'manual': ('👆 Manual (Recalibrate Now)', '#eef0f5', '#555')}.get(ev.trigger,
-                  ('Not recorded', '#f6f6f6', '#999')) %}
+  <table class="hist">
+    <tr><th>Date</th><th>Type</th><th>What changed</th><th>Why</th><th>🧪 Reviewer</th><th>Value before</th></tr>
+    {% for e in timeline.events %}
     <tr>
-      <td>{{ ev.date }}{% if ev.at %}<div style="color:#888;font-size:0.8rem;">{{ ev.at|et_time }} ET</div>{% endif %}</td>
-      <td style="white-space:normal;"><span class="act" style="background:{{ kind[1] }};color:{{ kind[2] }};">{{ kind[0] }}</span>
-        {% if not ev.trigger %}<div style="color:#999;font-size:0.75rem;">before labels were added</div>{% endif %}
-        {% if ev.reason %}<div style="color:#6a7280;font-size:0.8rem;max-width:280px;">{{ ev.reason }}</div>{% endif %}
-        {% if ev.review and (ev.review.grade or ev.review.vetoed) %}<div style="font-size:0.8rem;margin-top:4px;max-width:300px;">
-          🧪 Reviewer{% if ev.review.grade %}: <b>{{ ev.review.grade }}</b>{% endif %} — {{ ev.review.summary }}
-          {% for sym, why in (ev.review.vetoed or {}).items() %}<div style="color:#a3312f;">⛔ blocked BUY {{ sym }}: {{ why }}</div>{% endfor %}
-          {% for sym, o in (ev.review.orders or {}).items() %}{% if o.verdict != 'agree' %}<div style="color:#b45309;">{{ '⚠️' if o.verdict == 'concern' else '✋' }} {{ sym }}: {{ o.reason }}</div>{% endif %}{% endfor %}
-        </div>{% endif %}</td>
-      <td>{% for o in ev.orders %}<span class="act {{ o.side }}">{{ o.side }} {{ o.qty }} {{ o.symbol }}</span> {% endfor %}
-        {% if not ev.orders %}no changes needed{% endif %}
-        {% if ev.errors %}<div style="color:#a3312f;">{{ ev.errors|length }} error(s)</div>{% endif %}</td>
-      <td>${{ '{:,.2f}'.format(ev.portfolio_value_before) }}</td>
+      <td style="white-space:nowrap;">{{ e.date }}{% if e.at %}<div class="small">{{ e.at|et_time }} ET</div>{% endif %}</td>
+      <td style="white-space:nowrap;">{{ e.type }}</td>
+      <td>
+        {% if e.unknown_holdings %}
+          {% for o in e.orders %}<span class="chip {{ 'in' if o.side == 'BUY' else 'out' }}">{{ '+' if o.side == 'BUY' else '−' }}{{ o.symbol }}</span>{% endfor %}
+          {% if not e.orders %}<span class="small">no changes</span>{% endif %}
+        {% elif e.no_change %}<span class="small">no changes needed</span>
+        {% else %}
+          {% for s in e.exited %}<span class="chip out">−{{ s }}</span>{% endfor %}
+          {% for s in e.entered %}<span class="chip in">+{{ s }}</span>{% endfor %}
+          {% for s in e.resized %}<span class="chip rs">⇅{{ s }}</span>{% endfor %}
+          <div class="small">holds {{ e.n_holds }}</div>
+        {% endif %}
+        {% if e.errors %}<div style="color:#a3312f;font-size:0.78rem;">{{ e.errors }} order error{{ 's' if e.errors > 1 }}</div>{% endif %}
+        {% if e.orders %}<details class="more"><summary>orders ▸</summary><div>{% for o in e.orders %}{{ o.side }} {{ o.qty }} {{ o.symbol }}{% if o.result and o.result != 'FILLED' %} ({{ o.result|lower }}){% endif %}{{ ', ' if not loop.last }}{% endfor %}</div></details>{% endif %}
+      </td>
+      <td style="white-space:normal;max-width:260px;font-size:0.84rem;">{{ e.why_short or '—' }}
+        {% if e.why_full %}<details class="more"><summary>more ▸</summary><div>{{ e.why_full }}</div></details>{% endif %}</td>
+      <td style="white-space:normal;max-width:260px;font-size:0.84rem;">
+        {% if e.grade or e.blocked %}
+          {% if e.grade %}<span class="grade {{ e.grade }}">{{ e.grade }}</span>{% endif %} {{ e.review_short }}
+          {% if e.blocked %}<div style="color:#a3312f;font-size:0.78rem;">⛔ blocked {{ e.blocked|map(attribute=0)|join(', ') }}</div>{% endif %}
+          {% if e.objections or e.concerns %}<div class="small">✋ {{ e.objections|length }} objection{{ 's' if e.objections|length != 1 }} · ⚠️ {{ e.concerns|length }} concern{{ 's' if e.concerns|length != 1 }}</div>{% endif %}
+          {% if e.review_full or e.blocked or e.objections or e.concerns %}<details class="more"><summary>details ▸</summary><div>
+            {% if e.review_full %}{{ e.review_full }}<br>{% endif %}
+            {% for sym, why in e.blocked %}⛔ {{ sym }}: {{ why }}<br>{% endfor %}
+            {% for sym, why in e.objections %}✋ {{ sym }}: {{ why }}<br>{% endfor %}
+            {% for sym, why in e.concerns %}⚠️ {{ sym }}: {{ why }}<br>{% endfor %}
+          </div></details>{% endif %}
+        {% else %}<span class="small">—</span>{% endif %}
+      </td>
+      <td style="white-space:nowrap;">{% if e.value_before %}${{ '{:,.0f}'.format(e.value_before) }}{% else %}—{% endif %}</td>
     </tr>
     {% endfor %}
   </table>
@@ -3583,7 +3638,9 @@ def portfolio_detail(portfolio_id: str):
         error = (error + " · " if error else "") + f"Could not load historical chart: {e}"
 
     selector = _portfolio_selector(_all_portfolios_enriched(), f"/portfolios/{portfolio_id}")
-    return render_template_string(PORTFOLIO_DETAIL_PAGE, p=p, chart=chart, error=error,
+    from holdings_timeline import build_timeline
+    timeline = build_timeline(p) if p else None
+    return render_template_string(PORTFOLIO_DETAIL_PAGE, p=p, chart=chart, error=error, timeline=timeline,
                                   spy_return=spy_return, active_page="portfolios", selector=selector)
 
 

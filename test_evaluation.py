@@ -73,7 +73,7 @@ if __name__ == "__main__":
     assert list(ev["review"]["vetoed"]) == ["CCC"] and "red-flag" in ev["review"]["vetoed"]["CCC"]
     assert "CCC" not in fake.docs["p1"]["holdings"] and fake.docs["p1"]["cash_remaining"] > 1000, "the money stays cash"
     html = c.get("/portfolios/p1").get_data(as_text=True)
-    assert "⛔ blocked BUY CCC" in html and "SEC investigation" in html
+    assert "⛔ blocked CCC" in html and "SEC investigation" in html, "short line in the column, full reason in details"
     ok(f"orders {FakeTradingClient.submitted}; CCC blocked, cash ${fake.docs['p1']['cash_remaining']:,.0f}")
 
     print("SCENARIO B: concentration — a >40% buy in a 3-name portfolio is blocked; a 2-name one is not")
@@ -102,7 +102,8 @@ if __name__ == "__main__":
     prompt = rv.calls[0]["messages"][0]["content"]
     assert "BUY" in prompt and "BBB looks good" in prompt and "Trigger: manual" in prompt
     html = c.get("/portfolios/p1").get_data(as_text=True)
-    assert "🧪 Reviewer: <b>C</b>" in html and "✋ BBB: Chasing a 30% run." in html and "⚠️ AAA" in html
+    assert '<span class="grade C">C</span>' in html and "1 objection · ⚠️ 1 concern" in html
+    assert "✋ BBB: Chasing a 30% run." in html and "⚠️ AAA" in html, "per-order detail kept in the expandable details"
     assert "CCC: Sound." not in html, "agreements aren't listed — only concerns and objections"
     signals = fake.docs["p1"]["rebalance_history"][-1]["signals"]
     assert set(signals) == {"BBB", "CCC"} and signals["BBB"]["conviction"] == 0.7, "signals stored for the scorecard"

@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY web_ui.py universe.py simulate.py mandate_allocator.py analyst_reasoning.py \
      claude_reasoning.py execution_workflow.py alpaca_clients.py data_ingestion.py \
-     strategist.py macro_reasoning.py portfolio_store.py fundamentals.py proactive_recal.py llm.py rec_evaluator.py ./
+     strategist.py macro_reasoning.py portfolio_store.py fundamentals.py proactive_recal.py llm.py rec_evaluator.py holdings_timeline.py ./
 
 # Day-trading capability. The SAME image serves the web tab (daytrade_ui.py) and
 # the Cloud Run Job that trades (daytrade_runner.py — see its docstring for the
