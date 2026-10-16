@@ -51,8 +51,15 @@ DEFAULT_STRONG = "gemini-3.1-pro-preview"
 DEFAULT_FAST = "gemini-3.8-flash"
 MAX_OUTPUT_TOKENS = 65536        # Gemini's per-request output limit (thinking counts against it)
 # Vertex answers bursts with 429 RESOURCE_EXHAUSTED ("try again later"); Google's
-# guidance is retry with exponential backoff. 4 attempts: ~2s, 4s, 8s (+jitter).
+# guidance is retry with exponential backoff: 3 attempts, ~2s then ~4s (+jitter).
 RETRY_STATUS = [429, 500, 502, 503, 504]
+# Per-attempt timeout. Measured live (Oct 2026, 5 concurrent): Pro median 10s / max
+# 32s, Flash median 4s / max 25s. Without a timeout ONE hung request (seen live:
+# 3m40s for a 280-token prompt) stalled a whole recommendation past the 5-minute
+# budget recalibrations wait on. 60s = ~2x the slowest normal call; the SDK
+# retries timeouts as transient errors.
+REQUEST_TIMEOUT_MS = 60_000
+RETRY_ATTEMPTS = 3
 
 
 def provider() -> str:
@@ -112,10 +119,11 @@ class GeminiClaudeShim:
                 if self._genai is None:
                     from google import genai
                     from google.genai import types
-                    retry = types.HttpRetryOptions(attempts=4, initial_delay=2.0, max_delay=20.0, exp_base=2.0,
-                                                   jitter=1.0, http_status_codes=RETRY_STATUS)
+                    retry = types.HttpRetryOptions(attempts=RETRY_ATTEMPTS, initial_delay=2.0, max_delay=20.0,
+                                                   exp_base=2.0, jitter=1.0, http_status_codes=RETRY_STATUS)
                     self._genai = genai.Client(vertexai=True, project=self.project, location=self.location,
-                                               http_options=types.HttpOptions(retry_options=retry))
+                                               http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS,
+                                                                              retry_options=retry))
         return self._genai
 
     def create(self, *, model: str, max_tokens: int, messages: List[Dict[str, Any]],
@@ -269,9 +277,11 @@ if __name__ == "__main__":
         sys.modules["google.genai"] = real
         sys.modules["google"].genai = real
     assert len(built) == 1 and all(c is built[0] for c in clients), len(built)
-    ro = built[0].kw["http_options"].retry_options
-    assert ro.attempts == 4 and 429 in ro.http_status_codes and 503 in ro.http_status_codes
-    print("✓ 8 threads -> 1 client, built with 429/5xx retries (4 attempts, exponential backoff)")
+    ho = built[0].kw["http_options"]
+    ro = ho.retry_options
+    assert ro.attempts == 3 and 429 in ro.http_status_codes and 503 in ro.http_status_codes
+    assert ho.timeout == 60_000, "a hung request is cut off (and retried) instead of stalling the recommendation"
+    print("✓ 8 threads -> 1 client, built with a 60s per-attempt timeout and 429/5xx retries (3 attempts)")
 
     print("TEST 2: tier mapping and overrides")
     assert gemini_model_for("claude-haiku-4-5@20251001") == DEFAULT_FAST
