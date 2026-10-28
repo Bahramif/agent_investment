@@ -248,4 +248,22 @@ if __name__ == "__main__":
     ps.create_portfolio = real_create
     ok("checked -> news_watch=True, unchecked -> False")
 
+    print("SCENARIO K: EXIT symbols — sold, never bought back, replaced by the next-best names")
+    fake = install(doc())                            # after reconciling: AAA 60, BBB 50, CCC 30 -> a 3-stock book
+    st = world(news=NEWS, verdict={**YES, "exit_symbols": ["AAA", "BBB"]})
+    asked = []
+    def ranked(sectors, top_n):
+        asked.append(top_n)
+        return {"final_weights": {"BBB": 0.25, "CCC": 0.25, "DDD": 0.20, "EEE": 0.16, "FFF": 0.14}, "status": "ok"}
+    web_ui.recommend = ranked
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert r["results"][0]["action"] == "recalibrated" and "Exiting: AAA, BBB." in r["results"][0]["reason"], r
+    assert asked == [5], "3 stocks + 2 exits asked for, so the book still ends up with 3"
+    ev = fake.docs["p1"]["rebalance_history"][-1]
+    assert ev["excluded"] == ["AAA", "BBB"] and set(ev["target_weights"]) == {"CCC", "DDD", "EEE"}, ev["target_weights"]
+    assert all(abs(w - 1 / 3) < 1e-9 for w in ev["target_weights"].values()), ev["target_weights"]
+    trades = {(sym, side) for sym, side, _ in FakeTradingClient.submitted}
+    assert ("AAA", "sell") in trades and ("BBB", "sell") in trades and not {s for s, side in trades if side == "buy"} & {"AAA", "BBB"}
+    ok(f"asked for 5, kept CCC/DDD/EEE at 33% each; orders {sorted(trades)}")
+
     print("\nAll proactive-recalibration integration scenarios passed.")

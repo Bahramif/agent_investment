@@ -8,16 +8,21 @@ The evaluation agent for final buy/sell recommendations. Two halves:
    computed and BEFORE any order is sent.
      * HARD CHECKS (the only thing that can block anything, and only BUYs):
          - concentration: a buy into a portfolio of >= min_names_for_cap
-           names that would put more than max_single_weight in one stock;
+           names that would put more than max_single_weight (or an equal
+           share, if that is bigger) in one stock;
          - red-flag news: a buy of a stock with fraud / SEC probe /
            bankruptcy / restatement / trading-halt style headlines in the
            last red_flag_days days.
        A vetoed buy is simply not placed; that money stays as cash. Every
        other order still trades.
-     * AI REVIEW (advisory only — never blocks): Gemini grades the whole plan
-       A-F and gives each order agree / concern / object with a reason
-       (chasing, catching a knife, contradicting news, thin rationale,
-       hidden concentration), informed by the TRACK RECORD below.
+     * AI REVIEW: Gemini grades the whole plan A-F and gives each order
+       agree / concern / object with a reason (chasing, catching a knife,
+       contradicting news, thin rationale, hidden concentration), informed by
+       the TRACK RECORD below. Advisory for scheduled and manual
+       recalibrations. For the mid-day news watch's (trigger "proactive") it
+       BLOCKS BUYs (ai_veto_proactive): every "object", and every "concern"
+       too when the whole plan is graded F — added after an F-graded
+       "rotate out of chip equipment" plan still bought LRCX to 30%.
    Never raises: if the model is unavailable the hard checks still run.
 
 2. TRACK-RECORD SCORECARD (grade_decisions / aggregate) — grades every past
@@ -49,10 +54,11 @@ HORIZONS = (1, 5, 20)            # trading days after the decision
 @dataclass
 class EvalConfig:
     enabled: bool = True
-    max_single_weight: float = 0.40     # concentration veto threshold (target weight of one name)
+    max_single_weight: float = 0.30     # concentration veto threshold (target weight of one name)
     min_names_for_cap: int = 3          # ... only applies when the portfolio targets >= this many names
     red_flag_days: int = 2              # headline window for the red-flag veto
-    ai_review: bool = True              # the advisory Gemini review
+    ai_review: bool = True              # the Gemini review
+    ai_veto_proactive: bool = True      # ... whose objections block BUYs in news-watch recalibrations
 
 
 def config_from_dict(raw: Optional[Dict[str, Any]]) -> EvalConfig:
@@ -99,12 +105,13 @@ def hard_checks(plan: Sequence[Dict[str, Any]], weights: Dict[str, float], headl
     """{symbol: reason} for BUY orders that must not be placed."""
     vetoed: Dict[str, str] = {}
     n_names = sum(1 for w in weights.values() if w > 0)
+    limit = max(cfg.max_single_weight, 1.0 / n_names if n_names else 1.0) + 1e-9   # an equal share is never "concentrated"
     for o in plan:
         if o.get("side") != "BUY":
             continue
         sym = o["symbol"]
         w = float(weights.get(sym, 0.0))
-        if n_names >= cfg.min_names_for_cap and w > cfg.max_single_weight:
+        if n_names >= cfg.min_names_for_cap and w > limit:
             vetoed[sym] = (f"concentration: target {w:.0%} of the portfolio in one stock "
                            f"(max {cfg.max_single_weight:.0%})")
             continue
@@ -218,6 +225,12 @@ def review_plan(portfolio: Dict[str, Any], plan: Sequence[Dict[str, Any]], weigh
                 orders[sym] = {"verdict": verdict, "reason": str(item.get("reason", ""))[:300]}
         out.update(grade=grade, summary=str(raw.get("summary", ""))[:800], orders=orders,
                    model=str(getattr(response, "model", "") or REVIEW_MODEL), source="ai")
+        if trigger == "proactive" and cfg.ai_veto_proactive:
+            for o in plan:
+                v = orders.get(o["symbol"]) or {}
+                if o.get("side") == "BUY" and o["symbol"] not in out["vetoed"] and (
+                        v.get("verdict") == "object" or (grade == "F" and v.get("verdict") == "concern")):
+                    out["vetoed"][o["symbol"]] = f"reviewer {v['verdict']} (plan graded {grade}): {v.get('reason', '')}"[:300]
     except Exception as e:
         out["source"] = "checks"
         out["summary"] = (out["summary"] + " " if out["summary"] else "") + f"AI reviewer unavailable ({type(e).__name__})"
@@ -394,12 +407,32 @@ if __name__ == "__main__":
                      trigger="proactive", reason="lagging", track_record=["dip buys: n=12, beat-sector rate 67%"])
     assert rv["grade"] == "C" and rv["source"] == "ai" and rv["model"] == "fake-model"
     assert set(rv["orders"]) == {"AAA", "DDD", "BBB"} and rv["orders"]["BBB"]["verdict"] == "concern"
-    assert set(rv["vetoed"]) == {"AAA", "BBB"}, "the AI 'object' on AAA is advisory; AAA is vetoed by the HARD check"
+    assert set(rv["vetoed"]) == {"AAA", "BBB"} and "concentration" in rv["vetoed"]["AAA"], "the HARD check wins"
     prompt = fc.calls[0]["messages"][0]["content"]
     for needle in ("BUY-THE-DIP pick", "TRACK RECORD", "dip buys: n=12", "Trigger: proactive — lagging",
                    "SEC opens investigation", "untrusted"):
         assert needle in prompt, needle
     print("✓ grade C; unknown symbols dropped; bad verdict -> 'concern'; prompt carries signals, news, track record")
+
+    print("TEST 3b: in a NEWS-WATCH recalibration the reviewer's objections block BUYs (the Oct-16 LRCX buy)")
+    oct16 = [{"symbol": "LRCX", "side": "BUY", "qty": 5, "price": 260.0}, {"symbol": "NVDA", "side": "BUY", "qty": 15, "price": 180.0},
+             {"symbol": "MSFT", "side": "BUY", "qty": 1, "price": 520.0}, {"symbol": "KLAC", "side": "SELL", "qty": 8, "price": 160.0}]
+    w16 = {"LRCX": 0.30, "NVDA": 0.30, "MSFT": 0.20, "GOOGL": 0.10, "NFLX": 0.10}
+    verdicts = {"grade": "F", "summary": "Buys the sub-industry it says it is leaving.",
+                "orders": [{"symbol": "LRCX", "verdict": "object", "reason": "Catching a falling knife."},
+                           {"symbol": "NVDA", "verdict": "concern", "reason": "Concentration."},
+                           {"symbol": "MSFT", "verdict": "agree", "reason": "Fits the rotation."},
+                           {"symbol": "KLAC", "verdict": "object", "reason": "x"}]}
+    rv = review_plan({}, oct16, w16, {}, {}, cfg, FakeClient(verdicts), trigger="proactive")
+    assert set(rv["vetoed"]) == {"LRCX", "NVDA"} and "object" in rv["vetoed"]["LRCX"], rv["vetoed"]
+    assert "KLAC" not in rv["vetoed"], "a SELL is never blocked, objection or not"
+    rv = review_plan({}, oct16, w16, {}, {}, cfg, FakeClient(dict(verdicts, grade="C")), trigger="proactive")
+    assert set(rv["vetoed"]) == {"LRCX"}, "below an F, a 'concern' stays advisory"
+    for trig, c in (("manual", cfg), ("scheduled", cfg), ("proactive", EvalConfig(ai_veto_proactive=False))):
+        assert review_plan({}, oct16, w16, {}, {}, c, FakeClient(verdicts), trigger=trig)["vetoed"] == {}, trig
+    eq3 = {"A": 1 / 3, "B": 1 / 3, "C": 1 / 3}
+    assert hard_checks([{"symbol": "A", "side": "BUY", "qty": 1}], eq3, {}, cfg) == {}, "an equal share is not concentration"
+    print("✓ F plan: object + concern buys blocked, agree + sells placed; advisory elsewhere; 3 x 33% allowed")
 
     print("TEST 4: never raises — model down keeps the hard checks; empty plan; disabled")
     rv = review_plan({}, plan, weights, {}, heads, cfg, FakeClient(error=TimeoutError("slow")))

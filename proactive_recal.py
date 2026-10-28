@@ -42,9 +42,14 @@ Pipeline per portfolio (evaluate_portfolio):
   4. NEWS REVIEW: Claude reads the evidence and calls `decide_recalibration`
      (recalibrate?, confidence, urgency, reason, key symbols). Headlines are
      untrusted third-party text: the prompt says so, the output is clamped
-     (confidence to [0,1], key symbols to actual holdings), and the only
+     (confidence to [0,1], key/exit symbols to the watched pool), and the only
      thing the model can cause is the SAME recalibration a human can click —
-     it never picks symbols, sizes or orders. A refusal, error or garbage
+     it never picks symbols, sizes or orders. It MAY name EXIT symbols: stocks
+     the recalibration must sell if held and must not buy. Added after a
+     "rotate out of chip equipment" verdict ran a recalibration whose
+     buy-the-dip scoring bought MORE of the falling LRCX it meant to leave.
+     The lagging rule adds its own exits (holdings that are themselves down
+     >= lag_loss_pct and >= lag_vs_sector_pct behind the pool). A refusal, error or garbage
      output falls back to the deterministic rule: act only on a severe
      trigger (a material holding down >= fallback_drop_pct, or drift >=
      max_drift).
@@ -57,7 +62,11 @@ Pipeline per portfolio (evaluate_portfolio):
          a second rebalance on the same date would collide with the first;
        * orders from the last rebalance are still in flight — trading again
          would double up;
-       * max_proactive_per_30d early recalibrations already used;
+       * max_proactive_per_30d early recalibrations already used — UNLESS
+         a loss of loss_override_pct or more is building (the portfolio since
+         its last recalibration, or a material holding since then or today):
+         the owner does not want to sit on a loss that size because of a
+         monthly limit;
      and on dry_run (config or ?dry_run=1) or a closed market.
 
 Every check — including holds and skips — is logged on the portfolio
@@ -77,7 +86,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 DECIDE_MODEL = "claude-opus-5"      # once a day per portfolio, and it can trigger real trades — the strong model
@@ -112,6 +121,7 @@ class ProactiveConfig:
     lag_loss_pct: float = 0.05                # LAGGING: down this much since the last recalibration...
     lag_vs_sector_pct: float = 0.04           # ...AND this far behind its own sector pool
     act_on_lagging: bool = True               # lagging recalibrates even if the model says hold
+    loss_override_pct: float = 0.05           # a loss this size lets a trade through the 30-day limit
 
 
 def config_from_dict(raw: Optional[Dict[str, Any]]) -> ProactiveConfig:
@@ -124,7 +134,8 @@ def config_from_dict(raw: Optional[Dict[str, Any]]) -> ProactiveConfig:
         raise ValueError("proactive_recalibration.min_confidence must be in (0, 1]")
     if cfg.max_proactive_per_30d < 0 or cfg.news_lookback_days < 1:
         raise ValueError("proactive_recalibration: counts must be non-negative, news_lookback_days >= 1")
-    for k in ("material_weight", "big_move_pct", "fallback_drop_pct", "max_drift", "lag_loss_pct", "lag_vs_sector_pct"):
+    for k in ("material_weight", "big_move_pct", "fallback_drop_pct", "max_drift", "lag_loss_pct", "lag_vs_sector_pct",
+              "loss_override_pct"):
         if not 0.0 < getattr(cfg, k) < 1.0:
             raise ValueError(f"proactive_recalibration.{k} must be in (0, 1)")
     return cfg
@@ -156,9 +167,13 @@ def last_recal_date(p: Dict[str, Any]) -> Optional[date]:
     return max(dates) if dates else _d(p.get("created_at"))
 
 
+def _proactive_dates(p: Dict[str, Any], today: date, window_days: int = 30) -> List[date]:
+    return sorted(d for e in p.get("rebalance_history") or []
+                  if e.get("trigger") == PROACTIVE and (d := _d(e.get("date"))) and (today - d).days < window_days)
+
+
 def proactive_count(p: Dict[str, Any], today: date, window_days: int = 30) -> int:
-    return sum(1 for e in p.get("rebalance_history") or []
-               if e.get("trigger") == PROACTIVE and (d := _d(e.get("date"))) and (today - d).days < window_days)
+    return len(_proactive_dates(p, today, window_days))
 
 
 def target_weights(p: Dict[str, Any]) -> Dict[str, float]:
@@ -193,15 +208,52 @@ def precheck(p: Dict[str, Any], cfg: ProactiveConfig, today: date) -> Optional[s
     return None
 
 
-def trade_block(p: Dict[str, Any], cfg: ProactiveConfig, today: date) -> Optional[str]:
-    """Reason a "recalibrate" verdict must be flagged rather than traded, or None."""
+def loss_override(ev: Optional[Dict[str, Any]], cfg: ProactiveConfig) -> Optional[str]:
+    """Why a loss of loss_override_pct+ lets this trade through the 30-day
+    limit, or None: the portfolio since its last recalibration, or a material
+    holding since then or today."""
+    if not ev:
+        return None
+    x = cfg.loss_override_pct
+    perf = ev.get("performance") or {}
+    if perf.get("portfolio") is not None and perf["portfolio"] <= -x:
+        return f"the portfolio is down {abs(perf['portfolio']):.1%} since its last recalibration"
+    for r in ev.get("holdings") or []:
+        if r["weight"] < cfg.material_weight:
+            continue
+        since = (perf.get("holdings") or {}).get(r["symbol"])
+        if since is not None and since <= -x:
+            return f"{r['symbol']} ({r['weight']:.0%}) is down {abs(since):.1%} since the last recalibration"
+        if r["day_change"] is not None and r["day_change"] <= -x:
+            return f"{r['symbol']} ({r['weight']:.0%}) is down {abs(r['day_change']):.1%} today"
+    return None
+
+
+def trade_block(p: Dict[str, Any], cfg: ProactiveConfig, today: date,
+                override: Optional[str] = None) -> Optional[str]:
+    """Reason a "recalibrate" verdict must be flagged rather than traded, or
+    None. `override` (from loss_override) lifts the 30-day limit only."""
     if last_recal_date(p) == today:
         return "already recalibrated today (a second rebalance on the same date would reuse its order IDs)"
     if p.get("pending_order_ids"):
         return "orders from the last rebalance are still being filled"
-    if proactive_count(p, today) >= cfg.max_proactive_per_30d:
-        return f"already {cfg.max_proactive_per_30d} early recalibration(s) in the last 30 days"
+    used = _proactive_dates(p, today)
+    if len(used) >= cfg.max_proactive_per_30d and not override:
+        nxt = (used[len(used) - cfg.max_proactive_per_30d] + timedelta(days=30)).isoformat() if used else "-"
+        return (f"already {cfg.max_proactive_per_30d} early recalibration(s) in the last 30 days — "
+                f"next allowed {nxt}, or sooner if a {cfg.loss_override_pct:.0%} loss builds")
     return None
+
+
+def rule_exits(ev: Dict[str, Any], cfg: ProactiveConfig) -> List[str]:
+    """Holdings the lagging rule rotates OUT of: each down >= lag_loss_pct
+    since the last recalibration and >= lag_vs_sector_pct behind the pool."""
+    perf = ev.get("performance") or {}
+    pool = perf.get("sector_pool")
+    if pool is None:
+        return []
+    return sorted(s for s, r in (perf.get("holdings") or {}).items()
+                  if r <= -cfg.lag_loss_pct and r - pool <= -cfg.lag_vs_sector_pct)
 
 
 # -----------------------------------------------------------------------------
@@ -331,6 +383,12 @@ DECIDE_TOOL = {
             "reason": {"type": "string", "description": "2-3 plain sentences for the portfolio owner"},
             "key_symbols": {"type": "array", "items": {"type": "string"},
                             "description": "stocks (held or not) whose news drives the decision"},
+            "exit_symbols": {"type": "array", "items": {"type": "string"},
+                             "description": ("stocks (held or not) this recalibration must SELL if held and must NOT "
+                                             "buy — the names your reason says to rotate out of. The recommendation "
+                                             "otherwise favours quality names that have fallen, so a stock you want "
+                                             "out of can be bought back unless it is listed here. Empty = let the "
+                                             "recommendation decide.")},
         },
         "required": ["recalibrate", "confidence", "urgency", "reason"],
     },
@@ -396,7 +454,9 @@ def build_prompt(ev: Dict[str, Any], today: date) -> str:
             lines.append("- (none — no news and no big moves elsewhere in these sectors)")
     if ev["triggers"]:
         lines += ["", "Automatic flags: " + "; ".join(t["text"] for t in ev["triggers"])]
-    lines += ["", "Call decide_recalibration."]
+    lines += ["", "If you recalibrate to get OUT of specific stocks or a sub-industry, list them in exit_symbols "
+                  "(held or not) — otherwise the recommendation may buy them back on the dip.",
+              "Call decide_recalibration."]
     return "\n".join(lines)
 
 
@@ -425,9 +485,11 @@ def clamp_review(raw: Dict[str, Any], holdings: Sequence[str]) -> Dict[str, Any]
     conf = min(1.0, max(0.0, conf)) if math.isfinite(conf) else 0.0
     held = {s.upper() for s in holdings}
     keys = [str(s).upper() for s in (raw.get("key_symbols") or []) if str(s).upper() in held][:10]
+    exits = sorted({str(s).upper() for s in (raw.get("exit_symbols") or []) if str(s).upper() in held})[:10]
     urgency = raw.get("urgency") if raw.get("urgency") in ("low", "medium", "high") else "low"
     return {"recalibrate": raw.get("recalibrate") is True, "confidence": round(conf, 3), "urgency": urgency,
-            "reason": str(raw.get("reason", ""))[:1000], "key_symbols": keys, "model": str(raw.get("_model", ""))[:60]}
+            "reason": str(raw.get("reason", ""))[:1000], "key_symbols": keys, "exit_symbols": exits,
+            "model": str(raw.get("_model", ""))[:60]}
 
 
 def fallback_review(ev: Dict[str, Any], cfg: ProactiveConfig, why: str) -> Dict[str, Any]:
@@ -437,7 +499,8 @@ def fallback_review(ev: Dict[str, Any], cfg: ProactiveConfig, why: str) -> Dict[
     return {"recalibrate": bool(severe), "confidence": 1.0 if severe else 0.0, "urgency": "high" if severe else "low",
             "reason": ("; ".join(t["text"] for t in severe) if severe else "no severe mechanical trigger")
                       + f" (news model unavailable: {why})",
-            "key_symbols": [t["symbol"] for t in severe if t.get("symbol")]}
+            "key_symbols": [t["symbol"] for t in severe if t.get("symbol")],
+            "exit_symbols": sorted({t["symbol"] for t in severe if t["kind"] == "big_move"})}
 
 
 # -----------------------------------------------------------------------------
@@ -447,7 +510,7 @@ def fallback_review(ev: Dict[str, Any], cfg: ProactiveConfig, why: str) -> Dict[
 class ProactiveDeps:
     quotes_fn: Callable[[List[str]], Dict[str, Dict[str, float]]]      # {sym: {"price", "prev_close"}}
     news_fn: Callable[[str, int], List[str]]                            # (symbol, days) -> headlines
-    recalibrate_fn: Callable[[str, str], Dict[str, Any]]                # (portfolio_id, reason) -> result
+    recalibrate_fn: Callable[[str, str, List[str]], Dict[str, Any]]     # (portfolio_id, reason, exits) -> result
     record_fn: Callable[[str, Dict[str, Any]], None]                    # (portfolio_id, check entry)
     client_fn: Optional[Callable[[], Any]] = None                       # Claude client factory; None = no model
     market_open_fn: Callable[[], bool] = lambda: True
@@ -550,16 +613,23 @@ def _evaluate(p, cfg, deps, today, client, dry_run, ev, trig, symbols, watched) 
         if review["recalibrate"]:
             reason = f"confidence {review['confidence']:.2f} below {cfg.min_confidence:.2f}: {reason}"
         return CheckResult(pid, name, "hold", reason, source, review, trig)
+    exits = sorted(set(review.get("exit_symbols") or []) | set(rule_exits(ev, cfg) if lag else []))
+    review = {**review, "exit_symbols": exits}
+    if exits:
+        reason = f"{reason} Exiting: {', '.join(exits)}."
     if dry_run or cfg.dry_run:
         return CheckResult(pid, name, "flagged", f"{reason} (dry run)", source, review, trig)
-    blocked = trade_block(p, cfg, today)
+    override = loss_override(ev, cfg)
+    blocked = trade_block(p, cfg, today, override)
     if blocked:
         return CheckResult(pid, name, "flagged", f"{reason} (not traded: {blocked})", source, review, trig)
+    if override and proactive_count(p, today) >= cfg.max_proactive_per_30d:
+        reason = f"{reason} (30-day limit overridden: {override})"
     if not deps.market_open_fn():
         return CheckResult(pid, name, "flagged", f"{reason} (market closed — not trading now)",
                            source, review, trig)
     try:
-        rc = deps.recalibrate_fn(pid, reason)
+        rc = deps.recalibrate_fn(pid, reason, exits)
     except Exception as e:
         return CheckResult(pid, name, "error", f"recalibration failed: {e}", source, review, trig)
     if rc.get("error"):
@@ -633,7 +703,7 @@ if __name__ == "__main__":
         d = ProactiveDeps(
             quotes_fn=lambda syms: {s: quotes[s] for s in syms if s in quotes},
             news_fn=lambda s, days: (news or {}).get(s, []),
-            recalibrate_fn=lambda pid, why: log["recal"].append((pid, why)) or {"orders": [{"symbol": "AAA"}], "errors": []},
+            recalibrate_fn=lambda pid, why, exits=(): log["recal"].append((pid, why)) or {"orders": [{"symbol": "AAA"}], "errors": []},
             record_fn=lambda pid, e: log["records"].append((pid, e)),
             client_fn=(lambda: client) if client is not None else None,
             market_open_fn=lambda: market_open)
@@ -777,7 +847,7 @@ if __name__ == "__main__":
 
     print("TEST 10: one portfolio failing never stops the others; recalibration errors are reported")
     d, log = deps(news=FRAUD, client=FakeClient(YES))
-    d.recalibrate_fn = lambda pid, why: {"error": "Recalibration produced no recommendation"} if pid == "p1" else {"orders": []}
+    d.recalibrate_fn = lambda pid, why, exits=(): {"error": "Recalibration produced no recommendation"} if pid == "p1" else {"orders": []}
     boom = pf(id="p0")
     boom["holdings"] = "not a dict"
     res = run_proactive_check([boom, pf(), pf(id="p2", name="Other")], cfg, d, NOW)
@@ -891,7 +961,14 @@ if __name__ == "__main__":
     d, log = deps(quotes=NOWQ, client=FakeClient(HOLD))
     d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
     r = run_proactive_check([capped], cfg, d, NOW)[0]
-    assert r.action == "flagged" and "already 2 early" in r.reason and not log["recal"]
+    assert r.action == "recalibrated" and "30-day limit overridden" in r.reason, "a 12% loss beats the monthly cap"
+    calm = {s: {"price": BASE[s], "prev_close": BASE[s]} for s in BASE}      # nothing down: the cap holds
+    d, log = deps(quotes={**calm, "CCC": {"price": 118.0, "prev_close": 100.0}}, news={"AAA": ["Fraud probe at AAA"]},
+                  client=FakeClient(YES))
+    d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
+    r = run_proactive_check([capped], cfg, d, NOW)[0]
+    assert r.action == "flagged" and "already 2 early" in r.reason and "next allowed 2026-10-10" in r.reason \
+        and not log["recal"], r.reason
     d, log = deps(quotes=NOWQ, client=FakeClient(error=TimeoutError("down")))
     d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
     r = run_proactive_check([bleeding], cfg, d, NOW)[0]
@@ -901,4 +978,40 @@ if __name__ == "__main__":
     d.history_fn = lambda syms, day: (_ for _ in ()).throw(RuntimeError("bars API down"))
     assert run_proactive_check([bleeding], cfg, d, NOW)[0].action == "hold", "no history -> no rule, no crash"
     print("✓ monthly cap -> flagged; model down -> fallback still rotates a lagging portfolio; history outage -> no crash")
+
+    print("TEST 19: EXIT symbols — the model's and the lagging rule's reach the recalibration")
+    d, log = deps(quotes=NOWQ, client=FakeClient(dict(YES, exit_symbols=["bbb", "CCC", "NOTINPOOL"])))
+    d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
+    seen = []
+    d.recalibrate_fn = lambda pid, why, exits=(): seen.append(list(exits)) or {"orders": [], "errors": []}
+    r = run_proactive_check([bleeding], cfg, d, NOW)[0]
+    # model: BBB (held) + CCC (not held, in the pool); NOTINPOOL dropped; lagging rule adds AAA (-12% vs pool)
+    assert seen == [["AAA", "BBB", "CCC"]] and "Exiting: AAA, BBB, CCC." in r.reason, (seen, r.reason)
+    d, log = deps(quotes=NOWQ, client=FakeClient(HOLD))
+    d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
+    d.recalibrate_fn = lambda pid, why, exits=(): seen.append(list(exits)) or {"orders": [], "errors": []}
+    run_proactive_check([bleeding], cfg, d, NOW)
+    assert seen[-1] == ["AAA", "BBB"], "the hard lagging rule exits the holdings that are themselves bleeding"
+    print(f"✓ model exits clamped to the pool, lagging rule adds its own: {seen}")
+
+    print("TEST 20: a 5% loss lifts the 30-day limit — portfolio, holding since recal, or holding today")
+    two = [{"date": "2026-09-20", "trigger": "proactive"}, {"date": "2026-09-21", "trigger": "proactive"}]
+    for label, quotes, base in (
+            ("portfolio -6%", {**calm, "AAA": {"price": 47.0, "prev_close": 47.0}, "BBB": {"price": 94.0, "prev_close": 94.0}}, BASE),
+            ("BBB -6% since recal", {**calm, "BBB": {"price": 94.0, "prev_close": 94.0}}, BASE),
+            ("AAA -5.5% today", {**calm, "AAA": {"price": 50.0, "prev_close": 52.9}}, {**BASE, "AAA": 50.0})):
+        d, log = deps(quotes=quotes, news={"AAA": ["Fraud probe at AAA"]}, client=FakeClient(YES))
+        d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day, b=base: b)
+        r = run_proactive_check([pf(rebalance_history=two)], cfg, d, NOW)[0]
+        assert r.action == "recalibrated" and "30-day limit overridden" in r.reason, (label, r.reason)
+    d, log = deps(quotes={**calm, "BBB": {"price": 96.0, "prev_close": 96.0}}, news={"AAA": ["Fraud probe at AAA"]},
+                  client=FakeClient(YES))
+    d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
+    r = run_proactive_check([pf(rebalance_history=two)], cfg, d, NOW)[0]
+    assert r.action == "flagged" and "next allowed 2026-10-20" in r.reason, "a 4% dip does not lift the cap"
+    today_already = pf(rebalance_history=[*two, {"date": "2026-09-28", "trigger": "manual"}])
+    d, log = deps(quotes=NOWQ, news={"AAA": ["Fraud probe at AAA"]}, client=FakeClient(YES))
+    d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
+    assert "already recalibrated today" in run_proactive_check([today_already], cfg, d, NOW)[0].reason
+    print("✓ each 5% loss trades through the cap; a 4% dip waits; same-day / in-flight blocks still apply")
     print("\nAll proactive_recal tests passed.")
