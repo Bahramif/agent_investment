@@ -47,7 +47,7 @@ import json
 import math
 import os
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from flask import Flask, render_template_string, request, Response, stream_with_context, redirect
 
@@ -108,7 +108,9 @@ def _max_per_name_for(top_n: int) -> float:
     # check: > max_single_weight in one name when the book holds >=
     # min_names_for_cap names). Without this a 3-stock book got a 67% cap and
     # its biggest buy was vetoed every time. Still >= an equal share (1/n), so
-    # the budget can always be fully placed.
+    # the budget can always be fully placed. With max_single_weight at 30%, a
+    # 5-stock book can no longer put 70% in its top two (it was NVDA 40% +
+    # LRCX 30% at the 40% limit).
     try:
         from rec_evaluator import load_config
         ev = load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
@@ -2741,7 +2743,35 @@ def close_portfolio_route(portfolio_id: str):
     return portfolios_route()
 
 
-def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "") -> Dict[str, Any]:
+def _drop_and_resize(weights: Dict[str, float], exclude: Sequence[str], n: int, cap: float) -> Dict[str, float]:
+    """`weights` without the `exclude` names, cut to the n largest and scaled
+    back up to the same total, then re-capped at `cap` (any excess spread
+    pro rata over the names still under it; what nobody can take stays cash)."""
+    budget = sum(weights.values())
+    keep = sorted(((w, s) for s, w in weights.items() if s not in set(exclude) and w > 0), reverse=True)[:n]
+    total = sum(w for w, _ in keep)
+    if total <= 0:
+        return {}
+    out = {s: w * budget / total for w, s in keep}
+    capped: set = set()
+    for _ in range(len(out)):
+        over = {s: w - cap for s, w in out.items() if w > cap + 1e-12}
+        if not over:
+            break
+        capped |= set(over)
+        for s in over:
+            out[s] = cap
+        under = {s: w for s, w in out.items() if s not in capped}
+        room = sum(under.values())
+        if room <= 0:
+            break
+        for s, w in under.items():
+            out[s] = w + sum(over.values()) * w / room
+    return out
+
+
+def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "",
+                          exclude: Sequence[str] = ()) -> Dict[str, Any]:
     """The actual autopilot recalibration: re-runs the SAME recommendation
     pipeline this portfolio was launched with (same sectors, same top_n),
     sized against its CURRENT mark-to-market value — not the stale original
@@ -2753,7 +2783,11 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     (/portfolios/recalibrate_due) that a Cloud Scheduler job hits, or by the
     mid-day news watch (/portfolios/proactive_check). `trigger` ("manual" |
     "scheduled" | "proactive") and `reason` are recorded on the history event
-    so the page shows WHY each recalibration happened."""
+    so the page shows WHY each recalibration happened. `exclude` (the news
+    watch's exit symbols) are sold if held and never bought: the
+    recommendation is asked for that many extra names, they are dropped, and
+    the rest is resized — otherwise its buy-the-dip scoring re-picks the very
+    names the news watch is rotating out of."""
     import portfolio_store
     from datetime import datetime, timedelta, timezone
     from alpaca.trading.client import TradingClient
@@ -2779,8 +2813,11 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     # changes which stocks, never how many. Older portfolios without n_stocks
     # (see backfill_n_stocks.py) keep their current count.
     n_stocks = int(p.get("n_stocks") or len(old_holdings) or p.get("top_n") or TOP_N_TOTAL)
-    result = recommend(p["sectors"], n_stocks)
+    exclude = sorted({str(s).upper() for s in exclude or ()})
+    result = recommend(p["sectors"], n_stocks + len(exclude))
     weights = result.get("final_weights") or {}
+    if exclude:
+        weights = _drop_and_resize(weights, exclude, n_stocks, _max_per_name_for(n_stocks))
     if not weights:
         return {"error": f"Recalibration produced no recommendation "
                          f"(status: {result.get('status')}, risk: {result.get('risk_verdict')})."}
@@ -2905,7 +2942,7 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
         event={"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(),
                "orders": orders_placed, "errors": errors,
               "portfolio_value_before": current_value, "target_weights": weights,
-              "trigger": trigger, "reason": reason[:1000], "review": review,
+              "trigger": trigger, "reason": reason[:1000], "review": review, "excluded": exclude,
               # holdings right after this recalibration (orders still filling counted at their size) — the
               # Portfolio page's "what changed" column reads this instead of reconstructing it
               "holdings_after": {**{s: {"shares": h["shares"]} for s, h in new_holdings.items()},
@@ -3260,8 +3297,8 @@ def proactive_check_route():
         return {"error": "unauthorized"}, 403
     dry_run = request.args.get("dry_run") in ("1", "true", "yes")
 
-    def recalibrate(pid: str, reason: str) -> Dict[str, Any]:
-        return recalibrate_portfolio(pid, trigger="proactive", reason=reason)
+    def recalibrate(pid: str, reason: str, exits: Sequence[str] = ()) -> Dict[str, Any]:
+        return recalibrate_portfolio(pid, trigger="proactive", reason=reason, exclude=exits)
 
     def client():
         # Not claude_reasoning._client(): this service has no

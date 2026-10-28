@@ -83,8 +83,9 @@ if __name__ == "__main__":
     print("SCENARIO D: the per-stock cap never exceeds what the reviewer would block")
     caps = {n: web_ui._max_per_name_for(n) for n in range(1, 31)}
     assert caps[1] == 1.0 and caps[2] == 1.0, "1-2 stock books may be concentrated by design"
-    assert all(caps[n] <= 0.40 + 1e-12 for n in range(3, 31)), caps
+    assert all(caps[n] <= max(0.30, 1.0 / n) + 1e-12 for n in range(3, 31)), caps
+    assert abs(caps[3] - 1 / 3) < 1e-12 and caps[5] == 0.30, "a 5-stock book: at most 30% per stock (was 40%)"
     assert all(caps[n] >= 1.0 / n - 1e-12 for n in range(1, 31)), "the budget can always be fully placed"
     assert abs(caps[12] - 2 / 12) < 1e-12 and caps[30] == 0.10
-    ok(f"3-5 stocks -> 40% (was 67%/50%/40%), 12 -> {caps[12]:.1%}, 30 -> 10%")
+    ok(f"3 stocks -> 33%, 4-6 -> 30% (was 40%), 12 -> {caps[12]:.1%}, 30 -> 10%")
     print("\nAll stock-count scenarios passed.")
