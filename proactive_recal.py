@@ -64,7 +64,8 @@ Pipeline per portfolio (evaluate_portfolio):
          would double up;
        * max_proactive_per_30d early recalibrations already used — UNLESS
          a loss of loss_override_pct or more is building (the portfolio since
-         its last recalibration, or a material holding since then or today):
+         its last recalibration, or a material holding vs. its cost, since
+         then, or today):
          the owner does not want to sit on a loss that size because of a
          monthly limit;
      and on dry_run (config or ?dry_run=1) or a closed market.
@@ -211,7 +212,10 @@ def precheck(p: Dict[str, Any], cfg: ProactiveConfig, today: date) -> Optional[s
 def loss_override(ev: Optional[Dict[str, Any]], cfg: ProactiveConfig) -> Optional[str]:
     """Why a loss of loss_override_pct+ lets this trade through the 30-day
     limit, or None: the portfolio since its last recalibration, or a material
-    holding since then or today."""
+    holding below what was paid for it (its blended entry price), since the
+    last recalibration, or today. Below-cost matters most: each recalibration
+    resets the "since" baseline, so LRCX at -15% vs. cost read as -3.3% "since
+    the last recalibration" and the limit held it."""
     if not ev:
         return None
     x = cfg.loss_override_pct
@@ -221,6 +225,8 @@ def loss_override(ev: Optional[Dict[str, Any]], cfg: ProactiveConfig) -> Optiona
     for r in ev.get("holdings") or []:
         if r["weight"] < cfg.material_weight:
             continue
+        if r["since_entry"] is not None and r["since_entry"] <= -x:
+            return f"{r['symbol']} ({r['weight']:.0%}) is {abs(r['since_entry']):.1%} below what was paid for it"
         since = (perf.get("holdings") or {}).get(r["symbol"])
         if since is not None and since <= -x:
             return f"{r['symbol']} ({r['weight']:.0%}) is down {abs(since):.1%} since the last recalibration"
@@ -1013,5 +1019,12 @@ if __name__ == "__main__":
     d, log = deps(quotes=NOWQ, news={"AAA": ["Fraud probe at AAA"]}, client=FakeClient(YES))
     d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
     assert "already recalibrated today" in run_proactive_check([today_already], cfg, d, NOW)[0].reason
-    print("✓ each 5% loss trades through the cap; a 4% dip waits; same-day / in-flight blocks still apply")
+    under_water = pf(rebalance_history=two, holdings={"AAA": {"shares": 100, "entry_price": 58.8, "cost": 5880.0},
+                                                      "BBB": {"shares": 40, "entry_price": 100.0, "cost": 4000.0}})
+    d, log = deps(quotes=calm, news={"AAA": ["Fraud probe at AAA"]}, client=FakeClient(YES))
+    d.pool_fn, d.history_fn = (lambda sectors: POOL), (lambda syms, day: BASE)
+    r = run_proactive_check([under_water], cfg, d, NOW)[0]
+    assert r.action == "recalibrated" and "15.0% below what was paid" in r.reason, r.reason
+    print("✓ each 5% loss trades through the cap (incl. 15% below cost but flat since the last recal — the Oct-28 LRCX case);"
+          " a 4% dip waits; same-day / in-flight blocks still apply")
     print("\nAll proactive_recal tests passed.")

@@ -136,7 +136,8 @@ proactive_recalibration:
   lag_vs_sector_pct: 0.04
   act_on_lagging: true
   # A loss this size lets a "recalibrate" verdict through max_proactive_per_30d: the portfolio down 5%+ since its
-  # last recalibration, or a holding of 5%+ weight down 5%+ since then or today. Same-day / in-flight blocks still apply.
+  # last recalibration, or a holding of 5%+ weight down 5%+ vs. what was paid, since then, or today. Same-day /
+  # in-flight blocks still apply.
   loss_override_pct: 0.05
 
 # =============================================================================
