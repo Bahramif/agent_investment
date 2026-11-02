@@ -76,13 +76,13 @@ if __name__ == "__main__":
 
     print("GENERIC 3: the stop scales with each stock's own volatility")
     calm, wild = 0.25 / 252 ** 0.5, 0.40 / 252 ** 0.5
-    assert abs(rb.stop_threshold(wild, CFG) - 0.17) < 0.01 and abs(rb.stop_threshold(calm, CFG) - 0.11) < 0.01
-    assert rb.stop_breached(100 * (1 - 0.13), 100, 0.0, calm, CFG) and not rb.stop_breached(100 * (1 - 0.13), 100, 0.0, wild, CFG)
+    assert abs(rb.stop_threshold(wild, CFG) - 0.346) < 0.01 and abs(rb.stop_threshold(calm, CFG) - 0.217) < 0.01
+    assert rb.stop_breached(100 * (1 - 0.26), 100, 0.0, calm, CFG) and not rb.stop_breached(100 * (1 - 0.26), 100, 0.0, wild, CFG)
     ok(f"limit {rb.stop_threshold(calm, CFG):.1%} for a 25%-vol stock, {rb.stop_threshold(wild, CFG):.1%} for a 40%-vol one")
 
     print("ALIGNED 1: the stop only sells a LOSER that lags its OWN sector")
-    assert rb.stop_breached(80, 100, 0.0, 0.02, CFG), "down 20%, sector flat"
-    assert not rb.stop_breached(80, 100, -0.20, 0.02, CFG), "down with its sector"
+    assert rb.stop_breached(60, 100, 0.0, 0.02, CFG), "down 40%, sector flat"
+    assert not rb.stop_breached(60, 100, -0.40, 0.02, CFG), "down with its sector"
     assert not rb.stop_breached(110, 100, 0.60, 0.02, CFG), "above cost: a winner that lags isn't a loser"
     assert not rb.stop_breached(80, 100, None, 0.02, CFG) and not rb.stop_breached(80, 100, 0.0, None, CFG), "can't judge: no stop"
     ok("ok")
@@ -164,6 +164,14 @@ if __name__ == "__main__":
         for args in ((mom + 1e-3, dd, p5, v), (mom, dd - 1e-3, p5, v), (mom, dd, p5 - 1e-3, v)):
             assert abs(rb.pullback_credit(*args, "clean") - c0) < 0.08, (args, c0)
     ok("worst single-step change stays small over 20,000 random inputs (the old dip score jumped 0.70 between -3.9% and -4.1%)")
+
+    print("PULLBACK OFF: with pullback_weight 0 nothing earns or reports a pullback credit")
+    dip = InstrumentSnapshot("D", "equities.tech_ai", momentum_1m=-0.05, news_sentiment=0.0, quality_score=0.8, volatility=0.02,
+                             momentum_12_1=0.30, earnings_yield=0.05, drawdown_6m=-1.8 * rb.monthly_sigma(0.02), news_status="clean")
+    assert CFG.pullback_weight == 0.0 and rb.composite_scores([dip], None, CFG)["D"][1] == 0.0
+    assert rb.composite_scores([dip], None, rb.RulebookConfig(pullback_weight=0.1))["D"][1] > 0.5
+    assert reason_desk([dip], CFG)[0].dip_score == 0.0
+    ok("ok")
 
     print("SCORE: ranks inside each sector; a sector's scale doesn't decide across sectors; the LLM is one input")
     def snap(name, sector, mom, q, ey):

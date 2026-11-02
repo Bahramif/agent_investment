@@ -235,14 +235,14 @@ def close_on_or_before(series: Optional[Dict[date, float]], day: Optional[date])
 
 def stop_status(p: Dict[str, Any], symbol: str, price: Optional[float], pool: Dict[str, str],
                 quotes: Dict[str, Dict[str, float]], series: Dict[str, Dict[date, float]],
-                rules: rulebook.RulebookConfig) -> Dict[str, Any]:
+                rules: rulebook.RulebookConfig, today: date) -> Dict[str, Any]:
     """Where this holding stands against the rulebook's stop. Peers are its own
-    sector, or the whole pool for a stock no longer listed in one."""
+    sector, or the whole pool for a stock no longer listed in one. Volatility
+    stops at yesterday's close: a crash must not push its own limit further away."""
     out: Dict[str, Any] = {"vol": None, "vs_sector": None, "stop_level": None, "stop_breached": False}
     closes = series.get(symbol) or {}
     if closes:
-        ordered = [closes[d] for d in sorted(closes)]
-        out["vol"] = rulebook.annual_window_vol(ordered + ([price] if price else []))
+        out["vol"] = rulebook.annual_window_vol([closes[d] for d in sorted(closes) if d < today])
     entry = ((p.get("holdings") or {}).get(symbol) or {}).get("entry_price")
     since = rulebook.holding_entry_date(p, symbol)
     sector = pool.get(symbol)
@@ -285,7 +285,7 @@ def build_evidence(p: Dict[str, Any], quotes: Dict[str, Dict[str, float]], headl
         px = (quotes.get(s) or {}).get("price")
         since = (px / h["entry_price"] - 1.0) if px and h.get("entry_price") else None
         heads = [str(x)[:200] for x in (headlines.get(s) or [])[:MAX_HEADLINES_PER_SYMBOL]]
-        st = stop_status(p, s, px, pool or {}, quotes, series, rules)
+        st = stop_status(p, s, px, pool or {}, quotes, series, rules, today)
         rows.append({"symbol": s, "weight": round(w, 4), "target_weight": round(tw.get(s, 0.0), 4),
                      "day_change": None if mv is None else round(mv, 4),
                      "since_entry": None if since is None else round(since, 4), "headlines": heads, **st})
@@ -754,7 +754,7 @@ if __name__ == "__main__":
     print("✓ ok")
 
     print("TEST 6: THE STOP: below cost and behind its sector by 1.5 monthly sigmas, the same rule for every stock")
-    vol = rulebook.annual_window_vol([SERIES["AAA"][k] for k in sorted(SERIES["AAA"])] + [40.0])
+    vol = rulebook.annual_window_vol([SERIES["AAA"][k] for k in sorted(SERIES["AAA"])])
     limit = rulebook.stop_threshold(vol)
     print(f"  (daily vol {vol:.1%} -> limit {limit:.1%})")
     drop = {**QUOTES, "CCC": {"price": 100.0, "prev_close": 100.0}, "DDD": {"price": 100.0, "prev_close": 100.0}}
@@ -770,6 +770,11 @@ if __name__ == "__main__":
     d, log = deps(quotes={**drop, "AAA": {"price": ok_px, "prev_close": ok_px}}, client=FakeClient(NO), series=SERIES, pool=POOL)
     assert run_proactive_check([pf()], cfg, d, NOW)[0].action != "recalibrated" and not log["recal"], "inside the limit: no stop"
     print(f"✓ {r.reason[:110]}...")
+
+    print("TEST 6b: a one-day crash can't move its own stop further away")
+    worst = 50.0 * (1 - limit * 1.1)
+    assert build_evidence(pf(), {**drop, "AAA": {"price": worst, "prev_close": 50.0}}, {}, cfg, today, POOL, SERIES)["holdings"][0]["stop_breached"]
+    print("✓ ok")
 
     print("TEST 7: falling WITH its sector is not a stop; lagging a rising sector while above cost is not a stop")
     all_down = {s: {"price": v["price"] * (1 - limit * 1.5), "prev_close": v["price"]} for s, v in

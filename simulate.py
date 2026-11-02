@@ -274,7 +274,7 @@ def run_simulation(
                     rets.append(now / b - 1.0)
             if not rets or not px:
                 continue
-            vol = rulebook.annual_window_vol(series[sym].upto(day))
+            vol = rulebook.annual_window_vol(series[sym].upto(day)[:-1])   # to yesterday: a crash can't move its own stop
             if rulebook.stop_breached(px, entry_px, statistics.fmean(rets), vol, cfg):
                 out.append(sym)
         return out

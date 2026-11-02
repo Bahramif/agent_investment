@@ -61,13 +61,12 @@ VARIANTS: Dict[str, rulebook.RulebookConfig] = {
     "default": BASE,
     "prices only (no quality/value)": _vary(weight_quality=0.0, weight_value=0.0),
     "no stop": _vary(stop_sigma_mult=99.0),
-    "stop 1.0 sigma": _vary(stop_sigma_mult=1.0),
+    "stop 1.5 sigma": _vary(stop_sigma_mult=1.5),
     "stop 2.0 sigma": _vary(stop_sigma_mult=2.0),
-    "stop 3.0 sigma": _vary(stop_sigma_mult=3.0),
     "no keep band (1x)": _vary(keep_rank_multiple=1.0),
     "keep band 1.5x": _vary(keep_rank_multiple=1.5),
     "keep band 3x": _vary(keep_rank_multiple=3.0),
-    "no pullback credit": _vary(pullback_weight=0.0),
+    "pullback credit 0.10": _vary(pullback_weight=0.10),
     "no re-entry block": _vary(reentry_block_days=0),
     "no sub-industry limit": _vary(max_industry_weight=1.0),
     "no beta limit": _vary(max_portfolio_beta=99.0),
@@ -75,15 +74,14 @@ VARIANTS: Dict[str, rulebook.RulebookConfig] = {
 PRICES_ONLY = dict(weight_quality=0.0, weight_value=0.0)
 # The clean test: the same questions with the lookahead-prone factors removed.
 CLEAN_VARIANTS: Dict[str, rulebook.RulebookConfig] = {
+    "default": _vary(**PRICES_ONLY),
     "no stop": _vary(stop_sigma_mult=99.0, **PRICES_ONLY),
-    "stop 1.0 sigma": _vary(stop_sigma_mult=1.0, **PRICES_ONLY),
-    "stop 1.5 sigma (default)": _vary(**PRICES_ONLY),
+    "stop 1.5 sigma": _vary(stop_sigma_mult=1.5, **PRICES_ONLY),
     "stop 2.0 sigma": _vary(stop_sigma_mult=2.0, **PRICES_ONLY),
-    "stop 3.0 sigma": _vary(stop_sigma_mult=3.0, **PRICES_ONLY),
     "no keep band (1x)": _vary(keep_rank_multiple=1.0, **PRICES_ONLY),
     "keep band 1.5x": _vary(keep_rank_multiple=1.5, **PRICES_ONLY),
     "keep band 3x": _vary(keep_rank_multiple=3.0, **PRICES_ONLY),
-    "no pullback credit": _vary(pullback_weight=0.0, **PRICES_ONLY),
+    "pullback credit 0.10": _vary(pullback_weight=0.10, **PRICES_ONLY),
     "no re-entry block": _vary(reentry_block_days=0, **PRICES_ONLY),
 }
 VARIANTS.update({f"clean: {k}": v for k, v in CLEAN_VARIANTS.items()})
@@ -240,7 +238,7 @@ def main() -> None:
                      f"{r['turnover']:.1f}x | {r['stops']} |")
         L.append("")
 
-    clean_base = "clean: stop 1.5 sigma (default)"
+    clean_base = "clean: default"
     L += ["## The clean test: prices only (no quality or value), all five sectors, 12 stocks", "",
           "This removes the fundamentals lookahead, so it is the fairest read. Survivorship still flatters every "
           "column equally.", "",
