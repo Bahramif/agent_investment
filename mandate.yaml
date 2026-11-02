@@ -39,14 +39,14 @@ rulebook:
   weight_quality: 0.25            # margins, returns on equity, leverage, growth
   weight_value: 0.20              # forward earnings yield
   weight_llm: 0.20                # the model's read, ranked among the peers it compared
-  pullback_weight: 0.10           # a pullback in an intact uptrend, with clean news
+  pullback_weight: 0.0            # off: a pullback credit lowered return and raised turnover in the clean backtest
   # who may be held at all
   min_history_bars: 252           # about a year of trading days
   min_dollar_volume: 10000000
   # keeping a stock: stays while ranked inside this multiple of the portfolio's size
   keep_rank_multiple: 2.0
   # selling a loser: below cost AND behind its sector, since purchase, by this many monthly sigmas
-  stop_sigma_mult: 1.5
+  stop_sigma_mult: 3.0            # catches severe breakdowns only: tighter stops didn't reduce drawdowns in the backtest
   # no rebuy for this long after any sale, whatever the reason
   reentry_block_days: 30
   # no new buy this close to a company's earnings report

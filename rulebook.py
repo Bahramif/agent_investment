@@ -21,7 +21,8 @@ Three principles, each enforced by test_rulebook.py:
 
 THE LIFE OF A POSITION
   1. SCORE      within-sector percentile of 12-1 momentum, quality, value and
-                (when available) the LLM's read, plus a pullback credit.
+                (when available) the LLM's read. An optional pullback credit is
+                switched off (pullback_weight 0): the backtest didn't support it.
   2. BUY        highest-scoring eligible names, within the sub-industry limit.
                 Not eligible: under a year of history, too illiquid, broken
                 thesis. Not bought now: re-entry block, earnings imminent.
@@ -64,14 +65,14 @@ class RulebookConfig:
     weight_quality: float = 0.25
     weight_value: float = 0.20
     weight_llm: float = 0.20
-    pullback_weight: float = 0.10       # share of the score a full pullback credit is worth
+    pullback_weight: float = 0.0        # share of the score a full pullback credit is worth (off: see backtest_report.md)
     # eligibility
     min_history_bars: int = 252         # about a year of trading days
     min_dollar_volume: float = 10_000_000.0
     # holding
     keep_rank_multiple: float = 2.0
     # selling
-    stop_sigma_mult: float = 1.5
+    stop_sigma_mult: float = 3.0
     reentry_block_days: int = 30
     # buying
     earnings_block_days: int = 3
@@ -262,7 +263,8 @@ def composite_scores(snapshots: Sequence[Any], llm_pct: Optional[Dict[str, float
             base = cfg.weight_momentum * mom[s.name] + cfg.weight_quality * qual[s.name] + cfg.weight_value * val[s.name]
             if use_llm:
                 base += cfg.weight_llm * float((llm_pct or {}).get(s.name, 0.5))
-            credit = pullback_credit(s.momentum_12_1, s.drawdown_6m, s.pullback_5d, s.volatility or None, s.news_status)
+            credit = (pullback_credit(s.momentum_12_1, s.drawdown_6m, s.pullback_5d, s.volatility or None, s.news_status)
+                      if cfg.pullback_weight > 0 else 0.0)
             score = (base / total) * (1.0 - cfg.pullback_weight) + cfg.pullback_weight * credit
             out[s.name] = (round(score, 6), credit)
     return out

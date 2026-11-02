@@ -1151,15 +1151,14 @@ ABOUT_PAGE = """
       <code>rulebook:</code> block of <code>mandate.yaml</code>), used by recommendations, the news
       watch and the simulation alike. No rule names a stock. Each stock gets one 0-1 <b>score</b>,
       from where it ranks among the stocks in its own sector:</p>
-    <div class="formula">score = 0.9 &times; (0.35&middot;momentum + 0.25&middot;quality + 0.20&middot;value + 0.20&middot;LLM read) + 0.1 &times; pullback credit</div>
+    <div class="formula">score = 0.35&middot;momentum + 0.25&middot;quality + 0.20&middot;value + 0.20&middot;LLM read</div>
     <ul>
       <li><b>LLM read</b> — the model compares a sector's stocks and classifies their headlines.
         Its scores are converted to ranks within each call, since raw scores aren't comparable
         between calls. If the model is unavailable its weight goes to the other factors and a
         stock's news counts as unknown.</li>
-      <li><b>Pullback credit</b> — earned gradually, and only when the long-term trend is still up,
-        the fall is meaningful for that stock (about 1-3 of its monthly sigmas below its 6-month
-        high), it has stopped falling hard, and its news is clean. Unknown news earns nothing.</li>
+      <li><b>No dip buying</b> — a recent fall earns no extra credit. The backtest didn't support it,
+        so that setting is off.</li>
       <li><b>Who can't be held</b> — a stock with under a year of trading history, under $10M of
         average daily dollar volume, or news the model judges thesis-breaking. The same test for
         every stock.</li>
@@ -1231,8 +1230,8 @@ ABOUT_PAGE = """
         portfolio don't trade.</li>
       <li>If you turn on the news watch, it checks daily whether a holding must be sold early, for
         one of two reasons. The <b>stop</b>: below what was paid AND behind its sector, since
-        purchase, by 1.5 of its own monthly sigmas (about 17% for a 40%-volatility stock, 11% for a
-        25% one). Or <b>news</b> the model judges thesis-breaking, at most twice in 30 days. Only
+        purchase, by 3 of its own monthly sigmas (about 35% for a 40%-volatility stock, 22% for a
+        25% one), so it only catches severe breakdowns. Or <b>news</b> the model judges thesis-breaking, at most twice in 30 days. Only
         that stock is sold and its slot filled; only a stop can go past the limit.</li>
       <li>Every order is reviewed before it is placed: hard checks and the AI reviewer can block a
         buy, on every trigger, and never block a sell</li>
