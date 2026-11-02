@@ -107,6 +107,7 @@ def install(doc):
     ps._client = fake
     FakeTradingClient.outage, FakeTradingClient.submitted, FakeTradingClient.lookups = False, [], 0
     web_ui._RECONCILE_LAST.clear()
+    web_ui._market_open = lambda: True
     return fake
 
 

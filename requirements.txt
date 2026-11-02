@@ -7,6 +7,5 @@ alpaca-py
 anthropic[vertex]
 google-genai
 yfinance
-scipy
 pyyaml
 tzdata

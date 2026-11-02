@@ -235,7 +235,7 @@ if __name__ == "__main__":
     assert cfg.sleeve_capital > 0 and cfg.long_only
     from mandate_allocator import load_mandate
     m = load_mandate(path)
-    assert "day_trading" in m and set(m["buckets"]) == {"equities", "forex", "crypto", "cash"}
+    assert "day_trading" in m and set(m["buckets"]) == {"equities"}
     print(f"✓ sleeve=${cfg.sleeve_capital:,.0f}, strategies={cfg.strategies}; buckets untouched")
 
     print("TEST 6: learning block — defaults, typo rejection, bounds")

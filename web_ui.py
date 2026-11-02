@@ -69,6 +69,7 @@ RESOURCE_NAME = os.environ.get(
 # bundles into the deployed agent, so there's exactly one candidate list to
 # keep accurate rather than two copies that can drift apart.
 from universe import SECTORS, EQUITIES as UNIVERSE
+import rulebook
 
 def _max_per_name_for(top_n: int) -> float:
     """Per-name allocation cap, SCALED to whatever "max # of stocks" the
@@ -76,7 +77,7 @@ def _max_per_name_for(top_n: int) -> float:
 
     BUG FIX, confirmed live with real market data: a FIXED cap here
     (previously 0.50, regardless of top_n) meant the "max # of stocks"
-    setting barely mattered past 2 names — the allocator/optimizer
+    setting barely mattered past 2 names — the allocator
     routinely concentrated the whole budget onto the top 2 convictions
     (50% each, hitting the cap) and funded nothing else, whether top_n was
     set to 6, 8, or 12. This wasn't a hardcoded "always 3 stocks" anywhere
@@ -108,9 +109,7 @@ def _max_per_name_for(top_n: int) -> float:
     # check: > max_single_weight in one name when the book holds >=
     # min_names_for_cap names). Without this a 3-stock book got a 67% cap and
     # its biggest buy was vetoed every time. Still >= an equal share (1/n), so
-    # the budget can always be fully placed. With max_single_weight at 30%, a
-    # 5-stock book can no longer put 70% in its top two (it was NVDA 40% +
-    # LRCX 30% at the 40% limit).
+    # the budget can always be fully placed.
     try:
         from rec_evaluator import load_config
         ev = load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mandate.yaml"))
@@ -194,7 +193,7 @@ def _claude_client():
 _LAST_CONTEXT: Dict[str, Any] = {}
 
 
-def build_mandate(selected_sectors: List[str], top_n: int = TOP_N_TOTAL) -> dict:
+def build_mandate(selected_sectors: List[str], top_n: int = TOP_N_TOTAL, context: Optional[Dict[str, Any]] = None) -> dict:
     """Locks OUT every non-selected sector at 0% (so its names never enter
     the allocator's pool) and leaves every SELECTED sector fully OPEN. Open
     equity space with no locked children is exactly what
@@ -203,11 +202,15 @@ def build_mandate(selected_sectors: List[str], top_n: int = TOP_N_TOTAL) -> dict
     strategist.theme_budgets() when real theme_tilts are available (AI-
     tilted by conviction), falling back to pro-rata-by-name-count only if
     tilts are missing entirely. This is real allocator code, not a special
-    case written for this UI."""
+    case written for this UI.
+
+    `context` is what the rulebook needs to know about an existing portfolio:
+    {"held": [...], "blocked": [...]} (rulebook.select_names)."""
     excluded = [s for s in SECTORS if s not in selected_sectors]
     mandate: Dict[str, Any] = {
         "total": 1.0,
-        "default_limits": {"max_per_name": _max_per_name_for(top_n), "min_names": 1, "top_n": top_n},
+        "default_limits": {"max_per_name": _max_per_name_for(top_n), "min_names": 1, "top_n": top_n,
+                           **{k: list(v) for k, v in (context or {}).items() if v}},
         "buckets": {"equities": {"set_by": "user", "weight": 1.0}},
     }
     if excluded:
@@ -238,15 +241,49 @@ def _call_with_timeout(fn, *args, timeout: float = 300.0, **kwargs):
             raise TimeoutError(f"{getattr(fn, '__name__', fn)} did not respond within {timeout:.0f}s")
 
 
-def _build_recommend_state(selected_sectors: List[str], top_n: int) -> tuple:
+def _strategist_memory() -> tuple:
+    """(saved sector views, days since they were saved). Starting from nothing
+    only costs an extra strategic review, so a store failure isn't an error."""
+    from datetime import datetime, timezone
+    try:
+        import portfolio_store
+        saved = portfolio_store.get_strategist_memory()
+        memory = saved.get("theme_memory") or {}
+        at = datetime.fromisoformat(saved["saved_at"]) if saved.get("saved_at") else None
+        elapsed = (datetime.now(timezone.utc) - at).total_seconds() / 86400.0 if at else 0.0
+        return memory, max(0.0, elapsed)
+    except Exception as e:
+        print(f"[web_ui] strategist memory unavailable ({e}): starting fresh")
+        return {}, 0.0
+
+
+def _finish_recommendation(result: dict) -> dict:
+    """The agent's answer, ready for this app: its sector views saved for next
+    time, and CASH (what the rulebook's limits left uninvested) taken out of the
+    weights, since it isn't a stock to price or order."""
+    memory = result.get("theme_memory") if isinstance(result, dict) else None
+    if memory and isinstance(memory, dict):
+        try:
+            import portfolio_store
+            portfolio_store.save_strategist_memory(memory)
+        except Exception as e:
+            print(f"[web_ui] could not save strategist memory: {e}")
+    weights = result.get("final_weights") if isinstance(result, dict) else None
+    if weights and rulebook.CASH in weights:
+        result = {**result, "final_weights": {n: w for n, w in weights.items() if n != rulebook.CASH}}
+    return result
+
+
+def _build_recommend_state(selected_sectors: List[str], top_n: int, context: Optional[Dict[str, Any]] = None) -> tuple:
     """Shared by recommend() and the SSE streaming route below so the
     mandate/state-building logic (and the thread_id convention) lives in
     exactly one place. Returns (thread_id, state)."""
+    theme_memory, elapsed_days = _strategist_memory()
     state = {
-        "mandate": build_mandate(selected_sectors, top_n),
+        "mandate": build_mandate(selected_sectors, top_n, context),
         "tilt_caps": {"strategic_cap": 0.15, "tactical_cap": 0.06, "total_cap": 0.15},
-        "theme_memory": {},
-        "elapsed_days": 0.0,
+        "theme_memory": theme_memory,
+        "elapsed_days": elapsed_days,
         "material_threshold": 0.03,
         # +0.05 buffer above the allocator's own cap (same relationship the
         # old fixed 0.50/0.55 pair had) so ordinary floating-point solver
@@ -258,14 +295,14 @@ def _build_recommend_state(selected_sectors: List[str], top_n: int) -> tuple:
     return thread_id, state
 
 
-def recommend(selected_sectors: List[str], top_n: int = TOP_N_TOTAL) -> dict:
+def recommend(selected_sectors: List[str], top_n: int = TOP_N_TOTAL, context: Optional[Dict[str, Any]] = None) -> dict:
     """Asks the deployed agent to run its real pipeline (live ingestion ->
     analyst scoring -> strategist tilts -> risk check) over the selected
     sectors, AI-tilting the split between them by conviction. top_n caps how
     many of each sector's highest-conviction names the allocator will
     actually fund — the user-facing "max number of stocks" setting."""
-    thread_id, state = _build_recommend_state(selected_sectors, top_n)
-    return _call_with_timeout(_remote_agent.query, thread_id=thread_id, state=state, timeout=300.0)
+    thread_id, state = _build_recommend_state(selected_sectors, top_n, context)
+    return _finish_recommendation(_call_with_timeout(_remote_agent.query, thread_id=thread_id, state=state, timeout=300.0))
 
 
 # Human-friendly labels for each real LangGraph node name, shown live while
@@ -383,10 +420,7 @@ def enrich(result: dict, selected_sectors: List[str], capital: float) -> Dict[st
             "already_held": current_positions.get(name, 0.0) > 1e-9,
             "rationale": note.get("rationale", ""),
             "risk_note": note.get("risk_note", ""),
-            # WHY this weight, not just why this name — see
-            # mandate_allocator._weight_rationale: benchmarked against an
-            # equal-weight baseline and tied to expected return / volatility
-            # relative to the other names it was sized against.
+            # WHY this weight, not just why this name: see mandate_allocator._weight_rationale.
             "weight_rationale": note.get("weight_rationale", ""),
             # Key metrics/score block — the "why this equity was selected"
             # transparency panel. All from the analyst's original scoring
@@ -945,19 +979,16 @@ ABOUT_PAGE = """
       and a transparent arithmetic fallback without changing anything else in the graph.</p>
     <div class="stage-flow">
       <ol>
-        <li><b>Data ingestion</b> — real prices, news, fundamentals, and analyst estimates are
-          fetched for every candidate stock in your selected sector(s) and for a small
-          representative basket per sector (for the sector-level view)</li>
-        <li><b>Per-stock scoring</b> — each candidate gets a conviction score, a Buy/Hold/Sell
-          call, an expected-return estimate, and a one-line rationale</li>
-        <li><b>Sector-level strategist</b> — a separate pass forms a long-term + short-term view
-          per sector and tilts how open budget splits across them</li>
-        <li><b>Stock selection</b> — the highest-conviction names across your selection are cut
-          down to your "max # of stocks" setting</li>
-        <li><b>Weight optimization</b> — a real mean-variance optimizer decides how much of the
-          budget each selected name gets, benchmarked against simple equal-weighting</li>
-        <li><b>Risk check</b> — a deterministic, non-negotiable veto: no name may exceed its
-          concentration limit, and the book must sum to exactly 100%</li>
+        <li><b>Data ingestion</b> — a year of real prices, news, fundamentals, and analyst
+          estimates for every candidate stock</li>
+        <li><b>Per-stock scoring</b> — each stock gets one score, ranked against its own sector</li>
+        <li><b>Sector-level strategist</b> — a long-term + short-term view per sector, which
+          shades how the budget splits across your selected sectors</li>
+        <li><b>Stock selection</b> — the best eligible names up to your "max # of stocks",
+          with current holdings kept while they stay near the top</li>
+        <li><b>Sizing and limits</b> — inverse-volatility weights, then sub-industry and
+          portfolio-beta limits; any excess stays cash</li>
+        <li><b>Risk check</b> — a deterministic, non-negotiable veto on every limit</li>
         <li><b>Execution</b> (only on "Launch as New Portfolio") — real whole-share market
           orders placed on Alpaca's paper trading API</li>
         <li><b>Ongoing tracking</b> — an independent ledger reconstructs the portfolio's real
@@ -1080,163 +1111,99 @@ ABOUT_PAGE = """
         order sizing are based on</li>
       <li><b>Max # of stocks</b> — the ceiling on how many distinct names can be selected across
         your chosen sector(s) combined (not per sector) — this also directly controls how
-        concentrated or diversified the weight optimizer is allowed to get (see §7)</li>
+        concentrated any one stock is allowed to get (see §7)</li>
       <li><b>Rebalance cadence</b> — optional; if set when you launch a portfolio, a scheduled
         job re-runs this entire pipeline against it automatically (see §10)</li>
     </ul>
 
     <h2 id="ingestion">3. Data ingestion</h2>
-    <p>The candidate pool is {{ universe_size }} names across {{ sectors|length }} sectors
-      (AI/Tech, Energy, Industrials, Healthcare, Financials) — almost entirely real S&amp;P 500
-      constituents, cross-checked against Alpaca's own tradable-assets list, plus a small number
-      of explicit, deliberate exceptions (currently just SpaceX/SPCX under Industrials: real and
-      tradable, but not yet S&amp;P-500-eligible due to the index's mandatory 12-month post-IPO
-      seasoning period). For every candidate in your selected sector(s), five real inputs are
-      fetched fresh:</p>
+    <p>The candidate pool is {{ universe_size }} names across {{ sectors|length }} sectors. Each
+      stock's sector comes from the data provider, not from a hand-kept list. For every candidate,
+      these real inputs are fetched fresh:</p>
     <div class="about-grid">
       <div>
         <ul>
-          <li><b>Momentum</b> — trailing 21-trading-day return, from real Alpaca historical
-            price bars</li>
-          <li><b>News sentiment</b> — a -1..+1 score over the last 7 days of real headlines
-            from Alpaca News</li>
-          <li><b>Volatility</b> — the standard deviation of daily returns over that same
-            21-day window (this is also what feeds the covariance matrix in §7)</li>
+          <li><b>12-1 month momentum</b> — the return from 12 months ago to 1 month ago, from
+            Alpaca price bars. The latest month is skipped because returns over about a month
+            tend to reverse.</li>
+          <li><b>Volatility and beta</b> — daily volatility and beta to SPY over up to a year</li>
+          <li><b>News</b> — the last 7 days of real headlines from Alpaca News, read by the LLM</li>
         </ul>
       </div>
       <div>
         <ul>
           <li><b>Quality score</b> — real fundamentals from Yahoo Finance: profit margin (35%
-            weight), return on equity (35%), debt/equity (15%), revenue growth (15%), each
-            normalized to 0-1 and blended; cached ~20h per symbol since these move on an
-            earnings cadence, not intraday</li>
-          <li><b>Analyst forecast</b> — REAL Wall Street consensus data (also Yahoo Finance):
-            analyst mean target price, consensus rating, and number of covering analysts —
-            used directly as the expected-return input when coverage exists</li>
+            weight), return on equity (35%), debt/equity (15%), revenue growth (15%)</li>
+          <li><b>Value</b> — forward earnings yield (earnings per share / price)</li>
+          <li><b>Analyst forecast</b> — Wall Street consensus target and rating. Shown to you and
+            to the LLM, but it never sizes a position: target upside rises automatically when a
+            price falls.</li>
         </ul>
       </div>
     </div>
-    <p>A sector's own trailing momentum, sentiment, and a hand-set "structural tailwind" score
-      are also computed from a small representative basket per sector (e.g. Tech/AI uses
-      NVDA/MSFT/GOOGL/META/AVGO as a proxy) — this feeds the strategist in §5, separately from
-      individual-stock scoring.</p>
+    <p>Each sector's read for the strategist in §5 comes from all its stocks.</p>
     <div class="callout">Prices come from Alpaca's free IEX feed, not the full consolidated
       SIP tape — quotes can differ by a few cents (occasionally more for thinly-traded names)
       from a source using the full tape.</div>
 
     <h2 id="scoring">4. Per-stock scoring</h2>
-    <p>Each candidate's five inputs from §3 are combined into a single 0-1 <b>conviction
-      score</b>:</p>
-    <div class="formula">conviction = clip( 0.5 + 0.5 &times; (0.5&middot;momentum&times;10 + 0.3&middot;sentiment + 0.2&middot;quality) &minus; risk_penalty ,  0, 1 )
-risk_penalty = min(volatility &times; 3.0, 0.3)</div>
-    <p>That score maps to a Buy (&ge;65), Hold (&ge;40), or Sell rating, and a one-line rationale
-      is generated naming whichever inputs actually drove the number (e.g. "positive 1-month
-      momentum, above-average quality score"). A forward-return estimate is attached too:</p>
+    <p>Every rule for long-term portfolios lives in one place (<code>rulebook.py</code>, set in the
+      <code>rulebook:</code> block of <code>mandate.yaml</code>), used by recommendations, the news
+      watch and the simulation alike. No rule names a stock. Each stock gets one 0-1 <b>score</b>,
+      from where it ranks among the stocks in its own sector:</p>
+    <div class="formula">score = 0.9 &times; (0.35&middot;momentum + 0.25&middot;quality + 0.20&middot;value + 0.20&middot;LLM read) + 0.1 &times; pullback credit</div>
     <ul>
-      <li>When a name has real analyst coverage, the expected return IS the analyst
-        consensus target price's implied return — shown with the number of covering analysts
-        and labeled "target," genuinely independent third-party data</li>
-      <li>When it doesn't, a heuristic estimate is used instead — built from the SAME
-        momentum/sentiment/quality/volatility numbers already driving conviction (so it's
-        legible math, not new information) — shown labeled "est."</li>
+      <li><b>LLM read</b> — the model compares a sector's stocks and classifies their headlines.
+        Its scores are converted to ranks within each call, since raw scores aren't comparable
+        between calls. If the model is unavailable its weight goes to the other factors and a
+        stock's news counts as unknown.</li>
+      <li><b>Pullback credit</b> — earned gradually, and only when the long-term trend is still up,
+        the fall is meaningful for that stock (about 1-3 of its monthly sigmas below its 6-month
+        high), it has stopped falling hard, and its news is clean. Unknown news earns nothing.</li>
+      <li><b>Who can't be held</b> — a stock with under a year of trading history, under $10M of
+        average daily dollar volume, or news the model judges thesis-breaking. The same test for
+        every stock.</li>
     </ul>
-    <p>Analyst forecast data changes what's <i>displayed</i> next to a name, but never the
-      <b>conviction score itself</b> — the formula above runs identically whether or not real
-      coverage exists, using only momentum/sentiment/quality/volatility either way; the
-      Claude-backed path is the same, since its prompt (see the box below) is built from those
-      same four numbers and never includes analyst data at all. Two things follow from that:</p>
-    <ul>
-      <li>Conviction — and therefore stock <b>selection and ranking</b> in §6 — is unaffected by
-        whether a name has analyst coverage at all; a well-covered blue chip and an obscure
-        small-cap with identical momentum/sentiment/quality/volatility numbers get the exact
-        same conviction score</li>
-      <li>When real coverage exists, the <b>rating badge</b> (Buy/Hold/Sell) is Wall Street's own
-        consensus call (Yahoo Finance's <code>recommendationKey</code>), not a re-label of the
-        conviction tier — so it's possible, if rare, to see a name's badge and its numeric
-        conviction level point in slightly different directions, since they're two independent
-        judgments shown side by side, not one derived from the other</li>
-    </ul>
-    <p>This scoring step (and the sector-level strategist in §5) is <b>designed</b> to run as a
-      real Claude call via Vertex AI, reasoning over the whole desk of candidates at once rather
-      than name-by-name arithmetic — with the deterministic formula above as an automatic,
-      transparent fallback whenever that call fails for any reason.</p>
-    <div class="honest">Current status, checked against this deployment's own logs: Claude
-      calls on this project are presently failing on quota (HTTP 429, RESOURCE_EXHAUSTED) for
-      both the analyst and strategist models, so every recommendation right now is running the
-      deterministic fallback formula above, not a live Claude call. The math, rationale, and
-      risk-check gate are identical either way — only the reasoning source differs.</div>
 
     <h2 id="strategist">5. Sector-level strategist</h2>
     <p>Separately from individual stock scoring, each sector gets a top-down view on two
       horizons:</p>
     <ul>
-      <li><b>Strategic</b> — a slow-moving thesis (365-day decay half-life, expires if not
-        refreshed within 180 days), capped at &plusmn;15% tilt</li>
-      <li><b>Tactical</b> — a fast-moving read on recent momentum/sentiment (14-day half-life,
-        expires after 21 days), capped at &plusmn;6% tilt</li>
+      <li><b>Strategic</b> — a slow-moving thesis, reviewed every 90 days (365-day decay half-life,
+        expires if not refreshed within 180 days), up to &plusmn;15% tilt</li>
+      <li><b>Tactical</b> — a fast-moving read, refreshed on every run (14-day half-life, expires
+        after 21 days), up to &plusmn;6% tilt</li>
     </ul>
-    <p>The two combine into one net tilt per sector (capped at &plusmn;15% overall), which steers
-      how any budget you left <i>open</i> across multiple selected sectors splits between them
-      — favoring sectors with a stronger combined view, never all-or-nothing. A sector you've
-      explicitly locked to a fixed weight is untouched by this; it only shades money you didn't
-      already commit.</p>
+    <p>Views are saved between runs. The two combine into one net tilt per sector (capped at
+      &plusmn;15%), which shades how your budget splits across multiple selected sectors, never
+      all-or-nothing.</p>
 
     <h2 id="selection">6. Stock selection</h2>
-    <p>Within your selected sector(s), every candidate's conviction score is ranked and cut down
-      to your "max # of stocks" setting — GLOBALLY across every selected sector combined, not
-      per sector, so picking 3 sectors at "max 8" gives you 8 names total, not 24. A name with
-      zero or negative conviction never takes one of those slots even if it would otherwise
-      rank inside the cutoff, so every funded slot goes to a genuinely-positive pick whenever
-      that many exist.</p>
-    <p>Beyond that conviction cutoff, there are no other selection criteria — no sector-balance,
-      liquidity, market-cap, or correlation filter runs at this stage; raw conviction rank is the
-      entire test for which names get picked. (Correlation between the names that DO get selected
-      only enters afterward, at the weight-optimization stage in §7 below — it can change how much
-      budget a name gets, never whether it gets picked in the first place.) The one other thing
-      that can happen here: if a sector's real candidate pool has too few positive-conviction names
-      to fill even its fair share of your "max # of stocks" setting, fewer names get funded than
-      requested and a warning is attached to that allocation — selection never pads out the list
-      with a conviction &le; 0 name just to hit a round number.</p>
+    <p>Scores are ranked across your selected sectors, and the best names up to your "max # of
+      stocks" are selected: picking 3 sectors at "max 8" gives you 8 names total, not 24.</p>
+    <ul>
+      <li><b>Keeping a stock</b> — a holding stays while it ranks in the top 2&times;N, so a stock
+        slipping a few places doesn't trade.</li>
+      <li><b>Buying back</b> — anything sold, for any reason, can't be rebought for 30 days.</li>
+      <li><b>Earnings</b> — no new buys within 3 days before a company reports.</li>
+      <li><b>Sub-industry</b> — selection spreads across sub-industries where it can, so the limit
+        in §7 doesn't have to leave money in cash.</li>
+    </ul>
 
-    <h2 id="weights">7. Weight optimization</h2>
-    <p>Once the names are selected, a separate question is answered: how much of the budget does
-      each one get? This is real mean-variance portfolio optimization, not a simple split by
-      conviction score:</p>
-    <div class="stage-flow">
-      <ol>
-        <li><b>Build a real covariance matrix</b> from each selected name's ACTUAL daily
-          returns over the same lookback window §3 already computed — this is what lets the
-          optimizer see when two "top pick" names would move in lockstep (holding both barely
-          diversifies anything) versus genuinely independent picks</li>
-        <li><b>Maximize expected return net of risk</b> — <span style="font-family:ui-monospace,monospace;font-size:0.82em;">&mu;&sup1;w &minus; (risk_aversion/2)&middot;w&sup1;&Sigma;w</span>,
-          solved with a constrained numerical optimizer (SciPy SLSQP), subject to a per-name
-          cap and the budget summing to 100%</li>
-        <li><b>Compare against plain equal-weighting</b> — if simply splitting the budget
-          evenly across the selected names would project a HIGHER combined expected return
-          than the optimizer's own tilted weights, the equal split is used instead. This is a
-          hard guarantee, not a tiebreaker: the optimizer's return/risk trade-off can
-          legitimately sacrifice some expected return for lower correlation, but weight sizing
-          here never ends up strictly worse on return than doing nothing</li>
-      </ol>
-    </div>
-    <p>Every name's card shows exactly which of these drove its weight — e.g. "Sized at 25% —
-      12.5pp above the 12.5% equal-weight baseline for this 8-name group, driven mainly by
-      expected return of +20.6% vs. this group's +13.0% average" — so the percentage is never
-      left unexplained.</p>
-    <p>The per-name cap itself scales with your "max # of stocks" setting
-      (roughly <span style="font-family:ui-monospace,monospace;font-size:0.85em;">2 &divide; max_stocks</span>,
-      floored at 10%) — asking for more stocks doesn't just widen the selection pool in §6, it
-      also tightens how concentrated any single one is allowed to get here. If fewer than 2
-      selected names have enough real return history, or the optimizer fails to converge, sizing
-      falls back to a simpler risk-adjusted split (conviction discounted by each name's own
-      volatility) — the equal-weight comparison above still applies to that fallback too.</p>
+    <h2 id="weights">7. Sizing and portfolio limits</h2>
+    <p>Selected names are sized by <b>inverse volatility</b>: calmer stocks get more, so each
+      contributes more evenly to risk. There is deliberately no return forecast and no covariance
+      estimate here, because neither can be estimated reliably for a dozen stocks.</p>
+    <p>The per-name cap scales with your "max # of stocks" (roughly
+      <span style="font-family:ui-monospace,monospace;font-size:0.85em;">2 &divide; max_stocks</span>,
+      between 10% and 30% once a book holds 3 or more). Then two portfolio limits apply: at most
+      35% in one sub-industry, and a portfolio beta of at most 1.5. Any excess stays in cash.</p>
 
     <h2 id="risk">8. Risk check</h2>
     <p>Before anything is ever shown to you, a separate, deterministic (no LLM) check runs
-      against the proposed book: no single name may exceed its concentration limit (cash is
-      exempt), and the book must sum to exactly 100% — no stranded, undeployed budget. Either
-      violation vetoes the whole proposal and sends it back to be rebuilt, up to 3 times, before
-      giving up. This check cannot be argued with or reasoned around by either scoring path.</p>
+      against the proposed book: per-stock cap, sub-industry limit, beta limit, and that the
+      book adds up to 100% including cash. A violation vetoes the proposal. This check cannot be
+      argued with or reasoned around by either scoring path.</p>
 
     <h2 id="execution">9. Execution</h2>
     <p>"Launch as New Portfolio" is the only action that places real orders. Each selected name
@@ -1257,10 +1224,18 @@ risk_penalty = min(volatility &times; 3.0, 0.3)</div>
         against a real SPY buy-and-hold funded with the same starting capital — recomputed
         fresh on every page load, never simulated</li>
       <li>Marks every holding to a live current quote, shown alongside its real entry price</li>
-      <li>If you set a rebalance cadence at launch, a real Cloud Scheduler job checks daily for
-        portfolios that are due, re-runs this entire pipeline (stages 1-6) sized against the
-        portfolio's CURRENT mark-to-market value, and places real orders for the share delta
-        between what it holds now and the new target — not a fresh from-zero buy</li>
+      <li>If you set a rebalance cadence at launch, a real Cloud Scheduler job checks daily during
+        market hours for portfolios that are due, re-runs this entire pipeline (stages 1-6) sized
+        against the portfolio's CURRENT mark-to-market value, and places real orders for the share
+        delta between what it holds now and the new target, sells first. Changes under 0.5% of the
+        portfolio don't trade.</li>
+      <li>If you turn on the news watch, it checks daily whether a holding must be sold early, for
+        one of two reasons. The <b>stop</b>: below what was paid AND behind its sector, since
+        purchase, by 1.5 of its own monthly sigmas (about 17% for a 40%-volatility stock, 11% for a
+        25% one). Or <b>news</b> the model judges thesis-breaking, at most twice in 30 days. Only
+        that stock is sold and its slot filled; only a stop can go past the limit.</li>
+      <li>Every order is reviewed before it is placed: hard checks and the AI reviewer can block a
+        buy, on every trigger, and never block a sell</li>
       <li>Closing a portfolio sells every real holding and removes it from the Portfolio tab's
         list and dropdown (it stays reachable by direct link, just no longer part of ongoing
         tracking)</li>
@@ -1810,7 +1785,7 @@ def recommend_stream():
                     label = NODE_LABELS.get(node_name, f"Running {node_name}...")
                     yield f"data: {json.dumps({'step': label, 'node': node_name})}\n\n"
             final_state = _call_with_timeout(_remote_agent.get_final_state, thread_id=thread_id, timeout=60.0)
-            enrich(final_state, selected, capital)   # populates _LAST_CONTEXT
+            enrich(_finish_recommendation(final_state), selected, capital)   # populates _LAST_CONTEXT
             _LAST_CONTEXT["top_n"] = top_n           # the launch form must carry THIS, not the default
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as e:
@@ -1917,8 +1892,10 @@ def execute():
         from alpaca.trading.client import TradingClient
         from alpaca_clients import AlpacaBrokerClient
         from execution_workflow import Order, Side
+        from datetime import datetime, timezone
         import portfolio_store
 
+        launch_date = datetime.now(timezone.utc).date().isoformat()
         tc = TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True)   # PAPER ONLY, hardcoded
         broker = AlpacaBrokerClient(tc)
 
@@ -1989,7 +1966,8 @@ def execute():
                     real_shares = int(fill.filled_qty) if fill.filled_qty else shares
                     entry_price = (fill.filled_notional / real_shares) if fill.filled_notional and real_shares else price
                     holdings[r["name"]] = {"shares": real_shares, "entry_price": entry_price,
-                                           "cost": fill.filled_notional or real_shares * price}
+                                           "cost": fill.filled_notional or real_shares * price,
+                                           "entry_date": launch_date}
                     spent += holdings[r["name"]]["cost"]
                 elif result == "TIMEOUT":
                     pending_order_ids[r["name"]] = client_order_id
@@ -2105,7 +2083,10 @@ SIMULATE_PAGE = """
       <div class="stat {{ 'good' if result.total_return >= 0 else 'bad' }}">
         <div>AI strategy final value</div>
         <div class="big">${{ '{:,.0f}'.format(result.final_value) }}</div>
-        <div>{{ '%+.1f'|format(result.total_return*100) }}% total return</div>
+        <div>{{ '%+.1f'|format(result.total_return*100) }}% total return, after ${{ '{:,.0f}'.format(result.total_costs) }} of costs</div>
+        <div>Sharpe {{ '%.2f'|format(result.stats.sharpe) if result.stats.sharpe is not none else '—' }} ·
+          max drawdown {{ '%.1f'|format((result.stats.max_drawdown or 0)*100) }}% ·
+          turnover {{ '%.1f'|format(result.annual_turnover) }}x/yr · {{ result.n_stops }} stops</div>
       </div>
       <div class="stat">
         <div>Equal-weight buy &amp; hold (no rebalancing)</div>
@@ -2157,18 +2138,16 @@ SIMULATE_PAGE = """
   {% endif %}
 
   <div class="caveats">
-    <strong>What this simulation is — and isn't:</strong> it re-runs the SAME
-    allocation logic the live system uses (mandate_allocator's water-fill,
-    the same per-name caps, real strategist.theme_budgets() for multi-sector
-    tilting), scored at each rebalance ONLY on price history available up to
-    that date (no lookahead). Sector tilts here come from a SIMPLER momentum
-    average (not the live strategist's full multi-horizon decay model, which
-    is built around real calendar time/memory, not a historical replay).
-    It uses the HEURISTIC analyst scorer, not live Claude calls (too slow/
-    costly at every historical rebalance) and has NO historical news
-    sentiment (held at 0 every period). It ignores transaction costs,
-    slippage, and taxes. This is a same-logic backtest, not a guarantee,
-    forecast, or audited track record.
+    <strong>What this simulation is, and isn't:</strong> it runs the SAME rules as
+    live portfolios (rulebook.py: score, keep band, stops, re-entry block, sizing,
+    sub-industry and beta limits) on price history available at each date, net of
+    trading costs at {{ cost_bps|int }} bps per side. It can't replay three things:
+    the LLM's read and news verdicts (news is assumed clean, and the model's weight
+    is shared across the other factors), the earnings block, and point-in-time
+    fundamentals (quality, EPS and industry are today's, a mild lookahead). The
+    stock list is today's, so companies that failed or were removed are missing
+    (survivorship bias), which flatters results. No taxes. Not a guarantee, forecast
+    or audited track record.
   </div>
 
 </body>
@@ -2194,16 +2173,18 @@ def simulate_route():
     result, chart, error, rebalance_history = None, "", None, []
     if request.method == "POST":
         try:
-            from simulate import fetch_price_series, run_simulation
+            from simulate import fetch_price_series, rulebook_lookback_days, run_simulation
             symbols = [s for s, path, _ in UNIVERSE if path.split(".")[-1] in selected]
             # SPY fetched alongside the sector symbols in the SAME call — the
             # real, tradable S&P 500 comparison baseline (see
             # SimulationResult.spy_values' docstring for why SPY, not the
             # raw index). run_simulation() skips it gracefully if this
             # window has no SPY history.
-            series = fetch_price_series(symbols + ["SPY"], start, end, _ALPACA_API_KEY, _ALPACA_SECRET_KEY)
+            # The rules need a year of history BEFORE the first decision.
+            history_start = (date.fromisoformat(start) - timedelta(days=rulebook_lookback_days())).isoformat()
+            series = fetch_price_series(symbols + ["SPY"], history_start, end, _ALPACA_API_KEY, _ALPACA_SECRET_KEY)
             result = run_simulation(UNIVERSE, selected, series, capital,
-                                    all_sectors=list(SECTORS.keys()), top_n=top_n,
+                                    all_sectors=list(SECTORS.keys()), top_n=top_n, start=start,
                                     rebalance_every_days=int(rebalance), max_per_name=_max_per_name_for(top_n))
             chart = svg_multi_line_chart(result.dates, [
                 ("AI strategy", result.strategy_values, "#4a6cf7"),
@@ -2220,6 +2201,7 @@ def simulate_route():
         capital=capital, rebalance=rebalance, rebalance_options=REBALANCE_OPTIONS,
         top_n=top_n, universe_size=len(UNIVERSE), active_page="simulate",
         result=result, chart=chart, error=error, rebalance_history=rebalance_history,
+        cost_bps=rulebook.default_config().cost_bps,
     )
 
 
@@ -2772,22 +2754,23 @@ def _drop_and_resize(weights: Dict[str, float], exclude: Sequence[str], n: int, 
 
 def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "",
                           exclude: Sequence[str] = ()) -> Dict[str, Any]:
-    """The actual autopilot recalibration: re-runs the SAME recommendation
-    pipeline this portfolio was launched with (same sectors, same top_n),
-    sized against its CURRENT mark-to-market value — not the stale original
-    capital, so compounding gains/losses carry forward correctly — then
-    places REAL Alpaca orders for the SHARE DELTA between what it currently
-    holds and the new target (unlike launch's fresh from-zero buy, which
-    would double up on shares already held). Callable manually (see
-    /portfolios/<id>/recalibrate) or by the daily due-check
-    (/portfolios/recalibrate_due) that a Cloud Scheduler job hits, or by the
-    mid-day news watch (/portfolios/proactive_check). `trigger` ("manual" |
-    "scheduled" | "proactive") and `reason` are recorded on the history event
-    so the page shows WHY each recalibration happened. `exclude` (the news
-    watch's exit symbols) are sold if held and never bought: the
-    recommendation is asked for that many extra names, they are dropped, and
-    the rest is resized — otherwise its buy-the-dip scoring re-picks the very
-    names the news watch is rotating out of."""
+    """The actual recalibration, sized against the portfolio's CURRENT
+    mark-to-market value, placing REAL Alpaca orders for the SHARE DELTA between
+    what it holds and its new target. Callable manually
+    (/portfolios/<id>/recalibrate), by the daily due-check
+    (/portfolios/recalibrate_due) or by the news watch
+    (/portfolios/proactive_check). `trigger` ("manual" | "scheduled" | "proactive")
+    and `reason` are recorded on the history event.
+
+    Follows rulebook.py on every trigger: holdings inside the keep band stay,
+    anything sold in the last reentry_block_days isn't bought back, changes too
+    small to be worth their cost don't trade, and sells go first. Only runs while
+    the market is open, so orders fill at live prices rather than at the next
+    open at a price nobody saw.
+
+    `exclude` (the news watch's exits) makes it TARGETED: only those stocks are
+    sold, each slot goes to the best available name, and every other holding is
+    left exactly as it is."""
     import portfolio_store
     from datetime import datetime, timedelta, timezone
     from alpaca.trading.client import TradingClient
@@ -2797,6 +2780,12 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     p = portfolio_store.get_portfolio(portfolio_id)
     if p is None or p.get("status") != "open":
         return {"error": "Portfolio not found or already closed."}
+    try:
+        market_open = _market_open()
+    except Exception as e:
+        return {"error": f"Could not check market hours ({e}), so nothing was traded."}
+    if not market_open:
+        return {"error": "The market is closed. Recalibrations only trade during market hours."}
 
     # Size this rebalance off what the portfolio ACTUALLY holds. An earlier
     # recalibration's orders may have filled since its ledger was written;
@@ -2805,6 +2794,8 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     if p.get("pending_order_ids") and _reconcile_portfolio_orders(portfolio_id):
         p = portfolio_store.get_portfolio(portfolio_id) or p
 
+    rules = rulebook.default_config()
+    today = datetime.now(timezone.utc).date()
     old_holdings = p.get("holdings") or {}
     live = _live_prices(list(old_holdings.keys()))
     current_value = _mark_to_market(p, live)["mtm_value"]
@@ -2814,67 +2805,65 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     # (see backfill_n_stocks.py) keep their current count.
     n_stocks = int(p.get("n_stocks") or len(old_holdings) or p.get("top_n") or TOP_N_TOTAL)
     exclude = sorted({str(s).upper() for s in exclude or ()})
-    result = recommend(p["sectors"], n_stocks + len(exclude))
+    blocked = sorted(set(rulebook.reentry_blocked(p, today, rules)) | set(exclude))
+    result = recommend(p["sectors"], n_stocks,
+                       {"held": sorted(set(old_holdings) - set(exclude)), "blocked": blocked})
     weights = result.get("final_weights") or {}
-    if exclude:
-        weights = _drop_and_resize(weights, exclude, n_stocks, _max_per_name_for(n_stocks))
+    if set(weights) & set(blocked):               # the rule also holds if the agent didn't apply it
+        weights = _drop_and_resize(weights, blocked, n_stocks, _max_per_name_for(n_stocks))
+    notes = result.get("book_notes") or {}
     if not weights:
         return {"error": f"Recalibration produced no recommendation "
                          f"(status: {result.get('status')}, risk: {result.get('risk_verdict')})."}
+
+    kept: set = set()
+    if exclude:                                   # targeted: everything else stays exactly as it is
+        kept = set(old_holdings) - set(exclude)
+        current = {s: float(h.get("shares") or 0) * (live.get(s) or h.get("entry_price") or 0.0) / current_value
+                   for s, h in old_holdings.items()} if current_value > 0 else {}
+        fresh = sorted((s for s in weights if s not in old_holdings),
+                       key=lambda s: (-float((notes.get(s) or {}).get("conviction") or 0.0), -weights[s], s))
+        weights = rulebook.targeted_weights(current, exclude, fresh,
+                                            {s: (notes.get(s) or {}).get("industry") or "" for s in set(current) | set(fresh)},
+                                            {s: (notes.get(s) or {}).get("beta") for s in set(current) | set(fresh)}, rules)
 
     all_symbols = sorted(set(old_holdings) | set(weights.keys()))
     new_prices = _live_prices(all_symbols)
     tc = TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True)
     broker = AlpacaBrokerClient(tc)
 
-    # ---- evaluation agent (rec_evaluator.py): plan the orders with the SAME
-    # arithmetic as the loop below, review them, and skip only vetoed BUYs.
+    # ---- the orders: sells first, so a buy never waits on proceeds. Reviewed by
+    # the evaluation agent (rec_evaluator.py) before anything is placed.
     plan: List[Dict[str, Any]] = []
     for sym in all_symbols:
-        _px = new_prices.get(sym) or (old_holdings.get(sym) or {}).get("entry_price")
-        _cur = (old_holdings.get(sym) or {}).get("shares", 0)
-        if not _px:
+        px = new_prices.get(sym) or (old_holdings.get(sym) or {}).get("entry_price")
+        cur = (old_holdings.get(sym) or {}).get("shares", 0)
+        if not px or sym in kept:
             continue
-        _tgt = math.floor((current_value * weights.get(sym, 0.0)) / _px) if weights.get(sym, 0.0) > 0 else 0
-        if _tgt != _cur:
-            plan.append({"symbol": sym, "side": "BUY" if _tgt > _cur else "SELL", "qty": abs(_tgt - _cur),
-                         "price": _px, "current_shares": _cur})
-    notes = result.get("book_notes") or {}
+        tgt = math.floor((current_value * weights.get(sym, 0.0)) / px) if weights.get(sym, 0.0) > 0 else 0
+        if tgt == cur or rulebook.below_min_trade((tgt - cur) * px, current_value, tgt, rules):
+            continue
+        plan.append({"symbol": sym, "side": "BUY" if tgt > cur else "SELL", "qty": abs(tgt - cur),
+                     "price": px, "current_shares": cur})
+    plan.sort(key=lambda o: (o["side"] != "SELL", o["symbol"]))
     review = _review_plan(p, plan, weights, notes, trigger, reason)          # never raises
     vetoed = review.get("vetoed") or {}
 
-    rebalance_date = datetime.now(timezone.utc).date().isoformat()
-    new_holdings: Dict[str, Dict[str, float]] = {}
+    rebalance_date = today.isoformat()
+    new_holdings: Dict[str, Dict[str, Any]] = dict(old_holdings)   # anything not traded carries over untouched
     orders_placed: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
-    # Orders accepted but not yet resolved (e.g. placed after market hours)
-    # — same tracking close_portfolio_route() already relies on for
-    # launch-time orders, now also populated here so a future recalibration
-    # doesn't place a genuinely duplicate order for a still-pending one, and
+    # Orders accepted but not yet resolved — same tracking
+    # close_portfolio_route() relies on for launch-time orders, so a future
+    # recalibration doesn't place a duplicate of a still-pending order, and
     # closing the portfolio cancels these too instead of leaving them live.
     new_pending: Dict[str, str] = {}
 
-    for sym in all_symbols:
-        target_weight = weights.get(sym, 0.0)
-        price = new_prices.get(sym) or (old_holdings.get(sym) or {}).get("entry_price")
-        current_shares = (old_holdings.get(sym) or {}).get("shares", 0)
-        if not price:
-            if current_shares > 0:
-                new_holdings[sym] = old_holdings[sym]   # can't price it — leave untouched, don't lose track
+    for o in plan:
+        sym, qty, price, current_shares = o["symbol"], o["qty"], o["price"], o["current_shares"]
+        if o["side"] == "BUY" and sym in vetoed:        # the evaluator blocked this buy
             continue
-        target_shares = math.floor((current_value * target_weight) / price) if target_weight > 0 else 0
-        delta = target_shares - current_shares
-        if delta > 0 and sym in vetoed:                 # the evaluator's hard check blocked this buy
-            if current_shares > 0:
-                new_holdings[sym] = old_holdings[sym]
-            continue
-        if delta == 0:
-            if current_shares > 0:
-                new_holdings[sym] = old_holdings[sym]
-            continue
-
-        side = Side.BUY if delta > 0 else Side.SELL
-        qty = abs(delta)
+        side = Side.BUY if o["side"] == "BUY" else Side.SELL
         # Idempotency key includes the DATE, not just portfolio+symbol, so a
         # retried recalibration on the SAME day reuses this order, but the
         # NEXT scheduled recalibration (a different date) gets its own —
@@ -2885,50 +2874,45 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
         try:
             fill = broker.submit_and_await(order)
             fill_result = fill.result.value.upper()
-            orders_placed.append({"symbol": sym, "side": side.value.upper(), "qty": qty, "result": fill_result})
-            if fill_result not in ("FILLED", "PARTIAL"):
-                if current_shares > 0:
-                    new_holdings[sym] = old_holdings[sym]   # unresolved — keep tracking what we know we hold
+            # BUG FIX: a genuine PARTIAL fill means fewer shares actually
+            # traded than `qty` requested. Derive the real resulting share
+            # count from fill.filled_qty rather than the intended target.
+            real_qty = fill.filled_qty if fill.filled_qty else qty
+            traded = fill_result in ("FILLED", "PARTIAL")
+            orders_placed.append({"symbol": sym, "side": side.value.upper(), "qty": qty, "result": fill_result,
+                                  "price": price,
+                                  "fill_price": (fill.filled_notional / real_qty) if traded and fill.filled_notional and real_qty else None,
+                                  "notional": (fill.filled_notional or real_qty * price) if traded else None})
+            if not traded:
                 if fill_result == "TIMEOUT":
                     new_pending[sym] = client_order_id
                 continue
-            # BUG FIX: a genuine PARTIAL fill means fewer shares actually
-            # traded than `qty` requested — using `target_shares` (the
-            # INTENDED post-rebalance count) here assumed the delta order
-            # fully filled, which overstates real ownership on a partial
-            # BUY and understates it on a partial SELL, the same class of
-            # bug fixed in execute()/close_portfolio_route() above. Derive
-            # the real resulting share count from fill.filled_qty instead.
-            real_qty = fill.filled_qty if fill.filled_qty else qty
             actual_shares = current_shares + real_qty if side == Side.BUY else current_shares - real_qty
             if actual_shares <= 0:
-                continue   # fully sold — not carried into new_holdings
+                new_holdings.pop(sym, None)             # fully sold
+                continue
+            added_cost = fill.filled_notional or (real_qty * price)
             if side == Side.BUY and current_shares > 0:
-                # Blend cost basis: kept shares' original cost + newly bought shares' real fill cost.
-                old_cost = current_shares * old_holdings[sym]["entry_price"]
-                added_cost = fill.filled_notional or (real_qty * price)
+                # Blend cost basis and entry date: kept shares' + newly bought shares'.
+                old = old_holdings[sym]
+                old_cost = current_shares * old["entry_price"]
                 entry_price = (old_cost + added_cost) / actual_shares
+                entry_date = rulebook.blended_entry_date(old.get("entry_date"), old_cost, rebalance_date, added_cost)
             elif side == Side.BUY:
-                entry_price = (fill.filled_notional / real_qty) if fill.filled_notional and real_qty else price
-            else:   # partial or full SELL, shares remain — cost basis per share is unchanged
+                entry_price = added_cost / real_qty if real_qty else price
+                entry_date = rebalance_date
+            else:   # partial or full SELL, shares remain: cost basis per share is unchanged
                 entry_price = old_holdings[sym]["entry_price"]
+                entry_date = old_holdings[sym].get("entry_date")
             new_holdings[sym] = {"shares": actual_shares, "entry_price": entry_price,
-                                 "cost": actual_shares * entry_price}
+                                 "cost": actual_shares * entry_price, "entry_date": entry_date}
         except Exception as e:
             print(f"[web_ui] recalibration order failed for {sym}: {e}")
             errors.append({"symbol": sym, "error": str(e)})
-            if current_shares > 0:
-                new_holdings[sym] = old_holdings[sym]
 
-    # BUG FIX, confirmed live: this originally summed new_holdings' COST
-    # BASIS (h["cost"], what was originally paid) to figure out what's left
-    # as cash — but current_value is a MARK-TO-MARKET figure (current
-    # prices), not cost basis. For any position that had appreciated,
-    # current_value - cost_basis counts the unrealized GAIN as "leftover
-    # cash" too, and it compounds on every subsequent recalibration (a real
-    # test portfolio's cash inflated from $4,503 to $12,751 across two
-    # calls with no fills in between). Cash must be current_value minus the
-    # CURRENT MARKET VALUE of what's held, not what was paid for it.
+    # BUG FIX, confirmed live: cash must be current_value minus the CURRENT
+    # MARKET VALUE of what's held, not what was paid for it, or unrealized gains
+    # count as cash and compound on every recalibration.
     new_market_value = sum(
         (new_prices.get(sym) or old_holdings.get(sym, {}).get("entry_price", 0.0)) * h["shares"]
         for sym, h in new_holdings.items()
@@ -2950,7 +2934,7 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
                                     for o in plan if o["symbol"] in new_pending}},
               # what drove each pick — the scorecard attributes outcomes to these
               "signals": {s: {k: (notes.get(s) or {}).get(k) for k in
-                              ("dip_score", "drawdown_6m", "momentum_1m", "conviction", "rating", "quality_score")}
+                              ("dip_score", "drawdown_6m", "momentum_1m", "momentum_12_1", "conviction", "rating", "quality_score")}
                           for s in weights}},
         next_rebalance_date=next_date,
     )
@@ -2959,8 +2943,7 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
 
 @app.template_filter("et_time")
 def _et_time(iso: str) -> str:
-    """ISO timestamp -> 'HH:MM' New York time (scheduled recalibrations run
-    at 17:00 ET, the mid-day news watch around 12:30 ET)."""
+    """ISO timestamp -> 'HH:MM' New York time."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     try:
@@ -2984,7 +2967,7 @@ def recalibrate_route(portfolio_id: str):
     """Manual "Recalibrate Now" trigger — the same real logic the scheduled
     daily due-check runs automatically, just invoked on demand."""
     result = recalibrate_portfolio(portfolio_id, trigger="manual")
-    return portfolio_detail(portfolio_id)
+    return portfolio_detail(portfolio_id, notice=result.get("error"))
 
 
 _RECALIBRATE_TOKEN = None
@@ -3027,6 +3010,8 @@ def recalibrate_due_route():
 
     due = portfolio_store.list_due_portfolios()
     results = []
+    # Run this during market hours, e.g. --schedule "30 10 * * 1-5" --time-zone "America/New_York".
+    # With the market closed nothing trades and the portfolio stays due for the next run.
     for p in due:
         try:
             r = recalibrate_portfolio(p["id"], trigger="scheduled")
@@ -3073,7 +3058,7 @@ def _review_plan(p: Dict[str, Any], plan: List[Dict[str, Any]], weights: Dict[st
             print(f"[web_ui] reviewer headlines unavailable: {e}")
         track: List[str] = []
         try:
-            track = track_record_lines(_scorecard()[1])
+            track = track_record_lines(_scorecard()[1], min_trades=cfg.track_record_min_trades)
         except Exception as e:
             print(f"[web_ui] reviewer track record unavailable: {e}")
         client = None
@@ -3093,10 +3078,13 @@ def _daily_closes(symbols: List[str], start: Any) -> Dict[str, Dict[Any, float]]
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import Adjustment
     sc = apply_default_timeout(StockHistoricalDataClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
     out: Dict[str, Dict[Any, float]] = {}
     for i in range(0, len(symbols), 100):
+        # split-adjusted: a split inside the window must not look like a crash
         bars = sc.get_stock_bars(StockBarsRequest(symbol_or_symbols=symbols[i:i + 100], timeframe=TimeFrame.Day,
+                                                  adjustment=Adjustment.SPLIT,
                                                   start=datetime.combine(start, dtime(0), tzinfo=timezone.utc)))
         for sym, bs in (getattr(bars, "data", None) or {}).items():
             out[sym] = {b.timestamp.date(): float(b.close) for b in bs}
@@ -3113,21 +3101,35 @@ def _scorecard(max_age: float = 1800.0):
     if _SCORECARD["value"] is not None and time.monotonic() - _SCORECARD["at"] < max_age:
         return _SCORECARD["value"]
     import portfolio_store
-    from datetime import timedelta
-    from rec_evaluator import aggregate, decisions_from_portfolios, grade_decisions
+    from datetime import date, timedelta
+    from rec_evaluator import aggregate, decisions_from_portfolios, grade_decisions, portfolio_metrics
     sector_of = {sym: path.split(".")[-1] for sym, path, _ in UNIVERSE}
     pools: Dict[str, List[str]] = {}
     for sym, sector in sector_of.items():
         pools.setdefault(sector, []).append(sym)
-    decisions = decisions_from_portfolios(portfolio_store.list_portfolios(), sector_of)
+    portfolios = portfolio_store.list_portfolios()
+    decisions = decisions_from_portfolios(portfolios, sector_of)
     if not decisions:
         value = ([], aggregate([]))
     else:
         sectors = {d["sector"] for d in decisions}
-        syms = sorted({d["symbol"] for d in decisions} | {s for sec in sectors for s in pools.get(sec, [])} | {"SPY"})
-        closes = _daily_closes(syms, min(d["date"] for d in decisions) - timedelta(days=7))
+        syms = {d["symbol"] for d in decisions} | {s for sec in sectors for s in pools.get(sec, [])} | {"SPY"}
+        for p in portfolios:
+            syms |= set(p.get("initial_holdings") or {}) | set(p.get("holdings") or {})
+            for ev in p.get("rebalance_history") or []:
+                syms |= set(ev.get("holdings_after") or {})
+        starts = [d["date"] for d in decisions]
+        for p in portfolios:
+            created = rulebook._iso_date(p.get("created_at"))
+            if created:
+                starts.append(created)
+        closes = _daily_closes(sorted(syms), min(starts) - timedelta(days=7))
         graded = grade_decisions(decisions, closes, pools)
-        value = (graded, aggregate(graded))
+        agg = aggregate(graded)
+        today = date.today()
+        agg["portfolios"] = [m for m in (portfolio_metrics(p, closes, today) for p in portfolios
+                                         if p.get("status") == "open") if m]
+        value = (graded, agg)
     _SCORECARD.update(at=time.monotonic(), value=value)
     return value
 
@@ -3151,6 +3153,7 @@ EVALUATION_PAGE = """<!doctype html><html><head><meta name="viewport" content="w
 <p class="meta">Every buy and sell placed by a recalibration, graded on what the market did NEXT — the stock vs. its
   own sector (all its universe stocks, equal-weighted) over 1, 5 and 20 trading days. A buy is a hit if the stock beat
   its sector; a sell is a hit if it lagged after we sold. "Value added" is that gap (for sells, the loss avoided).
+  Hit rates and averages are weighted by trade size, graded from the fill price where recorded.
   Paper trading. Recalibrations made before signal tracking began show their signal as "unrecorded".
   <a href="/evaluation?refresh=1">Refresh now</a></p>
 {% if error %}<div class="warn">{{ error }}</div>{% endif %}
@@ -3165,6 +3168,19 @@ EVALUATION_PAGE = """<!doctype html><html><head><meta name="viewport" content="w
   {% for h in horizons %}{% set s = agg.overall[h] %}<div class="card"><div class="meta">{{ h }} trading day{{ 's' if h > 1 }} after</div>
     <div class="big {{ 'pos' if s.n and s.avg_value_added > 0 else 'neg' if s.n else '' }}">{{ '{:+.1%}'.format(s.avg_value_added) if s.n else '—' }}</div>
     <div class="meta">{{ s.n }} calls{% if s.n %} · {{ '{:.0%}'.format(s.hit_rate) }} hit rate{% endif %}</div></div>{% endfor %}
+  {% if agg.portfolios %}<h2>Portfolio record</h2>
+  <p class="meta">The stock book's own record since launch, excluding cash, before costs. Cost is an estimate at the rulebook's
+    cost per trade; a real account would also pay taxes on short-term gains.</p>
+  <div class="table-wrap"><table>
+    <tr><th></th><th>Return</th><th>SPY</th><th>Sharpe</th><th>Max drawdown</th><th>Turnover / yr</th><th>Est. cost</th></tr>
+    {% for m in agg.portfolios %}<tr><td><b>{{ m.name }}</b> <span class="meta">{{ m.days }} days</span></td>
+      <td class="{{ 'pos' if m['return'] >= m.spy_return else 'neg' }}">{{ '{:+.1%}'.format(m['return']) }}</td>
+      <td>{{ '{:+.1%}'.format(m.spy_return) }}</td>
+      <td>{{ '{:.2f}'.format(m.sharpe) if m.sharpe is not none else '—' }}</td>
+      <td>{{ '{:.1%}'.format(m.max_drawdown) if m.max_drawdown is not none else '—' }}</td>
+      <td>{{ '{:.1f}x'.format(m.annual_turnover) if m.annual_turnover is not none else '—' }}</td>
+      <td>${{ '{:,.0f}'.format(m.estimated_cost) }}</td></tr>{% endfor %}
+  </table></div>{% endif %}
   {{ table("By what triggered the recalibration", agg.by_trigger) }}
   {{ table("Buys, by the signal behind them", agg.by_signal) }}
   {{ table("Buys vs sells", agg.by_side) }}
@@ -3224,28 +3240,6 @@ def _headlines(symbol: str, days: int) -> List[str]:
         from alpaca_clients import AlpacaNewsClient
         _NEWS_CLIENT = AlpacaNewsClient(NewsClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
     return _NEWS_CLIENT.get_recent_headlines(symbol, days)
-
-
-def _closes_on(symbols: List[str], day: Any) -> Dict[str, float]:
-    """{symbol: daily close on `day`} — or on the last trading day before it,
-    when `day` was a weekend/holiday. Powers the news watch's 'performance
-    since the last recalibration' block and its lagging rule."""
-    from datetime import datetime, time as dtime, timedelta, timezone
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-    sc = apply_default_timeout(StockHistoricalDataClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY))
-    start = datetime.combine(day - timedelta(days=7), dtime(0), tzinfo=timezone.utc)
-    end = datetime.combine(day + timedelta(days=1), dtime(0), tzinfo=timezone.utc)
-    out: Dict[str, float] = {}
-    for i in range(0, len(symbols), 100):
-        bars = sc.get_stock_bars(StockBarsRequest(symbol_or_symbols=symbols[i:i + 100], timeframe=TimeFrame.Day,
-                                                  start=start, end=end))
-        for sym, bs in (getattr(bars, "data", None) or {}).items():
-            on_or_before = [b for b in bs if b.timestamp.date() <= day]
-            if on_or_before:
-                out[sym] = float(on_or_before[-1].close)
-    return out
 
 
 _NEWS_RAW = None
@@ -3315,7 +3309,7 @@ def proactive_check_route():
         portfolios.append(p)
     deps = ProactiveDeps(quotes_fn=_intraday_quotes, news_fn=_headlines, recalibrate_fn=recalibrate,
                          record_fn=portfolio_store.record_proactive_check, client_fn=client,
-                         market_open_fn=_market_open, news_many_fn=_headlines_many, history_fn=_closes_on)
+                         market_open_fn=_market_open, news_many_fn=_headlines_many, series_fn=_daily_closes)
     results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
     return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
             "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,
@@ -3367,11 +3361,11 @@ PORTFOLIO_DETAIL_PAGE = """
   <div class="paper-banner">📝 Alpaca PAPER account — not real money.</div>
   {% if p.status == 'open' %}
   <form method="post" action="/portfolios/{{ p.id }}/news_watch" style="margin:0 0 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"
-        {% if not p.news_watch %}onsubmit="return confirm('Turn on the mid-day news watch for {{ p.name }}? Each trading day at 12:30 ET it reads this portfolio\'s news and may recalibrate it (real paper orders) ahead of schedule.');"{% endif %}>
+        {% if not p.news_watch %}onsubmit="return confirm('Turn on the mid-day news watch for {{ p.name }}? Each trading day at 12:30 ET it may sell a holding (real paper orders) that hits its stop or has thesis-breaking news, and fill that slot.');"{% endif %}>
     <input type="hidden" name="enabled" value="{{ '0' if p.news_watch else '1' }}">
     <span style="font-size:0.9rem;">📰 Mid-day news watch:
       <b style="color:{{ '#00a340' if p.news_watch else '#888' }};">{{ 'ON' if p.news_watch else 'OFF' }}</b>
-      <span style="color:#6a7280;">{{ '— checks news daily at 12:30 ET and may recalibrate early' if p.news_watch else '— recalibrates only on schedule or when you click' }}</span></span>
+      <span style="color:#6a7280;">{{ '— checks daily at 12:30 ET and may sell a holding that hits its stop or has thesis-breaking news' if p.news_watch else '— recalibrates only on schedule or when you click' }}</span></span>
     <button type="submit" style="background:{{ '#fee' if p.news_watch else '#0d1117' }};color:{{ '#a3312f' if p.news_watch else '#fff' }};
             border:none;font-size:0.8rem;padding:6px 12px;border-radius:8px;cursor:pointer;font-weight:600;">
       {{ 'Turn off' if p.news_watch else 'Turn on' }}</button>
@@ -3566,7 +3560,7 @@ PORTFOLIO_DETAIL_PAGE = PORTFOLIO_DETAIL_PAGE.replace("<body>", "<body>\n" + TOP
 
 
 @app.route("/portfolios/<portfolio_id>")
-def portfolio_detail(portfolio_id: str):
+def portfolio_detail(portfolio_id: str, notice: Optional[str] = None):
     """Real day-by-day reconstruction of ONE tracked portfolio's value since
     launch, from its actual entry holdings + real historical Alpaca prices
     — compared against a SPY buy-and-hold funded with the same capital over
@@ -3589,7 +3583,7 @@ def portfolio_detail(portfolio_id: str):
     if p.get("status") == "open" and p.get("pending_order_ids") and _reconcile_portfolio_orders(portfolio_id):
         p = portfolio_store.get_portfolio(portfolio_id) or p
 
-    error, chart, spy_return = None, "", None
+    error, chart, spy_return = notice, "", None
     holdings = p.get("holdings") or {}
     symbols = list(holdings.keys())
     # Portfolios created before this field existed have NO

@@ -2,10 +2,10 @@
 test_evaluation.py
 ===================
 Drives the REAL web_ui Flask app to prove the evaluation agent is wired end
-to end: during a real recalibration the pre-trade reviewer blocks ONLY buys
-that fail a hard check (red-flag news, concentration), its advisory AI grade
-is stored and shown but never blocks, a broken reviewer never stops a
-recalibration, and the 🧪 Evaluation page grades past calls against their
+to end: during a real recalibration the pre-trade reviewer blocks buys that fail
+a hard check (red-flag news, concentration) or that the AI review objects to, on
+every trigger, never a sell; its grade is stored and shown; a broken reviewer
+never stops a recalibration, and the 🧪 Evaluation page grades past calls against their
 sector.
 
 Only the outside world is faked (same harness as test_proactive_recal.py).
@@ -43,7 +43,7 @@ def setup(weights, heads=None, reviewer=None):
     """One recalibration world: recommend() returns `weights`, the reviewer's
     headlines and model are faked."""
     base.world()
-    web_ui.recommend = lambda sectors, top_n: {"final_weights": weights, "status": "ok",
+    web_ui.recommend = lambda sectors, top_n, context=None: {"final_weights": weights, "status": "ok",
                                                "book_notes": {s: {"conviction": 0.7, "rating": "Buy",
                                                                   "momentum_1m": 0.03, "dip_score": 0.0,
                                                                   "rationale": f"{s} looks good"} for s in weights}}
@@ -88,7 +88,7 @@ if __name__ == "__main__":
     assert fake.docs["p1"]["rebalance_history"][-1]["review"]["vetoed"] == {} and bought("BBB")
     ok("BBB 50% of a 3-name book blocked; 60% of a 2-name book allowed (concentrated by design)")
 
-    print("SCENARIO C: the AI review is stored and shown, and its 'object' never blocks a trade")
+    print("SCENARIO C: the AI review is stored and shown, and its 'object' blocks that buy on a manual run too")
     rv = FakeReviewer({"grade": "C", "summary": "Chases BBB after a run-up.",
                        "orders": [{"symbol": "BBB", "verdict": "object", "reason": "Chasing a 30% run."},
                                   {"symbol": "CCC", "verdict": "agree", "reason": "Sound."},
@@ -97,8 +97,9 @@ if __name__ == "__main__":
     setup({"BBB": 0.5, "CCC": 0.4}, reviewer=rv)
     c.post("/portfolios/p1/recalibrate")
     review = fake.docs["p1"]["rebalance_history"][-1]["review"]
-    assert review["grade"] == "C" and review["model"] == "fake-reviewer" and review["vetoed"] == {}
-    assert bought("BBB"), "advisory: the AI's objection does not block"
+    assert review["grade"] == "C" and review["model"] == "fake-reviewer" and list(review["vetoed"]) == ["BBB"]
+    assert not bought("BBB") and bought("CCC"), "the same on every trigger: an objection blocks that buy only"
+    assert any(s == "AAA" and side == "sell" for s, side, _ in FakeTradingClient.submitted), "a sell is never blocked"
     prompt = rv.calls[0]["messages"][0]["content"]
     assert "BUY" in prompt and "BBB looks good" in prompt and "Trigger: manual" in prompt
     html = c.get("/portfolios/p1").get_data(as_text=True)
@@ -107,7 +108,7 @@ if __name__ == "__main__":
     assert "CCC: Sound." not in html, "agreements aren't listed — only concerns and objections"
     signals = fake.docs["p1"]["rebalance_history"][-1]["signals"]
     assert set(signals) == {"BBB", "CCC"} and signals["BBB"]["conviction"] == 0.7, "signals stored for the scorecard"
-    ok("grade C + objection logged and rendered; BBB still bought; signals recorded per pick")
+    ok("grade C + objection logged and rendered; BBB blocked, CCC bought; signals recorded per pick")
 
     print("SCENARIO D: a broken reviewer never stops a recalibration")
     fake = install(base.doc(pending_order_ids={}))
@@ -130,7 +131,7 @@ if __name__ == "__main__":
     closes.update({"NVDA": path(100, 0.01), "INTC": path(100, -0.01), "SPY": path(500, 0.001)})
     web_ui._daily_closes = lambda syms, start: closes
     web_ui._SCORECARD.update(at=-1e9, value=None)
-    fake = install(base.doc(pending_order_ids={}, rebalance_history=[
+    fake = install(base.doc(pending_order_ids={}, created_at="2026-09-01T15:00:00+00:00", rebalance_history=[
         {"date": "2026-09-02", "trigger": "scheduled", "portfolio_value_before": 1.0,
          "orders": [{"symbol": "NVDA", "side": "BUY", "qty": 5, "result": "FILLED"},
                     {"symbol": "INTC", "side": "SELL", "qty": 5, "result": "FILLED"}],
@@ -141,9 +142,11 @@ if __name__ == "__main__":
     html = c.get("/evaluation").get_data(as_text=True)
     assert "🧪 How good have the recommendations been?" in html and 'class="active"' in html.split("🧪 Evaluation")[0][-120:]
     for needle in ("By what triggered the recalibration", "scheduled", "proactive", "Buys, by the signal behind them",
-                   "dip", "momentum", "BUY NVDA", "SELL INTC", "BUY INTC", "67%"):
+                   "dip", "momentum", "BUY NVDA", "SELL INTC", "BUY INTC", "Portfolio record", "Turnover"):
         assert needle in html, needle
     graded, agg = web_ui._scorecard()
+    assert f"{agg['overall'][5]['hit_rate']:.0%}" in html and agg["overall"][5]["hit_rate"] > 0.67, "weighted by trade size"
+    assert agg["portfolios"][0]["name"] == "Test PF"
     assert agg["by_signal"]["dip"][5]["hit_rate"] == 1.0 and agg["by_signal"]["momentum"][5]["hit_rate"] == 0.0
     assert agg["by_trigger"]["proactive"][5]["avg_value_added"] < 0
     ok(f"3 calls graded: hit rate {agg['overall'][5]['hit_rate']:.0%} at 5 days; dip buy hit, momentum buy missed")

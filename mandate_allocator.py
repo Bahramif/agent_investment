@@ -10,13 +10,14 @@ The contract:
     the sub-limits (per-name cap, diversification floor).
   * Instrument selection is entirely the agents' — the user never names a ticker.
 
-Within an already-selected bucket of names, sizing tries a REAL mean-variance
-optimizer first (portfolio_optimizer.py — genuinely covariance-aware, sees
-when top picks would move in lockstep), falling back to a transparent,
-capped, score-weighted "water-fill" (stdlib only) whenever the optimizer
-can't run (no scipy, too little return history, solver failure) — see
-_allocate_within_bucket below. The constraint plumbing around either one
-(locked buckets, per-name caps, theme tilts) is the part that stays fixed.
+Which names and how much of each follow rulebook.py, the same rules the news
+watch and the backtest use: selection with a keep band and re-entry blocks,
+inverse-volatility sizing, and sub-industry and beta limits. What a limit won't
+let the book hold stays as CASH.
+
+`default_limits` may carry the portfolio's context: "held" (its current stocks,
+for the keep band), "blocked" (stocks that must not be bought) and "rulebook"
+(a config override, used by the backtest).
 
 `load_mandate` needs PyYAML (`pip install pyyaml`); everything else is stdlib.
 """
@@ -24,8 +25,10 @@ _allocate_within_bucket below. The constraint plumbing around either one
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+import rulebook
 from strategist import ThemeTilt, theme_budgets
 
 
@@ -52,21 +55,23 @@ class Signal:
     # consensus (fundamentals.get_analyst_forecast) when coverage exists,
     # falling back to a heuristic/Claude-generated estimate when it
     # doesn't — see analyst_reasoning.py / claude_reasoning.py.
+    # DISPLAY ONLY: neither ranks nor sizes anything.
     expected_return: float = 0.0
     rating: str = ""
     analyst_count: int = 0   # 0 when expected_return/rating came from the heuristic/Claude
                             # fallback rather than real analyst coverage — see analyst_reasoning.py
-    # Real daily returns over analyst_reasoning's lookback window, carried
-    # through from InstrumentSnapshot.returns_window so a real optimizer
-    # (see _optimize_weights below) can build an ACTUAL covariance matrix
-    # across whichever names survive top-N selection, instead of only ever
-    # seeing each name's own volatility in isolation.
-    returns_window: List[float] = field(default_factory=list)
-    # Buy-the-dip read (analyst_reasoning.dip_opportunity): 0 = not a dip
-    # opportunity; >0 = a quality name trading well below its recent high
-    # with an intact outlook. drawdown_6m is the distance from that high.
+    # Pullback credit (rulebook.pullback_credit): 0 = none; up to 1 = a meaningful,
+    # steadying pullback in an intact uptrend with clean news.
     dip_score: float = 0.0
     drawdown_6m: float = 0.0
+    # Rulebook inputs
+    momentum_12_1: Optional[float] = None
+    earnings_yield: Optional[float] = None
+    industry: str = ""
+    beta: Optional[float] = None
+    earnings_date: Optional[str] = None
+    eligible: bool = True
+    ineligible_reason: str = ""
 
 
 @dataclass
@@ -103,206 +108,48 @@ def _under(path: str, prefix: str) -> bool:
     return prefix == "" or path == prefix or path.startswith(prefix + ".")
 
 
-def _top_n(items: List[Tuple[str, float]], n: Optional[float]) -> List[Tuple[str, float]]:
-    """Keep only the N highest-conviction candidates before water-filling.
-    Without this, a large candidate pool with closely-clustered scores (a
-    real symptom of the heuristic scorer at S&P-500 scale — see
-    universe.py) spreads the budget near-equally across dozens of names
-    instead of concentrating on the agents' actual top picks.
+def _cfg(defaults: Dict[str, Any]) -> rulebook.RulebookConfig:
+    return rulebook.config_from_dict(defaults["rulebook"]) if defaults.get("rulebook") else rulebook.default_config()
 
-    BUG FIX #1: a mandate arriving through a real deployed query() call has
-    already round-tripped through JSON/proto, where EVERY number becomes a
-    float — confirmed live: a literal int 12 came back as 12.0. list[:12.0]
-    raises "slice indices must be integers" — int()-coerce here rather than
-    trusting the caller's type, since this is exactly the kind of mandate
-    value (like min_names, max_per_name) that legitimately arrives this way.
 
-    BUG FIX #2, confirmed live: ranking among ALL items (including
-    zero-or-negative-scored ones) can let a candidate with score <= 0 take
-    one of the N slots. _water_fill assigns that candidate EXACTLY zero
-    (it's a proportional split — 0 conviction gets 0 share of the budget,
-    every time) and then filters it out entirely (`w > 1e-9`), so the
-    caller silently ends up funding FEWER than N names even when N genuinely
-    positive-scoring candidates existed — e.g. "top 5" requested, one of the
-    raw top-5-by-rank has conviction 0.0, only 4 actually get capital.
-    Ranking among positive-scored candidates only means a weaker-but-real
-    candidate takes that slot instead, so N slots go to N fundable names
-    whenever that many exist. Only when FEWER than N candidates have any
-    positive conviction at all do we fall back to the full pool — matching
-    _water_fill's own equal-weight-when-nobody-has-conviction behavior
-    rather than returning nothing to allocate."""
+def _select(signals: List["Signal"], n: Optional[float], defaults: Dict[str, Any]) -> List["Signal"]:
+    """rulebook.select_names over these signals, for the N a mandate asks for
+    (it may arrive as a float: every number that crosses JSON does). With no N,
+    every eligible, unblocked name is selected."""
+    cfg = _cfg(defaults)
+    blocked = set(defaults.get("blocked") or [])
+    pool = [s for s in signals if s.eligible and s.name not in blocked]
     if not n or n <= 0:
-        return items
-    n = int(n)
-    positive = [item for item in items if item[1] > 0]
-    pool = positive if positive else items
-    if len(pool) <= n:
         return pool
-    return sorted(pool, key=lambda x: -x[1])[:n]
+    today = rulebook._iso_date(defaults.get("as_of")) or date.today()
+    names = rulebook.select_names(pool, int(n), defaults.get("held") or [], blocked, cfg, today)
+    by_name = {s.name: s for s in pool}
+    return [by_name[x] for x in names]
 
 
-RISK_AVERSION = 2.0   # tunable: how hard per-name volatility discounts water-fill share
-
-
-def _risk_adjusted_score(s: "Signal") -> float:
-    """WEIGHT OPTIMIZATION: an inverse-volatility tilt on top of raw
-    conviction, applied only at the water-fill stage (i.e. how much of the
-    ALREADY-SELECTED budget each name gets) — NOT at _top_n, which still
-    ranks/selects by raw conviction alone. Two names with equal conviction
-    split budget in inverse proportion to their volatility, so the calmer
-    one gets the bigger slice of the same conviction.
-
-    Deliberately simple, same honesty caveat as analyst_reasoning.py's own
-    per-instrument volatility penalty and this module's docstring: this is
-    risk-AWARE sizing using each name's OWN volatility, not a real
-    portfolio-level optimizer that weighs correlations between holdings
-    (mean-variance/Black-Litterman remains the flagged production upgrade)."""
-    return s.score / (1.0 + max(s.volatility, 0.0) * RISK_AVERSION)
-
-
-def _weight_rationale(sig: "Signal", weight: float, budget: float, cap: float,
-                      peers: List["Signal"], equal_weight_won: bool = False) -> str:
-    """One-line answer to "why THIS weight" — not "why this name" (that's
-    Signal.rationale). Benchmarks the actual weight against an equal-weight
-    baseline (what this name would get if conviction/return/risk didn't
-    matter at all) and names the driver: expected return relative to the
-    other names it was weighed against, then volatility as a secondary
-    factor — the same two inputs portfolio_optimizer.py's objective
-    actually optimizes over (mu, Sigma), stated in plain language instead
-    of left implicit in a percentage.
-
-    CAP-BOUND CASE, handled explicitly rather than left to produce a
-    misleading message: when the per-name cap binds (uncapped equal-weight
-    would exceed it), EVERY name in a small/undiversified group can land at
-    exactly the same capped weight regardless of how much better one name's
-    numbers are — confirmed live: a 3-name group under a 10% cap put NVDA
-    (the best expected return) at the same 10% as the others, and the
-    naive "below baseline" framing read as if its strong numbers were a
-    NEGATIVE, backwards from what actually happened. Report the cap as the
-    reason instead of a fabricated relative-attractiveness story.
-
-    equal_weight_won: True when _allocate_within_bucket's guardrail
-    overrode the optimizer/water-fill result because a plain equal split
-    projected a HIGHER weighted return for this group than the sizing
-    method's own output — said outright rather than left to look like an
-    ordinary "in line with baseline" coincidence."""
-    n = len(peers)
-    if n == 0 or budget <= 1e-12:
-        return ""
-    uncapped_equal_weight = budget / n
-    equal_weight = min(uncapped_equal_weight, cap)
-    avg_return = sum(p.expected_return for p in peers) / n
-    avg_vol = sum(p.volatility for p in peers) / n
-    ret_diff = sig.expected_return - avg_return
-    vol_diff = sig.volatility - avg_vol
-
-    drivers = []
-    if abs(ret_diff) >= 0.01:
-        drivers.append(f"expected return of {sig.expected_return:+.1%} vs. this group's {avg_return:+.1%} average")
-    if abs(vol_diff) >= 0.005:
-        cmp_word = "higher" if vol_diff > 0 else "lower"
-        drivers.append(f"{cmp_word} volatility ({sig.volatility:.1%} vs. {avg_vol:.1%} avg)")
-    driver_text = ", and ".join(drivers) if drivers else "roughly average expected return and risk within this group"
-
-    if equal_weight_won:
-        return (f"Sized at {weight:.1%}, an equal split across this {n}-name group — the optimizer's own "
-                f"tilted weights would have projected a LOWER combined expected return than just splitting "
-                f"evenly, so the equal split was used instead; {driver_text}.")
-
-    at_cap = weight >= cap - 1e-9 and cap < uncapped_equal_weight - 1e-9
-    if at_cap:
-        return (f"Sized at {weight:.1%} — hit the {cap:.0%} per-name position cap "
-                f"(this group's uncapped equal-weight baseline would be {uncapped_equal_weight:.1%}); "
-                f"{driver_text}.")
-
-    tilt_pp = (weight - equal_weight) * 100
-    if abs(tilt_pp) < 0.5:
-        return (f"Sized at {weight:.1%} — in line with the {equal_weight:.1%} equal-weight baseline "
-                f"for this {n}-name group; {driver_text}.")
-    direction = "above" if tilt_pp > 0 else "below"
-    return (f"Sized at {weight:.1%} — {abs(tilt_pp):.1f}pp {direction} the {equal_weight:.1%} "
-            f"equal-weight baseline for this {n}-name group, driven mainly by {driver_text}.")
-
-
-# DIVERSIFICATION FLOOR: every SELECTED name gets at least this fraction of an
-# equal-weight share (0.5 -> with 12 names, >= 4.2% each). Without it the
-# mean-variance optimizer filled the top names to the per-name cap and gave the
-# rest zero, so a portfolio set to "12 stocks" held 6 (and "6" held 3). 0 turns
-# the floor off (the old behaviour).
-MIN_WEIGHT_FRACTION = 0.5
-
-
-def _water_fill_with_floor(items: List[Tuple[str, float]], budget: float, cap: float,
-                           floor: float) -> Dict[str, float]:
-    """Everyone gets `floor` first; the rest is water-filled by score with
-    each name's remaining headroom (cap - floor)."""
-    if floor <= 1e-12 or not items:
-        return _water_fill(items, budget, cap)
-    base = {n: floor for n, _ in items}
-    extra = _water_fill(items, budget - floor * len(items), max(cap - floor, 0.0))
-    return {n: base[n] + extra.get(n, 0.0) for n in base}
+def _weight_rationale(sig: "Signal", weight: float, cap: float, peers: List["Signal"]) -> str:
+    """One line on why THIS weight (Signal.rationale says why this name)."""
+    vols = [p.volatility for p in peers if p.volatility]
+    if weight >= cap - 1e-9:
+        return f"Sized at {weight:.1%}, the {cap:.0%} per-stock cap."
+    if not sig.volatility or not vols:
+        return f"Sized at {weight:.1%}: a typical share, since its volatility isn't known."
+    avg = sum(vols) / len(vols)
+    word = "calmer" if sig.volatility < avg else "more volatile"
+    return (f"Sized at {weight:.1%} by volatility: {word} than this group "
+            f"({sig.volatility:.1%} daily vs. {avg:.1%} average), so less risky stocks get more.")
 
 
 def _allocate_within_bucket(signals_subset: List["Signal"], budget: float, cap: float,
                             book: "Book") -> Dict[str, float]:
-    """WEIGHT OPTIMIZATION entry point for an already-SELECTED set of names
-    (selection itself — _top_n, theme grouping — is untouched by this).
-    Tries the real mean-variance optimizer first (portfolio_optimizer.py) —
-    genuinely covariance-aware, so two "top pick" names that move in
-    lockstep don't both get full-size weight the way a per-name-only risk
-    tilt would allow — falling back to the pre-existing risk-adjusted
-    water-fill whenever the optimizer can't run (scipy missing, too little
-    return history, fewer than 2 usable names, solver non-convergence — see
-    portfolio_optimizer.optimize_weights's own docstring). Callers don't
-    need to know which path ran: on any failure this reduces to EXACTLY
-    what shipped before this function existed.
-
-    Also records WHY each weight is what it is (book.weight_rationale) —
-    computed the same way regardless of which path produced the weight,
-    since the question "how does this compare to equal-weight, and why"
-    is meaningful either way.
-
-    GUARDRAIL, always applied regardless of which path produced `w`: never
-    hand back a weighting whose OWN projected return (the weighted sum of
-    each name's expected_return — plain portfolio-expected-return math, no
-    risk term) is worse than simply splitting the same budget equally
-    across the same names. Mean-variance legitimately trades some return
-    for lower correlation/volatility, and the risk-adjusted water-fill
-    fallback sizes by conviction, not raw expected return either — both
-    can, in principle, land on a weighting an equal split would have beaten
-    on return alone. Comparing against that plain baseline and taking
-    whichever is actually better keeps the promise every per-name
-    "Sized at X% ... equal-weight baseline ..." rationale already makes:
-    that equal-weight is the thing being measured against, not just a
-    number quoted in a sentence."""
-    n_sel = len(signals_subset)
-    floor = min(cap, MIN_WEIGHT_FRACTION * budget / n_sel) if n_sel else 0.0
-    w = None
-    try:
-        from portfolio_optimizer import optimize_weights
-        w = optimize_weights(signals_subset, budget, cap, floor=floor)
-    except Exception:
-        w = None
-    if w is None:
-        w = _water_fill_with_floor([(s.name, _risk_adjusted_score(s)) for s in signals_subset], budget, cap, floor)
-
+    """Sizes an already-selected set of names: inverse volatility, capped per
+    name. Deliberately no return forecast and no covariance estimate: analyst
+    upside rises automatically when a price falls, and a covariance matrix for a
+    dozen stocks can't be estimated reliably. See rulebook.inverse_vol_weights."""
+    w = rulebook.inverse_vol_weights({s.name: s.volatility for s in signals_subset}, budget, cap)
     by_name = {s.name: s for s in signals_subset}
-    n = len(signals_subset)
-    equal_weight_won = False
-    if n > 0 and budget > 1e-12:
-        equal_w = min(budget / n, cap)
-        equal_weights = {s.name: equal_w for s in signals_subset}
-        opt_return = sum(w.get(name, 0.0) * sig.expected_return for name, sig in by_name.items())
-        equal_return = sum(equal_weights[name] * sig.expected_return for name, sig in by_name.items())
-        if equal_return > opt_return + 1e-9:
-            w = equal_weights
-            equal_weight_won = True
-
     for name, wt in w.items():
-        sig = by_name.get(name)
-        if sig is not None:
-            book.weight_rationale[name] = _weight_rationale(sig, wt, budget, cap, signals_subset,
-                                                             equal_weight_won=equal_weight_won)
+        book.weight_rationale[name] = _weight_rationale(by_name[name], wt, cap, signals_subset)
     return w
 
 
@@ -364,6 +211,7 @@ def allocate(mandate: Dict[str, Any], signals: List[Signal],
     defaults = mandate.get("default_limits", {})
     _alloc_children(mandate["buckets"], mandate.get("total", 1.0), "", signals,
                     defaults, book, theme_tilts or {})
+    _apply_limits(book, signals, defaults, mandate.get("total", 1.0))
     # Rationale/risk/scores/forecast aren't part of the weight math at all —
     # attach them after the fact, for whichever names actually made it into
     # the book, so the UI can show WHY a name was picked, not just its %.
@@ -377,9 +225,26 @@ def allocate(mandate: Dict[str, Any], signals: List[Signal],
                 "expected_return": s.expected_return, "rating": s.rating,
                 "analyst_count": s.analyst_count,
                 "dip_score": s.dip_score, "drawdown_6m": s.drawdown_6m,
+                "momentum_12_1": s.momentum_12_1, "earnings_yield": s.earnings_yield,
+                "industry": s.industry, "beta": s.beta, "earnings_date": s.earnings_date,
                 "weight_rationale": book.weight_rationale.get(s.name, ""),
             }
     return book
+
+
+def _apply_limits(book: Book, signals: List[Signal], defaults: Dict[str, Any], total: float) -> None:
+    """Sub-industry and beta limits on the finished book; whatever the book can't
+    hold, for these or any other reason, is CASH, so it always adds up."""
+    stocks = {n: w for n, w in book.weights.items() if n != rulebook.CASH}
+    by_name = {s.name: s for s in signals}
+    limited, notes = rulebook.apply_portfolio_limits(
+        stocks, {n: by_name[n].industry for n in stocks if n in by_name},
+        {n: by_name[n].beta for n in stocks if n in by_name}, defaults.get("max_per_name", 1.0), _cfg(defaults))
+    book.warnings.extend(notes)
+    cash = total - sum(limited.values())
+    book.weights = dict(limited)
+    if cash > 1e-9:
+        book.weights[rulebook.CASH] = cash
 
 
 def _alloc_children(children: Dict[str, Any], budget: float, parent_path: str,
@@ -416,22 +281,13 @@ def _alloc_children(children: Dict[str, Any], budget: float, parent_path: str,
         pool = [s for s in signals
                 if _under(s.path, parent_path) and not any(_under(s.path, lp) for lp in locked_paths)]
         cap = defaults.get("max_per_name", 1.0)
-        top_n = defaults.get("top_n")
         open_path = _join(parent_path, "*open*")
 
-        # GLOBAL top-N, confirmed as the intended behavior: "max # of
+        # GLOBAL selection, confirmed as the intended behavior: "max # of
         # stocks" caps the TOTAL number of positions across every open
-        # theme/sector COMBINED, not per theme — applying _top_n() inside
-        # each theme's own water-fill below (the previous behavior) meant
-        # selecting 3 sectors at top_n=5 funded 5 PER sector, 15 total,
-        # instead of 5 total. Cut the pool to its global top-N ONCE here,
-        # before grouping by theme, so every theme below competes for
-        # budget using only names that already survived the one shared cut
-        # — a theme whose stocks don't crack the global top-N simply gets
-        # none of the open budget, regardless of its macro tilt.
-        if top_n:
-            survivors = {name for name, _ in _top_n([(s.name, s.score) for s in pool], top_n)}
-            pool = [s for s in pool if s.name in survivors]
+        # theme/sector COMBINED, not per theme. Scores are within-sector
+        # percentiles, so stocks from different sectors compare fairly here.
+        pool = _select(pool, defaults.get("top_n"), defaults)
 
         themes = _group_by_theme(pool, parent_path)
         tilted_themes = {th: theme_tilts[th] for th in themes if th in theme_tilts}
@@ -471,9 +327,7 @@ def _alloc_children(children: Dict[str, Any], budget: float, parent_path: str,
             w: Dict[str, float] = {}
             for th in themes:
                 b = final_budgets.get(th, 0.0)
-                # top_n already applied globally above — NOT re-applied per
-                # theme here, or a theme with few survivors could still
-                # water-fill down to fewer names than its own count anyway.
+                # selection already applied globally above, not per theme
                 fill = _allocate_within_bucket(themes[th], b, cap, book)
                 w.update(fill)
                 tag = tilted_themes.get(th)
@@ -517,16 +371,14 @@ def _alloc_bucket(name: str, node: Dict[str, Any], budget: float, path: str,
         return
 
     limits = {**defaults, **node.get("limits", {})}
-    insts = [(s.name, s.score) for s in signals if _under(s.path, path)]
+    insts = [s for s in signals if _under(s.path, path)]
     if not insts:                                        # e.g. cash: no instruments to pick
         book.add(name.upper(), budget)
         book.buckets.append(BucketReport(path, set_by, node.get("weight"), budget, "no instruments"))
         return
 
-    top = _top_n(insts, limits.get("top_n"))            # selection: ranked by raw conviction
-    by_name = {s.name: s for s in signals}
-    subset = [by_name[n] for n, _ in top]
-    w = _allocate_within_bucket(subset, budget, limits.get("max_per_name", 1.0), book)   # sizing: real optimizer w/ fallback
+    subset = _select(insts, limits.get("top_n"), limits)
+    w = _allocate_within_bucket(subset, budget, limits.get("max_per_name", 1.0), book)
     for n, wt in w.items():
         book.add(n, wt)
     book.buckets.append(BucketReport(path, set_by, node.get("weight"), sum(w.values()),
@@ -594,27 +446,25 @@ if __name__ == "__main__":
             print(f"  ! {w}")
 
     print("\n" + "=" * 70)
-    print("TEST: diversification floor — a '12 stocks' book holds 12, not 6")
+    print("TEST: a '12 stocks' book holds 12, sized by inverse volatility")
     print("=" * 70)
-    import random as _random
-    import mandate_allocator as _ma
-    _rng = _random.Random(7)
-    sigs12 = [Signal(f"N{i:02d}", "equities.tech_ai", 0.9 - 0.03 * i, expected_return=0.30 - 0.02 * i,
-                     returns_window=[_rng.gauss(0.001, 0.02) for _ in range(20)]) for i in range(12)]
-    cap12 = min(1.0, max(0.10, 2.0 / 12))                      # web_ui._max_per_name_for(12) = 16.7%
-    def funded(frac):
-        _ma.MIN_WEIGHT_FRACTION = frac
-        return _ma._allocate_within_bucket(sigs12, 1.0, cap12, _ma.Book())
-    old = funded(0.0)
-    new = funded(0.5)
-    _ma.MIN_WEIGHT_FRACTION = 0.5
-    print(f"  floor off: {len(old)} names funded {sorted(round(v, 3) for v in old.values())[-3:]}…")
-    print(f"  floor 0.5: {len(new)} names, min {min(new.values()):.1%}, max {max(new.values()):.1%}")
-    assert len(old) < 12, "reproduces the corner solution the floor fixes"
-    assert len(new) == 12 and min(new.values()) >= 0.5 / 12 - 1e-6 and max(new.values()) <= cap12 + 1e-6
-    assert abs(sum(new.values()) - 1.0) < 1e-6
-    assert new["N00"] > new["N11"], "the optimizer still tilts toward its favourites"
-    wf = _ma._water_fill_with_floor([(s.name, s.score) for s in sigs12], 1.0, cap12, 0.5 / 12)
-    assert len(wf) == 12 and abs(sum(wf.values()) - 1.0) < 1e-9 and min(wf.values()) >= 0.5 / 12 - 1e-12
-    assert max(wf.values()) <= cap12 + 1e-12
-    print("✓ every selected name funded at >= half an equal share; still tilted; fallback path floored too")
+    sigs12 = [Signal(f"N{i:02d}", "equities.tech_ai", 0.9 - 0.03 * i, volatility=0.01 + 0.002 * i) for i in range(14)]
+    m12 = {"total": 1.0, "default_limits": {"max_per_name": 1 / 6, "top_n": 12}, "buckets": {"equities": {"set_by": "user", "weight": 1.0}}}
+    b12 = allocate(m12, sigs12)
+    assert len(b12.weights) == 12 and abs(sum(b12.weights.values()) - 1.0) < 1e-9
+    assert b12.weights["N00"] > b12.weights["N11"] and max(b12.weights.values()) <= 1 / 6 + 1e-9
+    print(f"✓ 12 names, calmest {b12.weights['N00']:.1%}, wildest {b12.weights['N11']:.1%}")
+
+    print("TEST: ineligible and blocked names are out; holdings stay inside the keep band; 'blocked' beats 'held'")
+    sigs = [Signal(f"S{i}", "equities.tech_ai", 1.0 - i * 0.05, volatility=0.02) for i in range(10)]
+    sigs[0].eligible = False
+    m = {"total": 1.0, "default_limits": {"max_per_name": 0.5, "top_n": 3, "held": ["S5", "S1"], "blocked": ["S1", "S2"]},
+         "buckets": {"equities": {"set_by": "user", "weight": 1.0}}}
+    assert set(allocate(m, sigs).weights) == {"S5", "S3", "S4"}, allocate(m, sigs).weights
+    print("✓ ok")
+
+    print("TEST: limits leave the excess as CASH and the book still adds up")
+    beta = [Signal(f"B{i}", "equities.tech_ai", 0.9, volatility=0.02, beta=2.0) for i in range(4)]
+    bk = allocate({"total": 1.0, "default_limits": {"max_per_name": 0.5, "top_n": 4}, "buckets": {"equities": {"set_by": "user", "weight": 1.0}}}, beta)
+    assert abs(bk.weights[rulebook.CASH] - 0.25) < 1e-9 and abs(sum(bk.weights.values()) - 1.0) < 1e-9 and bk.warnings
+    print(f"✓ beta 2.0 book holds {1 - bk.weights[rulebook.CASH]:.0%} stocks, {bk.weights[rulebook.CASH]:.0%} cash")

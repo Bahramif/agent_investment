@@ -55,6 +55,9 @@ class _Ref:
         snap = _Snap(d, self.c.versions.get(self.pid)) if d is not None else _Snap(None, None)
         snap.id = self.pid                       # the real DocumentSnapshot exposes .id; get_portfolio() reads it
         return snap
+    def set(self, fields):
+        self.c.docs[self.pid] = copy.deepcopy(fields)
+        self.c.versions[self.pid] = self.c.versions.get(self.pid, 0) + 1
     def update(self, fields, option=None):
         if option is not None and option.last_update_time != self.c.versions.get(self.pid):
             raise RuntimeError("FailedPrecondition: document was modified")
@@ -84,7 +87,8 @@ if __name__ == "__main__":
     print("TEST 1: a pending BUY that later filled is added to holdings and paid for out of cash")
     d = doc(pending_order_ids={"CCC": "c1"}, cash_remaining=2_000.0)
     up = resolve_pending(d, {"CCC": fact("c1", "buy", "filled", 30, 25.0)})
-    assert up["holdings"]["CCC"] == {"shares": 30, "entry_price": 25.0, "cost": 750.0}
+    entered = up["holdings"]["CCC"].pop("entry_date")
+    assert up["holdings"]["CCC"] == {"shares": 30, "entry_price": 25.0, "cost": 750.0} and entered == up["log"][0]["at"][:10]
     assert up["cash_remaining"] == 1_250.0 and up["pending_order_ids"] == {}
     assert up["log"][0]["side"] == "BUY" and up["log"][0]["filled_qty"] == 30
     print("✓ CCC 30 @ 25.00 added; cash 2000 -> 1250; nothing pending")

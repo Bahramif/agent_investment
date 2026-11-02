@@ -5,7 +5,7 @@ Drives the REAL web_ui Flask app through /portfolios/proactive_check — the
 endpoint the mid-day Cloud Scheduler job hits — to prove the news watch is
 wired end to end: pending fills are reconciled first, the token is enforced,
 a material-news verdict runs a REAL recalibration (orders placed, history
-tagged "proactive" with the reason), quiet days and dry runs never trade, and
+tagged "proactive" with the reason, only the named stock sold), quiet days and dry runs never trade, and
 every check is logged and rendered on the portfolio page.
 
 Only the outside world is faked (same harness as
@@ -54,7 +54,7 @@ class FakeClaude:
                   content=[NS(type="tool_use", name="decide_recalibration", input=self.verdict)])
 
 
-YES = {"recalibrate": True, "confidence": 0.92, "urgency": "high", "key_symbols": ["AAA"],
+YES = {"recalibrate": True, "confidence": 0.92, "urgency": "high", "key_symbols": ["AAA"], "exit_symbols": ["AAA"],
        "reason": "AAA disclosed an SEC accounting probe and its CFO resigned — the thesis for the largest holding changed."}
 NEWS = {"AAA": ["AAA discloses SEC probe into revenue recognition", "AAA CFO resigns"]}
 
@@ -69,8 +69,7 @@ def world(news=None, verdict=YES, market_open=True):
         return {s: (news or {}).get(s, []) for s in syms}
     web_ui._headlines_many = many
     web_ui._market_open = lambda: market_open
-    web_ui._closes_on = lambda syms, day: {}            # no price history unless a scenario sets it
-    web_ui._daily_closes = lambda syms, start: {}       # the evaluator's scorecard: no history in these tests
+    web_ui._daily_closes = lambda syms, start: {}       # no price history unless a scenario sets it
     web_ui._SCORECARD.update(at=-1e9, value=None)    # the harness's fake Secret Manager returns "stub" for ANY secret; default
     # these worlds to "no anthropic-api-key" (absent, checked just now)
     web_ui._ANTHROPIC_KEY, web_ui._ANTHROPIC_KEY_CHECKED = None, time.monotonic()
@@ -79,9 +78,12 @@ def world(news=None, verdict=YES, market_open=True):
     anthropic.AnthropicVertex = lambda **kw: state["claude"].bind(dict(kw, via="vertex"))
     anthropic.Anthropic = lambda **kw: state["claude"].bind(dict(kw, via="anthropic"))
 
-    def fake_recommend(sectors, top_n):
+    state["contexts"] = []
+
+    def fake_recommend(sectors, top_n, context=None):
         state["recommend_calls"] += 1
-        return {"final_weights": {"BBB": 0.5, "CCC": 0.4}, "status": "ok"}
+        state["contexts"].append(context or {})
+        return {"final_weights": {"BBB": 0.4, "CCC": 0.3, "DDD": 0.2}, "status": "ok"}
     web_ui.recommend = fake_recommend
     return state
 
@@ -94,6 +96,8 @@ if __name__ == "__main__":
     web_ui._live_prices = lambda syms: {s: 12.0 for s in syms}
     harness.simulate.fetch_price_series = lambda *a, **k: {}
     c = web_ui.app.test_client()
+    REAL_RECOMMEND = web_ui.recommend
+    import portfolio_store as ps_store
 
     print("SCENARIO A: the endpoint is token-protected — it can place real orders")
     fake = install(doc())
@@ -118,13 +122,18 @@ if __name__ == "__main__":
         "default provider -> Gemini on this project"
     assert d["proactive_checks"][-1]["review"]["model"] == "fake-model", "the model that decided is recorded"
     prompt = st["claude"].calls[0]["messages"][0]["content"]
-    assert "AAA discloses SEC probe" in prompt and "AAA: " in prompt and "CCC: " in prompt, \
+    assert "AAA discloses SEC probe" in prompt and "- AAA: " in prompt and "- CCC: " in prompt, \
         "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"
+    assert {s for s, _, _ in FakeTradingClient.submitted} == {"AAA", "DDD"}, \
+        ("targeted: AAA sold, its slot filled, BBB and CCC not touched", FakeTradingClient.submitted)
+    assert d["holdings"]["BBB"]["shares"] == 50 and d["holdings"]["CCC"]["shares"] == 30 and "AAA" not in d["holdings"]
+    assert st["contexts"][0]["blocked"] == ["AAA"] and "AAA" not in st["contexts"][0]["held"]
     ok(f"orders {FakeTradingClient.submitted}; history tagged proactive; next scheduled date pushed to {d['next_rebalance_date']}")
 
     print("SCENARIO C: running again the same day still REVIEWS, but a 'recalibrate' verdict is flagged, not traded")
     n_orders, n_calls = len(FakeTradingClient.submitted), len(st["claude"].calls)
     web_ui._headlines_many = lambda syms, days: {"BBB": ["BBB recalls its flagship product"]}   # AAA was sold in B
+    st["claude"].verdict = {**YES, "exit_symbols": ["BBB"]}
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
     assert r["results"][0]["action"] == "flagged" and "already recalibrated today" in r["results"][0]["reason"], r
     assert len(st["claude"].calls) == n_calls + 1, "the model reviewed the news again"
@@ -248,22 +257,81 @@ if __name__ == "__main__":
     ps.create_portfolio = real_create
     ok("checked -> news_watch=True, unchecked -> False")
 
-    print("SCENARIO K: EXIT symbols — sold, never bought back, replaced by the next-best names")
+    print("SCENARIO K: EXITS are targeted: each slot goes to the best available name, the rest stays as it is")
     fake = install(doc())                            # after reconciling: AAA 60, BBB 50, CCC 30 -> a 3-stock book
     st = world(news=NEWS, verdict={**YES, "exit_symbols": ["AAA", "BBB"]})
     asked = []
-    def ranked(sectors, top_n):
-        asked.append(top_n)
-        return {"final_weights": {"BBB": 0.25, "CCC": 0.25, "DDD": 0.20, "EEE": 0.16, "FFF": 0.14}, "status": "ok"}
+    def ranked(sectors, top_n, context=None):
+        asked.append((top_n, context))
+        return {"final_weights": {"CCC": 0.4, "DDD": 0.35, "EEE": 0.25}, "status": "ok",
+                "book_notes": {"DDD": {"conviction": 0.9}, "EEE": {"conviction": 0.8}}}
     web_ui.recommend = ranked
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
-    assert r["results"][0]["action"] == "recalibrated" and "Exiting: AAA, BBB." in r["results"][0]["reason"], r
-    assert asked == [5], "3 stocks + 2 exits asked for, so the book still ends up with 3"
-    ev = fake.docs["p1"]["rebalance_history"][-1]
+    assert r["results"][0]["action"] == "recalibrated" and "Selling: AAA, BBB." in r["results"][0]["reason"], r
+    assert asked == [(3, {"held": ["CCC"], "blocked": ["AAA", "BBB"]})], asked
+    d = fake.docs["p1"]
+    ev = d["rebalance_history"][-1]
     assert ev["excluded"] == ["AAA", "BBB"] and set(ev["target_weights"]) == {"CCC", "DDD", "EEE"}, ev["target_weights"]
-    assert all(abs(w - 1 / 3) < 1e-9 for w in ev["target_weights"].values()), ev["target_weights"]
-    trades = {(sym, side) for sym, side, _ in FakeTradingClient.submitted}
-    assert ("AAA", "sell") in trades and ("BBB", "sell") in trades and not {s for s, side in trades if side == "buy"} & {"AAA", "BBB"}
-    ok(f"asked for 5, kept CCC/DDD/EEE at 33% each; orders {sorted(trades)}")
+    trades = [(sym, side) for sym, side, _ in FakeTradingClient.submitted]
+    assert "CCC" not in {s for s, _ in trades} and d["holdings"]["CCC"]["shares"] == 30, "the third holding isn't touched"
+    assert [side for _, side in trades] == ["sell", "sell", "buy", "buy"], ("sells go first", trades)
+    assert d["holdings"]["DDD"]["entry_date"] == TODAY.isoformat(), "'since purchase' starts at the purchase"
+    ok(f"orders {trades}")
+
+    print("SCENARIO L: what was sold can't come back for 30 days, whatever sold it; a bad agent answer can't undo that")
+    d["rebalance_history"][-1]["date"] = (TODAY - timedelta(days=10)).isoformat()   # no longer today
+    FakeTradingClient.submitted = []
+    seen_ctx = []
+    def stale_agent(sectors, top_n, context=None):                      # an agent that ignores the block
+        seen_ctx.append(context)
+        return {"final_weights": {"AAA": 0.4, "CCC": 0.3, "DDD": 0.3}, "status": "ok"}
+    web_ui.recommend = stale_agent
+    c.post("/portfolios/p1/recalibrate")
+    assert seen_ctx[0]["blocked"] == ["AAA", "BBB"], seen_ctx
+    assert "AAA" not in {s for s, side, _ in FakeTradingClient.submitted if side == "buy"}, FakeTradingClient.submitted
+    assert "AAA" not in fake.docs["p1"]["holdings"]
+    ok("blocked names reach the agent, and are dropped here even if it returns them")
+
+    print("SCENARIO M: nothing trades with the market closed; a due portfolio stays due for the next run")
+    fake = install(doc(next_rebalance_date=TODAY.isoformat(), pending_order_ids={}))
+    st = world(market_open=False)
+    r = c.post("/portfolios/recalibrate_due", headers=TOKEN).get_json()
+    assert "market is closed" in r["results"][0]["error"] and not FakeTradingClient.submitted, r
+    assert fake.docs["p1"]["next_rebalance_date"] == TODAY.isoformat() and st["recommend_calls"] == 0
+    html = c.post("/portfolios/p1/recalibrate").get_data(as_text=True)
+    assert "market is closed" in html, "the button says why nothing happened"
+    ok("deferred; the manual button shows the reason")
+
+    print("SCENARIO N: a small change doesn't trade; closing a position always does")
+    fake = install(doc(pending_order_ids={}, cash_remaining=0.0,
+                       holdings={"AAA": {"shares": 500, "entry_price": 10.0, "cost": 5000.0},
+                                 "BBB": {"shares": 500, "entry_price": 10.0, "cost": 5000.0},
+                                 "ZZZ": {"shares": 10, "entry_price": 10.0, "cost": 100.0}}))
+    world()
+    web_ui.recommend = lambda sectors, top_n, context=None: {"final_weights": {"AAA": 0.495, "BBB": 0.498}, "status": "ok"}
+    c.post("/portfolios/p1/recalibrate")
+    assert [(s, side) for s, side, _ in FakeTradingClient.submitted] == [("ZZZ", "sell")], FakeTradingClient.submitted
+    ok("0.3% resizes skipped; the 1% position closed in full")
+
+    print("SCENARIO O: CASH from the rulebook's limits is never priced or ordered; strategist views persist")
+    fake = install(doc(pending_order_ids={}))
+    world()
+    state_seen = {}
+    def remote_query(thread_id, state):
+        state_seen.update(state)
+        return {"final_weights": {"BBB": 0.3, "CCC": 0.3, "CASH": 0.4}, "status": "ok",
+                "theme_memory": {"tech_ai": {"theme": "tech_ai", "strategic": {"raw": 0.1}, "tactical": {"raw": 0.0}}}}
+    web_ui._remote_agent.query = remote_query
+    web_ui.recommend = REAL_RECOMMEND
+    web_ui._call_with_timeout = lambda fn, *a, timeout=None, **k: fn(*a, **k)
+    c.post("/portfolios/p1/recalibrate")
+    assert "CASH" not in {s for s, _, _ in FakeTradingClient.submitted}, FakeTradingClient.submitted
+    assert "CASH" not in fake.docs["p1"]["rebalance_history"][-1]["target_weights"]
+    assert state_seen["theme_memory"] == {} and state_seen["mandate"]["default_limits"]["held"] == ["AAA", "BBB"]
+    first_saved = ps_store.get_strategist_memory()
+    assert first_saved["theme_memory"]["tech_ai"]["strategic"]["raw"] == 0.1 and first_saved["saved_at"]
+    thread, state2 = web_ui._build_recommend_state(["tech_ai"], 3)
+    assert state2["theme_memory"]["tech_ai"]["strategic"]["raw"] == 0.1 and 0 <= state2["elapsed_days"] < 1
+    ok("cash stays cash; sector views saved and re-read, so a strategic review lasts until it's due")
 
     print("\nAll proactive-recalibration integration scenarios passed.")

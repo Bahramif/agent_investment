@@ -14,43 +14,49 @@
 
 total: 1.0
 
-default_limits:            # apply inside every bucket unless a bucket overrides
-  max_per_name: 0.10       # no single instrument above 10% of the total portfolio
-  min_names: 3             # diversification floor per funded bucket
+default_limits:
+  min_names: 1
 
 buckets:
-
+  # What the app actually runs: a portfolio is 100% equities across the sectors
+  # chosen at launch, with no forced cash. Cash only comes from the rulebook's
+  # limits below and from whole-share rounding. (Per-stock caps scale with the
+  # number of stocks: web_ui._max_per_name_for.)
   equities:
     set_by: user
-    weight: 0.50
-    band: 0.05
-    children:
-      tech_ai:             # user drills in: locks a quarter of the book to AI/tech
-        set_by: user
-        weight: 0.25
-        band: 0.05
-        limits: { max_per_name: 0.08 }
-    # equities has a locked child summing to 0.25, so the remaining 0.25 of the
-    # equity sleeve is OPEN — agents place it across any equity names they have
-    # conviction in (energy, industrials, ...). Their call, not the user's.
+    weight: 1.0
 
-  forex:
-    set_by: user
-    weight: 0.20
-    band: 0.04
-    # no children -> agents pick the pairs and size them within 0.20
-
-  crypto:
-    set_by: user
-    weight: 0.15
-    band: 0.05
-    limits: { max_per_name: 0.075 }   # tighter single-name cap for crypto
-
-  cash:
-    set_by: user
-    weight: 0.15
-    band: 0.03
-
+# =============================================================================
+# rulebook: THE rules for long-term portfolios (rulebook.py explains each one).
+# The live recommendation, the news watch, the reviewer and the backtest all read
+# this one block. Every rule applies to every stock; price limits are measured in
+# each stock's own volatility. Change these only with evidence from
+# rulebook_backtest.py across several periods, never to fit one incident.
+# =============================================================================
+rulebook:
+  # score: weights of the within-sector percentiles
+  weight_momentum: 0.35           # 12 months ago to 1 month ago
+  weight_quality: 0.25            # margins, returns on equity, leverage, growth
+  weight_value: 0.20              # forward earnings yield
+  weight_llm: 0.20                # the model's read, ranked among the peers it compared
+  pullback_weight: 0.10           # a pullback in an intact uptrend, with clean news
+  # who may be held at all
+  min_history_bars: 252           # about a year of trading days
+  min_dollar_volume: 10000000
+  # keeping a stock: stays while ranked inside this multiple of the portfolio's size
+  keep_rank_multiple: 2.0
+  # selling a loser: below cost AND behind its sector, since purchase, by this many monthly sigmas
+  stop_sigma_mult: 1.5
+  # no rebuy for this long after any sale, whatever the reason
+  reentry_block_days: 30
+  # no new buy this close to a company's earnings report
+  earnings_block_days: 3
+  # portfolio limits; any excess stays cash
+  max_industry_weight: 0.35
+  max_portfolio_beta: 1.5
+  # trading
+  min_trade_pct: 0.005            # a change under 0.5% of the portfolio doesn't trade
+  cost_bps: 10                    # per side, charged in backtests and on the scorecard
 
 # =============================================================================
 # day_trading — the intraday capability (long-only, US equities).
@@ -112,39 +118,26 @@ day_trading:
     post_exit_minutes: 30        # watch price after an exit (was the stop just noise?)
 
 # =============================================================================
-# proactive_recalibration — the mid-day news watch (proactive_recal.py).
-# Once per trading day it reads each open portfolio's headlines and price moves
-# and decides whether to recalibrate NOW instead of waiting for the scheduled
-# date. It only ever runs the same recalibration the "Recalibrate Now" button
-# does, and only for portfolios whose owner switched the news watch ON (per
-# portfolio, on the Portfolio tab; off by default). These settings apply to
-# those. Not part of `buckets` (mandate_allocator.py never reads this block).
+# proactive_recalibration: the mid-day news watch (proactive_recal.py). Once per
+# trading day it checks each open portfolio whose owner switched it on. It can
+# only SELL the affected stock and fill that slot: on the rulebook's stop, or on
+# news the model judges thesis-breaking for a named holding.
 # =============================================================================
 proactive_recalibration:
   enabled: true
   dry_run: false                  # true = assess and log only, never trade
-  max_proactive_per_30d: 2         # the review runs every day; this only caps how often it may TRADE
-  min_confidence: 0.7             # the news model must be at least this sure acting now beats waiting
+  max_proactive_per_30d: 2        # early trades allowed; only the rulebook's stop may go beyond this
+  min_confidence: 0.7             # the model must be at least this sure before news sells a stock
   news_lookback_days: 1
-  material_weight: 0.05           # holdings under 5% don't raise price flags on their own
-  big_move_pct: 0.06              # a material holding moving 6%+ today is flagged to the model
-  fallback_drop_pct: 0.10         # model unavailable: act only on a 10%+ drop in a material holding...
-  max_drift: 0.15                 # ...or 15%+ total drift from target weights
-  # LAGGING rule: a portfolio down >= lag_loss_pct since its last recalibration AND trailing its own
-  # sector pool by >= lag_vs_sector_pct recalibrates even if the model says hold (trade limits still apply).
-  lag_loss_pct: 0.05
-  lag_vs_sector_pct: 0.04
-  act_on_lagging: true
-  # A loss this size lets a "recalibrate" verdict through max_proactive_per_30d: the portfolio down 5%+ since its
-  # last recalibration, or a holding of 5%+ weight down 5%+ vs. what was paid, since then, or today. Same-day /
-  # in-flight blocks still apply.
-  loss_override_pct: 0.05
+  material_weight: 0.05           # holdings under 5% don't raise unusual-move flags on their own
+  big_move_sigmas: 3.0            # flag a move this many daily sigmas (evidence for the model, not a trade)
+  big_move_pct: 0.06              # the same flag for a stock with no volatility data
 
 # =============================================================================
-# evaluation — the evaluation agent (rec_evaluator.py). Reviews every
-# recalibration's orders BEFORE they are placed: hard checks may block a BUY
-# (concentration, red-flag news); the AI review is advisory only. Also powers
-# the 🧪 Evaluation page (track record of past calls vs. their sector).
+# evaluation: the evaluation agent (rec_evaluator.py). Reviews every
+# recalibration's orders BEFORE they are placed, on every trigger. Hard checks
+# and the AI review can block a BUY; a SELL is never blocked. Also powers the
+# Evaluation page (track record of past calls vs. their sector).
 # =============================================================================
 evaluation:
   enabled: true
@@ -152,4 +145,5 @@ evaluation:
   min_names_for_cap: 3       # ... when the portfolio targets 3+ names
   red_flag_days: 2           # block a BUY with fraud / SEC probe / bankruptcy / halt headlines this recent
   ai_review: true            # Gemini review (grade A-F + per-order verdicts)
-  ai_veto_proactive: true    # news-watch recalibrations: its "object" (and "concern" on an F plan) blocks the BUY
+  ai_veto: true              # its "object" (and "concern" on an F plan) blocks the BUY
+  track_record_min_trades: 30  # the reviewer sees a track-record line only with this many graded trades
