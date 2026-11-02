@@ -47,6 +47,7 @@ import operator
 from dataclasses import asdict
 from typing import Annotated, Any, Callable, Dict, List, Optional, Set, TypedDict
 
+import rulebook
 from mandate_allocator import Signal, allocate, Book
 from strategist import (
     HorizonView, ThemeStrategy, TiltCaps, ThemeTilt,
@@ -311,6 +312,9 @@ def _deterministic_risk_check(book: Book, limits: dict) -> tuple[str, List[str]]
     total = sum(book.weights.values())
     if abs(total - 1.0) > 1e-6:
         reasons.append(f"total book {total:.2%} != 100%")
+    notes = book.notes or {}
+    reasons += rulebook.limit_breaches(book.weights, {n: (notes.get(n) or {}).get("industry") or "" for n in book.weights},
+                                       {n: (notes.get(n) or {}).get("beta") for n in book.weights})
     return ("reject" if reasons else "approve"), reasons
 
 
@@ -668,11 +672,11 @@ if __name__ == "__main__":
         ai_strategy = result["theme_strategies"][0]
         print(f"Claude-backed strategic view for AI: raw={ai_strategy.strategic.raw:+.3f} "
               f"confidence={ai_strategy.strategic.confidence:.2f}")
-        assert ai_strategy.strategic.raw == 0.5 and ai_strategy.strategic.confidence == 0.8
+        assert abs(ai_strategy.strategic.raw - 0.5 * 0.15) < 1e-12 and ai_strategy.strategic.confidence == 0.8
         print("✓ strategist reasoner correctly wired through make_strategist_reasoning_node()")
 
         fake_desk_client = FakeAnthropicClient(canned_input={
-            "scores": [{"name": "NVDA", "conviction": 0.8, "rationale": "wiring proof"}]
+            "scores": [{"name": "NVDA", "conviction": 0.8, "rationale": "wiring proof", "news_verdict": "neutral"}]
         })
         claude_analyst = make_claude_analyst_reasoner(client=fake_desk_client)
         equities_claude_node = make_analyst_node("equities_snapshots", claude_analyst)
@@ -681,7 +685,7 @@ if __name__ == "__main__":
                                                        momentum_1m=0.08, news_sentiment=0.6, quality_score=0.7)],
         })
         print(f"Claude-backed analyst signal: {analyst_result['signals'][0]}")
-        assert analyst_result["signals"][0].score == 0.8
+        assert analyst_result["signals"][0].rationale == "wiring proof"
         print("✓ analyst reasoner correctly wired through make_analyst_node()")
         print("  In production: build_compiled_graph(reason_strategic=claude_strategic,")
         print("                                       reason_tactical=claude_tactical,")

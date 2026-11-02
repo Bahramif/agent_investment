@@ -36,7 +36,8 @@ nothing extra beyond what quality scoring already paid.
 from __future__ import annotations
 
 import time
-from typing import Dict, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 _INFO_CACHE: Dict[str, Tuple[dict, float]] = {}   # symbol -> (info dict, fetched_at monotonic)
 _TTL_SECONDS = 20 * 3600   # fundamentals/estimates move on a coverage cadence, not intraday
@@ -91,6 +92,32 @@ def score_from_info(info: dict) -> Optional[float]:
         return None
     total_weight = sum(w for w, _ in parts)
     return sum(w * v for w, v in parts) / total_weight
+
+
+def factor_inputs_from_info(info: Optional[dict], today: Optional[date] = None) -> Dict[str, Any]:
+    """Pure function: the fields of a yfinance info dict the rulebook reads.
+    Anything missing comes back None/"" and is treated as unknown, not as bad."""
+    info = info or {}
+    today = today or date.today()
+    eps = info.get("forwardEps")
+    if eps is None:
+        eps = info.get("trailingEps")
+    earnings = None
+    stamp = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+    if stamp:
+        try:
+            d = datetime.fromtimestamp(float(stamp), tz=timezone.utc).date()
+            earnings = d.isoformat() if d >= today else None
+        except (TypeError, ValueError, OverflowError, OSError):
+            earnings = None
+    return {"eps": float(eps) if eps is not None else None, "industry": str(info.get("industry") or ""),
+            "earnings_date": earnings,
+            "avg_volume": info.get("averageVolume") or info.get("averageDailyVolume3Month")}
+
+
+def get_factor_inputs(symbol: str) -> Dict[str, Any]:
+    """Cached, resilient lookup of factor_inputs_from_info. Never raises."""
+    return factor_inputs_from_info(_get_info(symbol))
 
 
 def get_quality_score(symbol: str, fallback: float = 0.5) -> float:
@@ -172,6 +199,19 @@ if __name__ == "__main__":
     assert forecast_from_info({}, current_price=100.0) is None, "no target/coverage -> None, not a fake number"
     assert forecast_from_info(covered, current_price=None) is None, "no current price to compare against -> None"
     print("✓ real target price -> real implied return, no coverage -> None (fallback), consistent with quality")
+
+    print()
+    print("TEST: factor_inputs_from_info reads EPS, industry, next earnings and volume; missing fields stay unknown")
+    day = date(2026, 11, 1)
+    soon = int(datetime(2026, 11, 3, 21, tzinfo=timezone.utc).timestamp())
+    past = int(datetime(2026, 8, 3, 21, tzinfo=timezone.utc).timestamp())
+    got = factor_inputs_from_info({"forwardEps": 5.0, "trailingEps": 4.0, "industry": "Semiconductors",
+                                   "earningsTimestampStart": soon, "averageVolume": 1000}, today=day)
+    assert got == {"eps": 5.0, "industry": "Semiconductors", "earnings_date": "2026-11-03", "avg_volume": 1000}, got
+    assert factor_inputs_from_info({"trailingEps": 4.0}, today=day)["eps"] == 4.0
+    assert factor_inputs_from_info({"earningsTimestamp": past}, today=day)["earnings_date"] is None, "a past report is not upcoming"
+    assert factor_inputs_from_info(None) == {"eps": None, "industry": "", "earnings_date": None, "avg_volume": None}
+    print("✓ ok")
 
     print()
     print("=" * 70)

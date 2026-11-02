@@ -76,6 +76,13 @@ class ThemeTilt:
         return self.strategic_stale or self.tactical_stale
 
 
+# A view's raw tilt is in [-1, 1]. These turn it into tilt units so that only the
+# strongest, most confident view reaches its cap, so tilts keep their information
+# instead of saturating. Used by BOTH the LLM and the heuristic reasoners.
+STRATEGIC_VIEW_SCALE = 0.15   # = TiltCaps.strategic_cap
+TACTICAL_VIEW_SCALE = 0.06    # = TiltCaps.tactical_cap
+
+
 def _clip(x: float, cap: float) -> float:
     return max(-cap, min(cap, x))
 

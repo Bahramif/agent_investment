@@ -14,7 +14,8 @@ claude_reasoning.py's make_claude_reasoners().
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
 
 
 @dataclass
@@ -24,8 +25,9 @@ class MacroSnapshot:
     theme: str
     momentum_1m: float           # trailing 1-month theme return, e.g. +0.08
     news_sentiment: float        # -1..+1, e.g. headline sentiment score
-    valuation_percentile: float  # 0..1, where this trades vs. its own history
-    secular_score: float         # -1..+1, structural tailwind (capex, TAM, policy)
+    valuation_percentile: float  # 0..1, where prices sit in their own 1-year range (a price measure, not a valuation)
+    secular_score: float = 0.0   # kept for the interface; no hand-set value is ever supplied now
+    headlines: List[str] = field(default_factory=list)   # a sample from the sector's stocks, for the LLM to read
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
@@ -33,16 +35,16 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 
 def reason_strategic_view(snap: MacroSnapshot):
-    from strategist import HorizonView   # deferred: strategist.py stays a leaf module
-    raw = _clip(0.5 * snap.secular_score - 0.3 * (snap.valuation_percentile - 0.5), -1, 1) * 0.30
+    from strategist import HorizonView, STRATEGIC_VIEW_SCALE   # deferred: strategist.py stays a leaf module
+    raw = _clip(0.5 * snap.secular_score - 0.3 * (snap.valuation_percentile - 0.5), -1, 1) * STRATEGIC_VIEW_SCALE
     confidence = _clip(0.4 + 0.4 * abs(snap.secular_score), 0.0, 0.9)
     return HorizonView(raw=raw, confidence=confidence, age_days=0.0,
                        half_life_days=365, max_age_days=180)
 
 
 def reason_tactical_view(snap: MacroSnapshot):
-    from strategist import HorizonView
-    raw = _clip(0.6 * snap.momentum_1m * 10 + 0.4 * snap.news_sentiment, -1, 1) * 0.35
+    from strategist import HorizonView, TACTICAL_VIEW_SCALE
+    raw = _clip(0.6 * snap.momentum_1m * 10 + 0.4 * snap.news_sentiment, -1, 1) * TACTICAL_VIEW_SCALE
     confidence = _clip(0.3 + 0.5 * abs(snap.news_sentiment), 0.0, 0.85)
     return HorizonView(raw=raw, confidence=confidence, age_days=0.0,
                        half_life_days=14, max_age_days=21)

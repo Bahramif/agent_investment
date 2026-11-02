@@ -405,7 +405,6 @@ _REQUIREMENTS = [
                           # use_direct_anthropic_api=True and you only need the base package
     "alpaca-py",           # equities + crypto broker, market data, (not forex)
     "yfinance",            # real per-instrument fundamentals — see fundamentals.py
-    "scipy",               # mean-variance weight optimization — see portfolio_optimizer.py
     "pyyaml",
     # Cloud Trace export for set_up()'s tracer setup (enable_tracing=True) —
     # harmless to install even when tracing is left off, since the import
@@ -421,8 +420,8 @@ _EXTRA_PACKAGES = [
                              # the container can't unpickle the agent ("No module named
                              # 'vertex_deploy'") when it boots
     "mandate_allocator.py",
-    "portfolio_optimizer.py", # real mean-variance weight optimization, called from
-                             # mandate_allocator._allocate_within_bucket
+    "rulebook.py",            # THE rules: score, selection, sizing, limits, stops
+    "mandate.yaml",           # rulebook's config (read beside rulebook.py)
     "strategist.py",
     "macro_reasoning.py",     # MacroSnapshot + heuristic reasoning (strategist's fallback path)
     "analyst_reasoning.py",   # InstrumentSnapshot + heuristic scoring (analysts' fallback path)

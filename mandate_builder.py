@@ -2,8 +2,7 @@
 mandate_builder.py
 ===================
 Interactive wizard that lets the END USER build their own investment mandate
-by walking a category tree: pick which asset classes to fund (equities,
-forex, crypto), how much of the portfolio to weight each, then optionally
+by walking a category tree: pick which asset classes to fund, how much of the portfolio to weight each, then optionally
 drill into sub-categories (e.g. equities -> stocks vs. options; stocks ->
 which themes) before landing on the exact same mandate schema
 mandate_allocator.load_mandate()/allocate() already consume. This is just an
@@ -67,8 +66,6 @@ CATEGORY_TREE: Dict[str, Any] = {
             },
         },
     },
-    "forex": {},
-    "crypto": {},
 }
 
 THEME_LABELS = {   # cosmetic only — anything missing falls back to title-casing
@@ -215,9 +212,16 @@ def render_summary(mandate: Dict[str, Any]) -> str:
 
 
 def save_mandate(mandate: Dict[str, Any], path: str = "mandate.yaml") -> None:
+    """Replaces the mandate's own keys and keeps every other block in the file
+    (rulebook, day_trading, ...), which the wizard knows nothing about."""
+    import os
     import yaml
+    existing: Dict[str, Any] = {}
+    if os.path.exists(path):
+        with open(path) as fh:
+            existing = yaml.safe_load(fh) or {}
     with open(path, "w") as fh:
-        yaml.safe_dump(mandate, fh, sort_keys=False, default_flow_style=False)
+        yaml.safe_dump({**existing, **mandate}, fh, sort_keys=False, default_flow_style=False)
 
 
 if __name__ == "__main__":

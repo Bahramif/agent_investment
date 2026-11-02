@@ -68,7 +68,7 @@ if __name__ == "__main__":
         install(base.doc(pending_order_ids={}, **doc_over))
         base.world()
         asked = []
-        web_ui.recommend = lambda sectors, top_n: asked.append(top_n) or {
+        web_ui.recommend = lambda sectors, top_n, context=None: asked.append(top_n) or {
             "final_weights": {"BBB": 0.5, "CCC": 0.5}, "status": "ok", "book_notes": {}}
         c.post("/portfolios/p1/recalibrate")
         assert asked == [want], (label, asked)

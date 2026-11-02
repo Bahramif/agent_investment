@@ -6,16 +6,12 @@ objects the analysts and strategist reason over. This is the upstream piece
 flagged as missing earlier — those objects were hand-supplied state in the
 demos; this is what actually produces them.
 
-SCOPE, STATED HONESTLY: this module computes what's MECHANICALLY derivable
-from price history and headlines — momentum, a valuation percentile, and
-aggregate news sentiment. `quality_score` is now real too (fundamentals.py,
-via yfinance — profit margins, ROE, leverage, revenue growth), cached
-per-symbol so it doesn't add yfinance latency to every request. UniverseConfig's
-per-symbol quality value survives only as the FALLBACK when yfinance has
-nothing usable for a name. `secular_score` (per-theme structural thesis)
-is still supplied config — a structural/narrative judgment about a THEME
-(e.g. "AI capex supercycle"), not a per-company number a data feed
-produces, so it stays hand-set.
+SCOPE: this module computes what is MECHANICALLY derivable from price history
+and fundamentals. Headlines are passed through as text; judging them is the LLM's
+job (claude_reasoning.py), so without a model a stock's news is "unknown", never
+guessed from keywords. snapshot_from_prices() is the ONE place a snapshot is
+built from prices: the live path and the backtest (simulate.py) both use it, so
+what is tested is what runs.
 
 MarketDataClient / NewsClient are Protocols — bring your own client
 (Polygon.io, Alpaca Market Data, a news API, etc.) satisfying the same
@@ -25,11 +21,15 @@ pattern as claude_reasoning.py's FakeAnthropicClient.
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple
 
+import rulebook
 from analyst_reasoning import InstrumentSnapshot
 from macro_reasoning import MacroSnapshot
+
+BENCHMARK = "SPY"
 
 
 # -----------------------------------------------------------------------------
@@ -74,11 +74,7 @@ def compute_returns(prices: List[float]) -> List[float]:
 
 
 def compute_volatility(prices: List[float]) -> float:
-    """Stdev of daily returns over the given price history — a simple,
-    transparent risk proxy. Per-instrument only; see returns_window on
-    InstrumentSnapshot/Signal for the real per-instrument return SERIES
-    that lets mandate_allocator build an actual cross-instrument covariance
-    matrix instead of treating instruments as if they never move together."""
+    """Stdev of daily returns over the given price history."""
     returns = compute_returns(prices)
     if len(returns) < 2:
         return 0.0
@@ -99,28 +95,12 @@ def compute_valuation_percentile(prices: List[float]) -> float:
     return _clip((prices[-1] - lo) / (hi - lo), 0.0, 1.0)
 
 
-# A tiny, transparent sentiment scorer — explicitly NOT a real NLP model. In
-# production, swap this for a real sentiment classifier or an LLM call; the
-# interface (headlines in, score in [-1, 1] out) is what actually matters.
-_POSITIVE_WORDS = {"beats", "surges", "record", "growth", "upgrade", "rally", "strong", "wins", "soars"}
-_NEGATIVE_WORDS = {"misses", "plunges", "recall", "downgrade", "lawsuit", "weak", "cuts", "probe", "slumps"}
-
-
-def score_headline_sentiment(headlines: List[str]) -> float:
-    if not headlines:
-        return 0.0
-    scores = []
-    for h in headlines:
-        words = set(h.lower().split())
-        scores.append(len(words & _POSITIVE_WORDS) - len(words & _NEGATIVE_WORDS))
-    avg = sum(scores) / len(scores)
-    return _clip(avg / 2.0, -1.0, 1.0)   # crude normalization — swap for something real
-
-
 # -----------------------------------------------------------------------------
 # Snapshot builders
 # -----------------------------------------------------------------------------
-HISTORY_DAYS = 190        # calendar days fetched per instrument (~6 months) — for the buy-the-dip drawdown
+HISTORY_DAYS = 400        # calendar days fetched per instrument: a full year of trading days plus a margin
+RECENT_MONTH_BARS = 21    # the latest month's return, for display
+SECTOR_HEADLINE_SAMPLE = 12
 
 
 def compute_drawdown(prices: List[float]) -> float:
@@ -130,40 +110,69 @@ def compute_drawdown(prices: List[float]) -> float:
     return min(0.0, prices[-1] / max(prices) - 1.0)
 
 
+def snapshot_from_prices(symbol: str, path: str, prices: List[float], quality_score: float, eps: Optional[float] = None,
+                         industry: str = "", benchmark: Optional[List[float]] = None,
+                         earnings_date: Optional[str] = None, avg_volume: Optional[float] = None,
+                         headlines: Optional[List[str]] = None, news_status: str = "unknown",
+                         analyst: Optional[Tuple[float, str, int]] = None) -> InstrumentSnapshot:
+    """Prices are daily closes up to the moment of the decision, oldest first."""
+    last = prices[-1] if prices else None
+    earnings_yield = (eps / last) if eps is not None and last else None
+    expected, rating, count = analyst if analyst else (None, None, 0)
+    return InstrumentSnapshot(
+        name=symbol, path=path,
+        momentum_1m=compute_momentum(prices[-RECENT_MONTH_BARS - 1:]),
+        news_sentiment=0.0,
+        quality_score=quality_score,
+        volatility=rulebook.annual_window_vol(prices) or 0.0,
+        analyst_expected_return=expected, analyst_rating=rating, analyst_count=count,
+        drawdown_6m=rulebook.drawdown_from_high(prices),
+        pullback_5d=rulebook.trailing_return(prices, 5),
+        momentum_12_1=rulebook.momentum_12_1(prices),
+        earnings_yield=earnings_yield,
+        industry=industry,
+        beta=rulebook.beta_to(prices, benchmark) if benchmark else None,
+        earnings_date=earnings_date,
+        history_bars=len(prices),
+        avg_dollar_volume=(avg_volume * last) if avg_volume and last else None,
+        range_position=compute_valuation_percentile(prices[-rulebook.TRADING_DAYS_PER_YEAR:]),
+        headlines=[str(h)[:200] for h in (headlines or [])[:5]],
+        news_status=news_status,
+    )
+
+
 def build_instrument_snapshot(
     symbol: str, path: str, quality_score: float,
     market_client: MarketDataClient, news_client: NewsClient,
-    lookback_days: int = 21,
+    benchmark: Optional[List[float]] = None,
 ) -> InstrumentSnapshot:
-    """ONE price request covers ~6 months (HISTORY_DAYS): the recent slice —
-    the trading days inside `lookback_days` calendar days, as before — feeds
-    momentum/volatility/returns_window unchanged; the whole window feeds the
-    buy-the-dip drawdown. No extra API calls per instrument."""
-    from fundamentals import get_quality_score, get_analyst_forecast
-    history = market_client.get_price_history(symbol, max(HISTORY_DAYS, lookback_days))
-    recent_bars = max(2, round(lookback_days * 252 / 365))
-    prices = history[-recent_bars:]
+    """One price request covers everything: a year of factors plus the latest
+    month for display. `quality_score` is the fallback when there are no
+    fundamentals for this name."""
+    from fundamentals import get_quality_score, get_analyst_forecast, get_factor_inputs
+    prices = market_client.get_price_history(symbol, HISTORY_DAYS)
     headlines = news_client.get_recent_headlines(symbol, days=7)
-    # None (not 0.0/"") when there's no real analyst coverage — the scorer
-    # distinguishes "genuinely no coverage" from "a real 0% expected return"
-    # and falls back to its own heuristic only in the former case.
-    forecast = get_analyst_forecast(symbol, current_price=prices[-1] if prices else None)
-    analyst_expected_return, analyst_rating, analyst_count = forecast if forecast else (None, None, 0)
-    return InstrumentSnapshot(
-        name=symbol, path=path,
-        momentum_1m=compute_momentum(prices),
-        news_sentiment=score_headline_sentiment(headlines),
-        # `quality_score` param is now a FALLBACK ONLY, used when yfinance
-        # has nothing usable for this symbol — real value comes from
-        # fundamentals.py (profit margins, ROE, leverage, revenue growth).
-        quality_score=get_quality_score(symbol, fallback=quality_score),
-        volatility=compute_volatility(prices),
-        analyst_expected_return=analyst_expected_return,
-        analyst_rating=analyst_rating,
-        analyst_count=analyst_count,
-        returns_window=compute_returns(prices),
-        drawdown_6m=compute_drawdown(history),
-        pullback_5d=(history[-1] / history[-6] - 1.0) if len(history) >= 6 and history[-6] else 0.0,
+    inputs = get_factor_inputs(symbol)
+    return snapshot_from_prices(
+        symbol, path, prices, get_quality_score(symbol, fallback=quality_score), eps=inputs["eps"],
+        industry=inputs["industry"], benchmark=benchmark, earnings_date=inputs["earnings_date"],
+        avg_volume=inputs["avg_volume"], headlines=headlines,
+        analyst=get_analyst_forecast(symbol, current_price=prices[-1] if prices else None))
+
+
+def build_macro_from_snapshots(theme: str, snapshots: Sequence[InstrumentSnapshot]) -> MacroSnapshot:
+    """A sector's read from ALL its stocks: the median, so one outlier can't
+    speak for the sector. Re-uses the data already fetched for the stocks."""
+    headlines: List[str] = []
+    for s in sorted(snapshots, key=lambda x: -len(x.headlines)):
+        if s.headlines:
+            headlines.append(f"{s.name}: {s.headlines[0]}")
+    return MacroSnapshot(
+        theme=theme,
+        momentum_1m=statistics.median(s.momentum_1m for s in snapshots) if snapshots else 0.0,
+        news_sentiment=0.0,
+        valuation_percentile=statistics.median(s.range_position for s in snapshots) if snapshots else 0.5,
+        headlines=headlines[:SECTOR_HEADLINE_SAMPLE],
     )
 
 
@@ -172,18 +181,21 @@ def build_macro_snapshot(
     market_client: MarketDataClient, news_client: NewsClient,
     lookback_days: int = 21,
 ) -> MacroSnapshot:
-    momenta, valuations = [], []
+    """A theme with an explicit constituent list. Headlines are fetched per
+    constituent: a news API knows tickers, not a theme name like "tech_ai"."""
+    momenta, valuations, headlines = [], [], []
     for symbol in constituents:
         prices = market_client.get_price_history(symbol, lookback_days)
         momenta.append(compute_momentum(prices))
         valuations.append(compute_valuation_percentile(prices))
-    headlines = news_client.get_recent_headlines(theme, days=7)
+        headlines += [f"{symbol}: {h}" for h in news_client.get_recent_headlines(symbol, days=7)[:1]]
     return MacroSnapshot(
         theme=theme,
         momentum_1m=sum(momenta) / len(momenta) if momenta else 0.0,
-        news_sentiment=score_headline_sentiment(headlines),
+        news_sentiment=0.0,
         valuation_percentile=sum(valuations) / len(valuations) if valuations else 0.5,
-        secular_score=secular_score,   # supplied, not derived — see module docstring
+        secular_score=secular_score,
+        headlines=headlines[:SECTOR_HEADLINE_SAMPLE],
     )
 
 
@@ -199,7 +211,8 @@ class UniverseConfig:
     equities: List[Tuple[str, str, float]]       # (symbol, path, quality_score)
     forex: List[Tuple[str, str, float]]
     crypto: List[Tuple[str, str, float]]
-    themes: List[Tuple[str, List[str], float]]   # (theme, constituent symbols, secular_score)
+    themes: List[Tuple[str, List[str], float]]   # (theme, constituent symbols, secular_score);
+                                                 # no constituents listed = all the stocks in that sector
 
 
 def make_data_ingestion_node(
@@ -221,13 +234,21 @@ def make_data_ingestion_node(
     def _node(state: dict) -> dict:
         from concurrent.futures import ThreadPoolExecutor
 
+        benchmark = None
+        try:
+            benchmark = market_client.get_price_history(BENCHMARK, HISTORY_DAYS)
+        except Exception as e:                       # beta is one input, not a prerequisite
+            print(f"[data_ingestion] {BENCHMARK} history unavailable ({e}): beta unknown this run")
+
         def _equity(args):
             sym, path, q = args
-            return build_instrument_snapshot(sym, path, q, market_client, news_client)
+            return build_instrument_snapshot(sym, path, q, market_client, news_client, benchmark)
 
         def _macro(args):
             theme, constituents, sec = args
-            return build_macro_snapshot(theme, constituents, sec, market_client, news_client)
+            if constituents:
+                return build_macro_snapshot(theme, constituents, sec, market_client, news_client)
+            return build_macro_from_snapshots(theme, [s for s in equities if rulebook.sector_of(s.path) == theme])
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             equities = list(pool.map(_equity, universe.equities))
@@ -273,13 +294,6 @@ if __name__ == "__main__":
     assert compute_valuation_percentile([90, 95, 100]) == 1.0     # current price is the high of its range
     print("✓ momentum and valuation-percentile computations correct")
 
-    pos = score_headline_sentiment(["Company beats estimates, stock surges on record growth"])
-    neg = score_headline_sentiment(["Company misses estimates as lawsuit probe weighs on shares"])
-    neutral = score_headline_sentiment([])
-    print(f"  positive headline -> {pos:+.2f}, negative -> {neg:+.2f}, none -> {neutral:+.2f}")
-    assert pos > 0 and neg < 0 and neutral == 0.0
-    print("✓ sentiment scorer distinguishes positive/negative/absent headlines")
-
     print("\n" + "=" * 70)
     print("TEST 2: snapshot builders with fake clients")
     print("=" * 70)
@@ -296,9 +310,10 @@ if __name__ == "__main__":
 
     nvda_snap = build_instrument_snapshot("NVDA", "equities.tech_ai", quality_score=0.7,
                                          market_client=market, news_client=news)
-    print(f"  NVDA: momentum={nvda_snap.momentum_1m:+.2%} sentiment={nvda_snap.news_sentiment:+.2f} "
+    print(f"  NVDA: momentum={nvda_snap.momentum_1m:+.2%} "
           f"quality={nvda_snap.quality_score:+.2f} (REAL fundamentals via yfinance, not the 0.7 fallback)")
-    assert nvda_snap.momentum_1m > 0 and nvda_snap.news_sentiment > 0
+    assert nvda_snap.momentum_1m > 0 and nvda_snap.news_status == "unknown", "headlines are the LLM's to judge"
+    assert nvda_snap.headlines == ["NVDA beats on record AI demand, stock surges"]
     assert 0.0 <= nvda_snap.quality_score <= 1.0
     # A fake ticker yfinance can't resolve -> falls back to the supplied value untouched.
     fake_snap = build_instrument_snapshot("ZZZZFAKETICKER", "equities.tech_ai", quality_score=0.42,
@@ -340,21 +355,38 @@ if __name__ == "__main__":
     print("✓ ingestion output is directly consumable by the existing analyst scorer —")
     print("  no adapter needed between this module and firm_graph.py")
 
-    print("TEST: ONE ~6-month fetch -> recent slice for momentum, whole window for the buy-the-dip drawdown")
+    print("TEST: ONE ~13-month fetch feeds every factor; the snapshot needs nothing else from prices")
     import fundamentals as _f
     _f.get_quality_score = lambda sym, fallback=0.5: 0.8
     _f.get_analyst_forecast = lambda sym, current_price=None: (0.2, "Buy", 15)
+    _f.get_factor_inputs = lambda sym: {"eps": 10.0, "industry": "Semiconductors", "earnings_date": "2026-11-20",
+                                        "avg_volume": 2_000_000}
     asked = []
+    hist = [100 + i * 0.5 for i in range(240)] + [220 - i for i in range(40)]
     class LongFake(FakeMarketDataClient):
         def get_price_history(self, symbol, days):
             asked.append(days)
-            return [100 + i for i in range(100)] + [150 - 2 * i for i in range(30)]   # ran to ~199, fell to 92
-    snap = build_instrument_snapshot("DIP", "equities.tech_ai", 0.5, LongFake({}), FakeNewsClient({}))
-    hist = [100 + i for i in range(100)] + [150 - 2 * i for i in range(30)]
-    assert asked == [HISTORY_DAYS], "one request, ~6 months"
-    recent = hist[-round(21 * 252 / 365):]
-    assert abs(snap.momentum_1m - (recent[-1] - recent[0]) / recent[0]) < 1e-12, "momentum still on the ~21-day slice"
-    assert len(snap.returns_window) == len(recent) - 1
-    assert abs(snap.drawdown_6m - (hist[-1] / max(hist) - 1)) < 1e-12 and snap.drawdown_6m < -0.5
-    assert abs(snap.pullback_5d - (hist[-1] / hist[-6] - 1)) < 1e-12
-    print(f"✓ momentum {snap.momentum_1m:+.1%} on {len(recent)} bars; {snap.drawdown_6m:+.0%} from the 6-month high")
+            return hist
+    snap = build_instrument_snapshot("DIP", "equities.tech_ai", 0.5, LongFake({}), FakeNewsClient({"DIP": ["x"]}), benchmark=hist)
+    assert asked == [HISTORY_DAYS], "one request"
+    assert abs(snap.momentum_1m - (hist[-1] / hist[-22] - 1)) < 1e-12, "the latest month, for display"
+    assert abs(snap.momentum_12_1 - (hist[-22] / hist[-253] - 1)) < 1e-12, "12 months ago to 1 month ago"
+    assert snap.history_bars == 280 and abs(snap.beta - 1.0) < 1e-9 and snap.industry == "Semiconductors"
+    assert abs(snap.earnings_yield - 10.0 / hist[-1]) < 1e-12 and abs(snap.avg_dollar_volume - 2e6 * hist[-1]) < 1e-6
+    assert snap.volatility > 0 and snap.drawdown_6m < 0 and snap.analyst_expected_return == 0.2
+    print(f"✓ 12-1 momentum {snap.momentum_12_1:+.1%}, latest month {snap.momentum_1m:+.1%}, beta {snap.beta:.2f}")
+
+    print("TEST: a sector is read from ALL its stocks, and the news API is never asked about a theme name")
+    asked_news = []
+    class SpyNews(FakeNewsClient):
+        def get_recent_headlines(self, symbol_or_theme, days):
+            asked_news.append(symbol_or_theme)
+            return [f"{symbol_or_theme} headline"]
+    uni = UniverseConfig(equities=[("AAA", "equities.energy", 0.5), ("BBB", "equities.energy", 0.5), ("CCC", "equities.tech_ai", 0.5)],
+                         forex=[], crypto=[], themes=[("energy", [], 0.0), ("tech_ai", [], 0.0)])
+    out = make_data_ingestion_node(uni, LongFake({}), SpyNews({}))({})
+    macros = {m.theme: m for m in out["macro_snapshots"]}
+    assert "energy" not in asked_news and "tech_ai" not in asked_news, asked_news
+    assert sorted(macros["energy"].headlines) == ["AAA: AAA headline", "BBB: BBB headline"]
+    assert macros["energy"].secular_score == 0.0
+    print("✓ medians across the sector's stocks; headlines by ticker; no hand-set tailwind")

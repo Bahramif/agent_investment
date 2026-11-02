@@ -28,8 +28,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+import rulebook
+
 PROJECT = os.environ.get("MERIDIAN_PROJECT", "meridian-508414")
 _COLLECTION = "meridian_portfolios"
+_STRATEGIST_COLLECTION = "meridian_strategist"
+_STRATEGIST_DOC = "memory"
 
 _client = None
 
@@ -175,6 +179,19 @@ def record_rebalance(portfolio_id: str, new_holdings: Dict[str, Dict[str, float]
     })
 
 
+def get_strategist_memory() -> Dict[str, Any]:
+    """The strategist's sector views and when they were saved, carried between
+    runs so a strategic view lasts until its review is due, instead of being
+    re-derived from scratch on every recommendation."""
+    snap = _get_client().collection(_STRATEGIST_COLLECTION).document(_STRATEGIST_DOC).get()
+    return (snap.to_dict() or {}) if snap.exists else {}
+
+
+def save_strategist_memory(theme_memory: Dict[str, Any]) -> None:
+    _get_client().collection(_STRATEGIST_COLLECTION).document(_STRATEGIST_DOC).set(
+        {"theme_memory": theme_memory, "saved_at": datetime.now(timezone.utc).isoformat()})
+
+
 def set_news_watch(portfolio_id: str, enabled: bool) -> bool:
     """Turns the mid-day news watch on/off for one OPEN portfolio. Returns
     False if there is no such open portfolio."""
@@ -270,12 +287,16 @@ def resolve_pending(doc: Dict[str, Any], facts: Dict[str, Dict[str, Any]]) -> Op
             notional = qty * avg
             cur = holdings.get(sym)
             if side == "buy":
+                filled_on = entry["at"][:10]
                 if cur:
                     total = cur["shares"] + qty
-                    price = (cur["shares"] * cur["entry_price"] + notional) / total
+                    old_cost = cur["shares"] * cur["entry_price"]
+                    price = (old_cost + notional) / total
+                    entered = rulebook.blended_entry_date(cur.get("entry_date"), old_cost, filled_on, notional)
                 else:
-                    total, price = qty, avg
-                holdings[sym] = {"shares": _shares(total), "entry_price": price, "cost": total * price}
+                    total, price, entered = qty, avg, filled_on
+                holdings[sym] = {"shares": _shares(total), "entry_price": price, "cost": total * price,
+                                 "entry_date": entered}
                 cash = max(0.0, cash - notional)
             elif side == "sell":
                 held = cur["shares"] if cur else 0.0
@@ -285,7 +306,7 @@ def resolve_pending(doc: Dict[str, Any], facts: Dict[str, Dict[str, Any]]) -> Op
                     if remaining <= 1e-9:
                         del holdings[sym]
                     else:
-                        holdings[sym] = {"shares": _shares(remaining), "entry_price": cur["entry_price"],
+                        holdings[sym] = {**cur, "shares": _shares(remaining), "entry_price": cur["entry_price"],
                                          "cost": remaining * cur["entry_price"]}
                     cash += sold * avg
                     entry["filled_qty"] = sold
