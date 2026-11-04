@@ -51,6 +51,8 @@ class _StreamClient(FakeClient):
             def stream(self_inner):
                 out = []
                 for pid, d in c.docs.items():
+                    if "/" in pid:                       # a document of another collection
+                        continue
                     s = _Snap(d, c.versions[pid]); s.id = pid
                     out.append(s)
                 return out

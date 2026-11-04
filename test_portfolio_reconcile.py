@@ -71,8 +71,9 @@ class FakeClient:
         self.versions = {k: 1 for k in docs}
     def collection(self, name):
         c = self
+        other = "" if name == "meridian_portfolios" else f"{name}/"   # other collections don't mix with portfolios
         class _C:
-            def document(self_inner, pid): return _Ref(c, pid)
+            def document(self_inner, pid): return _Ref(c, f"{other}{pid}")
         return _C()
     def write_option(self, last_update_time): return _Opt(last_update_time)
 

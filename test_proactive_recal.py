@@ -51,11 +51,14 @@ class FakeClaude:
     def create(self, **kw):
         self.calls.append(kw)
         return NS(stop_reason="tool_use", model="fake-model",
-                  content=[NS(type="tool_use", name="decide_recalibration", input=self.verdict)])
+                  content=[NS(type="tool_use", name="judge_holdings_news", input=self.verdict)])
 
 
-YES = {"recalibrate": True, "confidence": 0.92, "urgency": "high", "key_symbols": ["AAA"], "exit_symbols": ["AAA"],
-       "reason": "AAA disclosed an SEC accounting probe and its CFO resigned — the thesis for the largest holding changed."}
+def sell(sym="AAA", why="AAA disclosed an SEC accounting probe and its CFO resigned: the thesis changed.", conf=0.92):
+    return {"symbol": sym, "sell": True, "confidence": conf, "reason": why}
+
+
+YES = {"verdicts": [sell()]}
 NEWS = {"AAA": ["AAA discloses SEC probe into revenue recognition", "AAA CFO resigns"]}
 
 
@@ -122,8 +125,7 @@ if __name__ == "__main__":
         "default provider -> Gemini on this project"
     assert d["proactive_checks"][-1]["review"]["model"] == "fake-model", "the model that decided is recorded"
     prompt = st["claude"].calls[0]["messages"][0]["content"]
-    assert "AAA discloses SEC probe" in prompt and "- AAA: " in prompt and "- CCC: " in prompt, \
-        "the model saw the RECONCILED holdings (CCC was bought by the in-flight order)"
+    assert "AAA discloses SEC probe" in prompt and "- AAA (" in prompt
     assert {s for s, _, _ in FakeTradingClient.submitted} == {"AAA", "DDD"}, \
         ("targeted: AAA sold, its slot filled, BBB and CCC not touched", FakeTradingClient.submitted)
     assert d["holdings"]["BBB"]["shares"] == 50 and d["holdings"]["CCC"]["shares"] == 30 and "AAA" not in d["holdings"]
@@ -133,7 +135,7 @@ if __name__ == "__main__":
     print("SCENARIO C: running again the same day still REVIEWS, but a 'recalibrate' verdict is flagged, not traded")
     n_orders, n_calls = len(FakeTradingClient.submitted), len(st["claude"].calls)
     web_ui._headlines_many = lambda syms, days: {"BBB": ["BBB recalls its flagship product"]}   # AAA was sold in B
-    st["claude"].verdict = {**YES, "exit_symbols": ["BBB"]}
+    st["claude"].verdict = {"verdicts": [sell("BBB", "BBB recalled its flagship product.")]}
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
     assert r["results"][0]["action"] == "flagged" and "already recalibrated today" in r["results"][0]["reason"], r
     assert len(st["claude"].calls) == n_calls + 1, "the model reviewed the news again"
@@ -161,8 +163,8 @@ if __name__ == "__main__":
 
     print("SCENARIO F: the model says wait -> hold with its reason")
     fake = install(doc())
-    st = world(news=NEWS, verdict={"recalibrate": False, "confidence": 0.8, "urgency": "low",
-                                   "reason": "Probe is preliminary; next scheduled rebalance is close enough."})
+    st = world(news=NEWS, verdict={"verdicts": [{"symbol": "AAA", "sell": False, "confidence": 0.8,
+                                                 "reason": "Probe is preliminary; next scheduled rebalance is close enough."}]})
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
     assert r["results"][0]["action"] == "hold" and "preliminary" in r["results"][0]["reason"]
     assert not FakeTradingClient.submitted
@@ -259,7 +261,8 @@ if __name__ == "__main__":
 
     print("SCENARIO K: EXITS are targeted: each slot goes to the best available name, the rest stays as it is")
     fake = install(doc())                            # after reconciling: AAA 60, BBB 50, CCC 30 -> a 3-stock book
-    st = world(news=NEWS, verdict={**YES, "exit_symbols": ["AAA", "BBB"]})
+    st = world(news={**NEWS, "BBB": ["BBB recalls its flagship product"]},
+               verdict={"verdicts": [sell(), sell("BBB", "BBB recalled its flagship product.")]})
     asked = []
     def ranked(sectors, top_n, context=None):
         asked.append((top_n, context))
@@ -269,6 +272,7 @@ if __name__ == "__main__":
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
     assert r["results"][0]["action"] == "recalibrated" and "Selling: AAA, BBB." in r["results"][0]["reason"], r
     assert asked == [(3, {"held": ["CCC"], "blocked": ["AAA", "BBB"]})], asked
+    assert fake.docs["p1"]["rebalance_history"][-1]["replacement"] == "done" and len(fake.docs["p1"]["rebalance_history"]) == 1
     d = fake.docs["p1"]
     ev = d["rebalance_history"][-1]
     assert ev["excluded"] == ["AAA", "BBB"] and set(ev["target_weights"]) == {"CCC", "DDD", "EEE"}, ev["target_weights"]
@@ -278,9 +282,74 @@ if __name__ == "__main__":
     assert d["holdings"]["DDD"]["entry_date"] == TODAY.isoformat(), "'since purchase' starts at the purchase"
     ok(f"orders {trades}")
 
+    print("SCENARIO K2: THE SALE COMES FIRST: the agent failing can't keep a stock the rules said to sell")
+    fake = install(doc())
+    st = world(news=NEWS)
+    seen_at_recommend = {}
+    def agent_down(sectors, top_n, context=None):
+        seen_at_recommend.update(holdings=dict(fake.docs["p1"]["holdings"]), events=len(fake.docs["p1"]["rebalance_history"]))
+        raise TimeoutError("query did not respond within 360s")
+    web_ui.recommend = agent_down
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    d = fake.docs["p1"]
+    assert r["results"][0]["action"] == "recalibrated" and "slot stays cash" in r["results"][0]["reason"], r
+    assert "AAA" not in seen_at_recommend["holdings"] and seen_at_recommend["events"] == 1, "sold and recorded BEFORE asking the agent"
+    assert [(s, side) for s, side, _ in FakeTradingClient.submitted] == [("AAA", "sell")], FakeTradingClient.submitted
+    ev = d["rebalance_history"][-1]
+    assert "AAA" not in d["holdings"] and d["holdings"]["BBB"]["shares"] == 50 and ev["replacement"].startswith("none: TimeoutError")
+    assert "slot stays cash" in ev["reason"] and d["cash_remaining"] > 1000
+    assert d["proactive_checks"][-1]["recalibration"]["replacement_error"]
+    html = c.get("/portfolios/p1").get_data(as_text=True)
+    assert "slot stays cash" in html
+    ok("sold AAA, recorded it, then the agent failed: the money is cash, the page says so, the rest wasn't touched")
+
+    print("SCENARIO K3: a sale that can't go through is an error; nothing is recorded as sold")
+    fake = install(doc(pending_order_ids={}))
+    st = world(news=NEWS)
+    real_submit = FakeTradingClient.submit_order
+    FakeTradingClient.submit_order = lambda self, req: (_ for _ in ()).throw(RuntimeError("broker down"))
+    try:
+        r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    finally:
+        FakeTradingClient.submit_order = real_submit
+    assert r["results"][0]["action"] == "error" and "Could not sell AAA" in r["results"][0]["reason"], r
+    assert fake.docs["p1"]["rebalance_history"] == [], "nothing happened, so nothing is recorded"
+    assert "AAA" in fake.docs["p1"]["holdings"] and st["recommend_calls"] == 0
+    ok("AAA still held; no replacement bought")
+
+    print("SCENARIO K4: the same headline gets the same verdict in every portfolio, and a dry run agrees with the real run")
+    fake = install(doc(pending_order_ids={}))
+    fake.docs["p2"] = {**doc(pending_order_ids={}), "name": "Second"}
+    fake.versions["p2"] = 1
+    st = world(news=NEWS, verdict={"verdicts": [{"symbol": "AAA", "sell": False, "confidence": 0.9, "reason": "Routine."},
+                                                {"symbol": "BBB", "sell": False, "confidence": 0.9, "reason": "Routine."}]})
+    r = c.post("/portfolios/proactive_check?dry_run=1", headers=TOKEN).get_json()
+    assert r["checked"] == 2 and len(st["claude"].calls) == 1, (r, len(st["claude"].calls))
+    r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
+    assert len(st["claude"].calls) == 1 and {x["action"] for x in r["results"]} == {"hold"}, r
+    ok("one model call across 2 portfolios and 2 runs")
+
+    print("SCENARIO K5: the timeout really stops waiting")
+    import threading
+    release = threading.Event()
+    t0 = time.time()
+    try:
+        web_ui._call_with_timeout(lambda: release.wait(10), timeout=0.2)
+        raise AssertionError("should have timed out")
+    except TimeoutError:
+        pass
+    took = time.time() - t0
+    release.set()
+    assert took < 2, took
+    ok(f"gave up after {took:.1f}s with the call still running")
+
     print("SCENARIO L: what was sold can't come back for 30 days, whatever sold it; a bad agent answer can't undo that")
-    d["rebalance_history"][-1]["date"] = (TODAY - timedelta(days=10)).isoformat()   # no longer today
-    FakeTradingClient.submitted = []
+    fake = install(doc(pending_order_ids={},
+                       holdings={"CCC": {"shares": 30, "entry_price": 25.0, "cost": 750.0}, "DDD": {"shares": 30, "entry_price": 25.0, "cost": 750.0}},
+                       rebalance_history=[{"date": (TODAY - timedelta(days=10)).isoformat(), "trigger": "proactive", "excluded": ["AAA", "BBB"],
+                                           "orders": [{"symbol": "AAA", "side": "SELL", "qty": 1, "result": "FILLED"},
+                                                      {"symbol": "BBB", "side": "SELL", "qty": 1, "result": "FILLED"}]}]))
+    world()
     seen_ctx = []
     def stale_agent(sectors, top_n, context=None):                      # an agent that ignores the block
         seen_ctx.append(context)
