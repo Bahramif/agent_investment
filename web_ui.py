@@ -1245,6 +1245,10 @@ ABOUT_PAGE = """
         verdict per stock per day, shared by every portfolio holding it. Only that stock is sold, and
         only a stop can go past the limit. The sale happens first; its slot is filled afterwards, or
         stays cash until the next recalibration if no replacement can be found.</li>
+      <li>The news watch also reads each sector you hold as a whole: every stock's news and moves. If a
+        sector moves unusually for it (2 of its own daily sigmas, up or down) and the model judges that a
+        real change in its outlook, the whole portfolio is re-ranked by the same rules as a scheduled
+        recalibration. This counts toward the same limit of two early trades in 30 days.</li>
       <li>Every order is reviewed before it is placed: hard checks and the AI reviewer can block a
         buy, on every trigger, and never block a sell</li>
       <li>Closing a portfolio sells every real holding and removes it from the Portfolio tab's

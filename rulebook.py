@@ -30,7 +30,10 @@ THE LIFE OF A POSITION
                 so a name slipping from 11th to 13th does not trade.
   4. SIZE       inverse volatility, capped per name. No return forecast.
   5. LIMIT      sub-industry and portfolio-beta limits; any excess stays cash.
-  6. SELL       rank falls out of the keep band (at a scheduled recalibration);
+  6. RE-RANK    a sector moving unusually (sector_move_sigmas of its own volatility)
+                lets the news watch's sector review re-run steps 1-5 early, within
+                the early-trade limit, if the move reflects a real change.
+  7. SELL       rank falls out of the keep band (at a scheduled recalibration);
                 or the STOP: below cost AND behind its sector by
                 stop_sigma_mult monthly sigmas since purchase; or news the
                 model judges thesis-breaking. News and stops sell only the
@@ -74,6 +77,8 @@ class RulebookConfig:
     # selling
     stop_sigma_mult: float = 3.0
     reentry_block_days: int = 30
+    # a whole sector moving unusually (in its own daily sigmas) lets the news watch consider a re-rank
+    sector_move_sigmas: float = 2.0
     # buying
     earnings_block_days: int = 3
     # portfolio limits
@@ -97,8 +102,8 @@ def config_from_dict(raw: Optional[Dict[str, Any]]) -> RulebookConfig:
         raise ValueError("rulebook.pullback_weight must be in [0, 1)")
     if cfg.keep_rank_multiple < 1.0:
         raise ValueError("rulebook.keep_rank_multiple must be >= 1")
-    if cfg.stop_sigma_mult <= 0 or cfg.max_portfolio_beta <= 0:
-        raise ValueError("rulebook: stop_sigma_mult and max_portfolio_beta must be positive")
+    if cfg.stop_sigma_mult <= 0 or cfg.max_portfolio_beta <= 0 or cfg.sector_move_sigmas <= 0:
+        raise ValueError("rulebook: stop_sigma_mult, sector_move_sigmas and max_portfolio_beta must be positive")
     if not 0.0 < cfg.max_industry_weight <= 1.0:
         raise ValueError("rulebook.max_industry_weight must be in (0, 1]")
     if cfg.reentry_block_days < 0 or cfg.earnings_block_days < 0 or cfg.min_history_bars < 0:
@@ -465,6 +470,19 @@ def stop_breached(price: float, entry_price: float, sector_return: Optional[floa
         return False
     own = price / entry_price - 1.0
     return own < 0.0 and own - sector_return <= -stop_threshold(daily_vol, cfg)
+
+
+def unusual_sector_move(day_move: Optional[float], move_5d: Optional[float], daily_vol: Optional[float],
+                        cfg: Optional[RulebookConfig] = None) -> bool:
+    """Has a whole sector moved unusually for THAT sector, up or down, today or over
+    the last 5 trading days? Measured in its own volatility, so the bar is the same
+    idea for a calm sector and a wild one."""
+    cfg = cfg or default_config()
+    if not daily_vol:
+        return False
+    today = day_move is not None and abs(day_move) >= cfg.sector_move_sigmas * daily_vol
+    week = move_5d is not None and abs(move_5d) >= cfg.sector_move_sigmas * daily_vol * math.sqrt(5)
+    return today or week
 
 
 def reentry_blocked(p: Dict[str, Any], today: date, cfg: Optional[RulebookConfig] = None) -> Dict[str, str]:

@@ -61,3 +61,16 @@ Annualised return / Sharpe per period; the last columns are simple averages over
 | clean: keep band 3x | +11.1% / 0.61 | +23.8% / 0.79 | +15.2% / 0.69 | +52.9% / 2.28 | +20.0% / 0.90 | +24.6% | 1.05 | -28.1% | 2.0x | 1 |
 | clean: pullback credit 0.10 | +13.9% / 0.72 | +26.7% / 0.89 | +8.8% / 0.45 | +52.6% / 2.26 | +24.4% / 1.08 | +25.3% | 1.08 | -28.5% | 3.2x | 1 |
 | clean: no re-entry block | +15.5% / 0.78 | +20.6% / 0.72 | +12.6% / 0.60 | +55.2% / 2.43 | +27.8% / 1.13 | +26.3% | 1.13 | -28.0% | 2.6x | 1 |
+
+## Re-ranking on unusual sector moves (mechanical, all five sectors, 12 stocks)
+
+Fires on every unusual sector move, up to 2 per 30 days. The model's filter can't be replayed, so this isn't a test of its judgement. Annualised return / Sharpe.
+
+| Rule | 2017-18 | 2019-20 | 2021-22 | 2023-24 | 2025-26 | Avg return | Avg Sharpe | Avg max DD | Avg turnover | Re-ranks per period |
+|---|---|---|---|---|---|---|---|---|---|---|
+| clean: no sector rule | +15.5% / 0.78 | +20.6% / 0.72 | +12.6% / 0.60 | +56.4% / 2.44 | +28.6% / 1.14 | +26.8% | 1.14 | -28.0% | 2.5x | 0 |
+| clean: re-rank at 2 sigma | +13.1% / 0.67 | +25.4% / 0.84 | +12.3% / 0.60 | +55.6% / 2.34 | +26.3% / 1.05 | +26.6% | 1.10 | -27.8% | 2.9x | 30 |
+| clean: re-rank at 3 sigma | +14.3% / 0.73 | +25.5% / 0.84 | +7.1% / 0.40 | +54.9% / 2.41 | +28.7% / 1.15 | +26.1% | 1.11 | -28.5% | 2.7x | 11 |
+| no sector rule | +18.5% / 1.00 | +27.6% / 0.89 | +28.6% / 1.15 | +64.0% / 2.79 | +51.5% / 1.92 | +38.0% | 1.55 | -23.5% | 1.7x | 0 |
+| re-rank at 2 sigma | +17.9% / 0.97 | +31.0% / 0.95 | +26.7% / 1.09 | +65.3% / 2.80 | +50.7% / 1.85 | +38.3% | 1.53 | -23.5% | 1.9x | 29 |
+| re-rank at 3 sigma | +19.2% / 1.03 | +31.2% / 0.95 | +25.6% / 1.06 | +62.1% / 2.72 | +49.8% / 1.87 | +37.6% | 1.53 | -23.1% | 1.8x | 10 |
