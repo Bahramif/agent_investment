@@ -34,6 +34,7 @@ PROJECT = os.environ.get("MERIDIAN_PROJECT", "meridian-508414")
 _COLLECTION = "meridian_portfolios"
 _STRATEGIST_COLLECTION = "meridian_strategist"
 _STRATEGIST_DOC = "memory"
+_NEWS_COLLECTION = "meridian_news_verdicts"
 
 _client = None
 
@@ -177,6 +178,29 @@ def record_rebalance(portfolio_id: str, new_holdings: Dict[str, Dict[str, float]
         "rebalance_history": history,
         "next_rebalance_date": next_rebalance_date,
     })
+
+
+def update_last_rebalance(portfolio_id: str, new_holdings: Dict[str, Dict[str, Any]], new_cash_remaining: float,
+                          pending_order_ids: Dict[str, str], event_updates: Dict[str, Any]) -> None:
+    """Second half of a targeted exit: the sale was recorded the moment it happened,
+    and this folds the search for a replacement into that same history event."""
+    doc_ref = _get_client().collection(_COLLECTION).document(portfolio_id)
+    snap = doc_ref.get()
+    history = (snap.to_dict() or {}).get("rebalance_history", []) if snap.exists else []
+    if history:
+        history[-1] = {**history[-1], **event_updates}
+    doc_ref.update({"holdings": new_holdings, "cash_remaining": new_cash_remaining,
+                    "pending_order_ids": pending_order_ids, "rebalance_history": history})
+
+
+def get_news_verdicts(day: str) -> Dict[str, Any]:
+    """The news review's verdict per stock for one day (proactive_recal.NewsBook)."""
+    snap = _get_client().collection(_NEWS_COLLECTION).document(day).get()
+    return (snap.to_dict() or {}) if snap.exists else {}
+
+
+def save_news_verdicts(day: str, verdicts: Dict[str, Any]) -> None:
+    _get_client().collection(_NEWS_COLLECTION).document(day).set(verdicts)
 
 
 def get_strategist_memory() -> Dict[str, Any]:

@@ -147,6 +147,9 @@ crypto_analyst_node = make_analyst_node("crypto_snapshots")
 # data arrived — re-derive on a cadence, not on every tick.
 # -----------------------------------------------------------------------------
 STRATEGIC_REVIEW_CADENCE_DAYS = 90.0
+# One slow sector view must not hold up a recommendation: past this, a sector
+# still waiting on the model uses its last saved view, or the rules-based one.
+STRATEGIST_DEADLINE_S = 90.0
 
 
 def _age_view(view: HorizonView, elapsed_days: float) -> HorizonView:
@@ -165,6 +168,7 @@ def _strategic_due(prior: Optional[ThemeStrategy], elapsed_days: float, forced: 
 def make_strategist_reasoning_node(
     reason_strategic: Callable[[MacroSnapshot], HorizonView] = reason_strategic_view,
     reason_tactical: Callable[[MacroSnapshot], HorizonView] = reason_tactical_view,
+    deadline_s: Optional[float] = None,
 ):
     """Factory, not a plain function — deliberately.
 
@@ -211,16 +215,35 @@ def make_strategist_reasoning_node(
                 strategic = _age_view(prior.strategic, elapsed)
             return ThemeStrategy(theme, strategic, tactical)
 
+        def without_model(theme: str) -> Optional[ThemeStrategy]:
+            """A sector the model didn't answer for in time: its last saved view,
+            aged, or else the rules-based reasoners, which make no outside call."""
+            prior = prior_memory.get(theme)
+            if prior is not None:
+                return ThemeStrategy(theme, _age_view(prior.strategic, elapsed), _age_view(prior.tactical, elapsed))
+            snap = snapshots.get(theme)
+            return ThemeStrategy(theme, reason_strategic_view(snap), reason_tactical_view(snap)) if snap else None
+
         # Themes are independent, so they are resolved CONCURRENTLY: with an LLM
-        # behind the reasoners each call takes seconds (Gemini Pro thinks 10-30s),
-        # and one-after-another over every theme pushed the whole recommendation
-        # toward the 5-minute budget recalibrations wait on. Output order and
-        # content are identical to the sequential loop.
-        from concurrent.futures import ThreadPoolExecutor
+        # behind the reasoners each call takes seconds. The deadline bounds the
+        # whole step; a call still hanging past it finishes in the background
+        # and its answer is ignored.
+        from concurrent.futures import ThreadPoolExecutor, wait
         all_themes = sorted(set(prior_memory) | set(snapshots))
-        with ThreadPoolExecutor(max_workers=max(1, min(8, len(all_themes)))) as pool:
-            resolved = list(pool.map(resolve, all_themes))
-        updated: Dict[str, ThemeStrategy] = {t: r for t, r in zip(all_themes, resolved) if r is not None}
+        limit = deadline_s if deadline_s is not None else STRATEGIST_DEADLINE_S
+        pool = ThreadPoolExecutor(max_workers=max(1, min(8, len(all_themes))))
+        futures = {t: pool.submit(resolve, t) for t in all_themes}
+        wait(list(futures.values()), timeout=limit)
+        updated: Dict[str, ThemeStrategy] = {}
+        for theme, future in futures.items():
+            if future.done() and not future.exception():
+                resolved = future.result()
+            else:
+                print(f"[firm_graph] no model view for {theme} within {limit:.0f}s: using its saved or rules-based view")
+                resolved = without_model(theme)
+            if resolved is not None:
+                updated[theme] = resolved
+        pool.shutdown(wait=False, cancel_futures=True)
 
         return {"theme_strategies": list(updated.values()), "theme_memory": updated}
     return _node
@@ -801,6 +824,23 @@ if __name__ == "__main__":
     assert len(gap["theme_strategies"]) == 6 and all(ts.strategic.age_days == 3.0 for ts in gap["theme_strategies"])
     print(f"✓ 6 themes x 2 slow calls in {took:.1f}s (sequential would be {6 * 2 * 0.2:.1f}s), "
           f"peak {live['peak']} concurrent; identical to the sequential result; data gaps still just age")
+
+    print("TEST: a hanging sector call can't hold up the step; it falls back and the others keep their views")
+    release = threading.Event()
+    def hang_energy(snap):
+        if snap.theme == "ai":
+            release.wait(5)
+        return reason_tactical_view(snap)
+    prior = out["theme_memory"]["ai"]
+    node = make_strategist_reasoning_node(reason_strategic_view, hang_energy, deadline_s=0.2)
+    t0 = _time.time()
+    fast = node({"macro_snapshots": snaps, "theme_memory": {"ai": prior}, "elapsed_days": 1.0})
+    took = _time.time() - t0
+    release.set()
+    assert took < 2 and len(fast["theme_strategies"]) == 6, took
+    assert fast["theme_memory"]["ai"].tactical.age_days == prior.tactical.age_days + 1.0, "its last saved view, aged"
+    assert fast["theme_memory"]["energy"].tactical.age_days == 0.0, "the other sectors are unaffected"
+    print(f"✓ back in {took:.1f}s with the saved view for the slow sector")
 
     print("\n" + "=" * 70)
     print("ATTEMPTING build_compiled_graph() — requires `pip install langgraph`")

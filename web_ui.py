@@ -233,12 +233,16 @@ def _call_with_timeout(fn, *args, timeout: float = 300.0, **kwargs):
     the call in a worker thread and enforces a hard wall-clock ceiling
     instead, since there's no cooperative way to cancel it from here."""
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeoutError:
-            raise TimeoutError(f"{getattr(fn, '__name__', fn)} did not respond within {timeout:.0f}s")
+    # Not a `with` block: leaving one waits for the worker, so a hung call would
+    # still hold this request after its time was up.
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, *args, **kwargs)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} did not respond within {timeout:.0f}s")
+    finally:
+        pool.shutdown(wait=False)
 
 
 def _strategist_memory() -> tuple:
@@ -295,6 +299,11 @@ def _build_recommend_state(selected_sectors: List[str], top_n: int, context: Opt
     return thread_id, state
 
 
+# Allows for the agent's own budgets: about 90s of data, then at most 120s of desk
+# scoring and 90s of sector views.
+RECOMMEND_TIMEOUT_S = 360.0
+
+
 def recommend(selected_sectors: List[str], top_n: int = TOP_N_TOTAL, context: Optional[Dict[str, Any]] = None) -> dict:
     """Asks the deployed agent to run its real pipeline (live ingestion ->
     analyst scoring -> strategist tilts -> risk check) over the selected
@@ -302,7 +311,8 @@ def recommend(selected_sectors: List[str], top_n: int = TOP_N_TOTAL, context: Op
     many of each sector's highest-conviction names the allocator will
     actually fund — the user-facing "max number of stocks" setting."""
     thread_id, state = _build_recommend_state(selected_sectors, top_n, context)
-    return _finish_recommendation(_call_with_timeout(_remote_agent.query, thread_id=thread_id, state=state, timeout=300.0))
+    return _finish_recommendation(_call_with_timeout(_remote_agent.query, thread_id=thread_id, state=state,
+                                                     timeout=RECOMMEND_TIMEOUT_S))
 
 
 # Human-friendly labels for each real LangGraph node name, shown live while
@@ -1231,8 +1241,14 @@ ABOUT_PAGE = """
       <li>If you turn on the news watch, it checks daily whether a holding must be sold early, for
         one of two reasons. The <b>stop</b>: below what was paid AND behind its sector, since
         purchase, by 3 of its own monthly sigmas (about 35% for a 40%-volatility stock, 22% for a
-        25% one), so it only catches severe breakdowns. Or <b>news</b> the model judges thesis-breaking, at most twice in 30 days. Only
-        that stock is sold and its slot filled; only a stop can go past the limit.</li>
+        25% one), so it only catches severe breakdowns. Or <b>news</b> the model judges thesis-breaking, at most twice in 30 days. There is one
+        verdict per stock per day, shared by every portfolio holding it. Only that stock is sold, and
+        only a stop can go past the limit. The sale happens first; its slot is filled afterwards, or
+        stays cash until the next recalibration if no replacement can be found.</li>
+      <li>The news watch also reads each sector you hold as a whole: every stock's news and moves. If a
+        sector moves unusually for it (2 of its own daily sigmas, up or down) and the model judges that a
+        real change in its outlook, the whole portfolio is re-ranked by the same rules as a scheduled
+        recalibration. This counts toward the same limit of two early trades in 30 days.</li>
       <li>Every order is reviewed before it is placed: hard checks and the AI reviewer can block a
         buy, on every trigger, and never block a sell</li>
       <li>Closing a portfolio sells every real holding and removes it from the Portfolio tab's
@@ -2751,105 +2767,12 @@ def _drop_and_resize(weights: Dict[str, float], exclude: Sequence[str], n: int, 
     return out
 
 
-def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "",
-                          exclude: Sequence[str] = ()) -> Dict[str, Any]:
-    """The actual recalibration, sized against the portfolio's CURRENT
-    mark-to-market value, placing REAL Alpaca orders for the SHARE DELTA between
-    what it holds and its new target. Callable manually
-    (/portfolios/<id>/recalibrate), by the daily due-check
-    (/portfolios/recalibrate_due) or by the news watch
-    (/portfolios/proactive_check). `trigger` ("manual" | "scheduled" | "proactive")
-    and `reason` are recorded on the history event.
-
-    Follows rulebook.py on every trigger: holdings inside the keep band stay,
-    anything sold in the last reentry_block_days isn't bought back, changes too
-    small to be worth their cost don't trade, and sells go first. Only runs while
-    the market is open, so orders fill at live prices rather than at the next
-    open at a price nobody saw.
-
-    `exclude` (the news watch's exits) makes it TARGETED: only those stocks are
-    sold, each slot goes to the best available name, and every other holding is
-    left exactly as it is."""
-    import portfolio_store
-    from datetime import datetime, timedelta, timezone
-    from alpaca.trading.client import TradingClient
-    from alpaca_clients import AlpacaBrokerClient
+def _place_orders(portfolio_id: str, plan: List[Dict[str, Any]], vetoed: Dict[str, str], holdings: Dict[str, Dict[str, Any]],
+                  rebalance_date: str, broker: Any) -> tuple:
+    """Places `plan` in order. Returns (holdings afterwards, orders, errors, orders
+    still pending). Anything not traded carries over untouched."""
     from execution_workflow import Order, Side
-
-    p = portfolio_store.get_portfolio(portfolio_id)
-    if p is None or p.get("status") != "open":
-        return {"error": "Portfolio not found or already closed."}
-    try:
-        market_open = _market_open()
-    except Exception as e:
-        return {"error": f"Could not check market hours ({e}), so nothing was traded."}
-    if not market_open:
-        return {"error": "The market is closed. Recalibrations only trade during market hours."}
-
-    # Size this rebalance off what the portfolio ACTUALLY holds. An earlier
-    # recalibration's orders may have filled since its ledger was written;
-    # without this, deltas are computed against stale holdings and (order IDs
-    # being date-stamped) a second, duplicate rebalance is placed on top.
-    if p.get("pending_order_ids") and _reconcile_portfolio_orders(portfolio_id):
-        p = portfolio_store.get_portfolio(portfolio_id) or p
-
-    rules = rulebook.default_config()
-    today = datetime.now(timezone.utc).date()
-    old_holdings = p.get("holdings") or {}
-    live = _live_prices(list(old_holdings.keys()))
-    current_value = _mark_to_market(p, live)["mtm_value"]
-
-    # Keep the number of stocks the portfolio was LAUNCHED with: recalibration
-    # changes which stocks, never how many. Older portfolios without n_stocks
-    # (see backfill_n_stocks.py) keep their current count.
-    n_stocks = int(p.get("n_stocks") or len(old_holdings) or p.get("top_n") or TOP_N_TOTAL)
-    exclude = sorted({str(s).upper() for s in exclude or ()})
-    blocked = sorted(set(rulebook.reentry_blocked(p, today, rules)) | set(exclude))
-    result = recommend(p["sectors"], n_stocks,
-                       {"held": sorted(set(old_holdings) - set(exclude)), "blocked": blocked})
-    weights = result.get("final_weights") or {}
-    if set(weights) & set(blocked):               # the rule also holds if the agent didn't apply it
-        weights = _drop_and_resize(weights, blocked, n_stocks, _max_per_name_for(n_stocks))
-    notes = result.get("book_notes") or {}
-    if not weights:
-        return {"error": f"Recalibration produced no recommendation "
-                         f"(status: {result.get('status')}, risk: {result.get('risk_verdict')})."}
-
-    kept: set = set()
-    if exclude:                                   # targeted: everything else stays exactly as it is
-        kept = set(old_holdings) - set(exclude)
-        current = {s: float(h.get("shares") or 0) * (live.get(s) or h.get("entry_price") or 0.0) / current_value
-                   for s, h in old_holdings.items()} if current_value > 0 else {}
-        fresh = sorted((s for s in weights if s not in old_holdings),
-                       key=lambda s: (-float((notes.get(s) or {}).get("conviction") or 0.0), -weights[s], s))
-        weights = rulebook.targeted_weights(current, exclude, fresh,
-                                            {s: (notes.get(s) or {}).get("industry") or "" for s in set(current) | set(fresh)},
-                                            {s: (notes.get(s) or {}).get("beta") for s in set(current) | set(fresh)}, rules)
-
-    all_symbols = sorted(set(old_holdings) | set(weights.keys()))
-    new_prices = _live_prices(all_symbols)
-    tc = TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True)
-    broker = AlpacaBrokerClient(tc)
-
-    # ---- the orders: sells first, so a buy never waits on proceeds. Reviewed by
-    # the evaluation agent (rec_evaluator.py) before anything is placed.
-    plan: List[Dict[str, Any]] = []
-    for sym in all_symbols:
-        px = new_prices.get(sym) or (old_holdings.get(sym) or {}).get("entry_price")
-        cur = (old_holdings.get(sym) or {}).get("shares", 0)
-        if not px or sym in kept:
-            continue
-        tgt = math.floor((current_value * weights.get(sym, 0.0)) / px) if weights.get(sym, 0.0) > 0 else 0
-        if tgt == cur or rulebook.below_min_trade((tgt - cur) * px, current_value, tgt, rules):
-            continue
-        plan.append({"symbol": sym, "side": "BUY" if tgt > cur else "SELL", "qty": abs(tgt - cur),
-                     "price": px, "current_shares": cur})
-    plan.sort(key=lambda o: (o["side"] != "SELL", o["symbol"]))
-    review = _review_plan(p, plan, weights, notes, trigger, reason)          # never raises
-    vetoed = review.get("vetoed") or {}
-
-    rebalance_date = today.isoformat()
-    new_holdings: Dict[str, Dict[str, Any]] = dict(old_holdings)   # anything not traded carries over untouched
+    new_holdings: Dict[str, Dict[str, Any]] = dict(holdings)
     orders_placed: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     # Orders accepted but not yet resolved — same tracking
@@ -2857,7 +2780,6 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     # recalibration doesn't place a duplicate of a still-pending order, and
     # closing the portfolio cancels these too instead of leaving them live.
     new_pending: Dict[str, str] = {}
-
     for o in plan:
         sym, qty, price, current_shares = o["symbol"], o["qty"], o["price"], o["current_shares"]
         if o["side"] == "BUY" and sym in vetoed:        # the evaluator blocked this buy
@@ -2893,7 +2815,7 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
             added_cost = fill.filled_notional or (real_qty * price)
             if side == Side.BUY and current_shares > 0:
                 # Blend cost basis and entry date: kept shares' + newly bought shares'.
-                old = old_holdings[sym]
+                old = holdings[sym]
                 old_cost = current_shares * old["entry_price"]
                 entry_price = (old_cost + added_cost) / actual_shares
                 entry_date = rulebook.blended_entry_date(old.get("entry_date"), old_cost, rebalance_date, added_cost)
@@ -2901,13 +2823,210 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
                 entry_price = added_cost / real_qty if real_qty else price
                 entry_date = rebalance_date
             else:   # partial or full SELL, shares remain: cost basis per share is unchanged
-                entry_price = old_holdings[sym]["entry_price"]
-                entry_date = old_holdings[sym].get("entry_date")
+                entry_price = holdings[sym]["entry_price"]
+                entry_date = holdings[sym].get("entry_date")
             new_holdings[sym] = {"shares": actual_shares, "entry_price": entry_price,
                                  "cost": actual_shares * entry_price, "entry_date": entry_date}
         except Exception as e:
-            print(f"[web_ui] recalibration order failed for {sym}: {e}")
+            print(f"[web_ui] order failed for {sym}: {e}")
             errors.append({"symbol": sym, "error": str(e)})
+    return new_holdings, orders_placed, errors, new_pending
+
+
+def _holdings_after(holdings: Dict[str, Dict[str, Any]], plan: List[Dict[str, Any]], pending: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    """Holdings right after trading (orders still filling counted at their size):
+    the Portfolio page's "what changed" column reads this."""
+    return {**{s: {"shares": h["shares"]} for s, h in holdings.items()},
+            **{o["symbol"]: {"shares": o["current_shares"] + (o["qty"] if o["side"] == "BUY" else -o["qty"])}
+               for o in plan if o["symbol"] in pending}}
+
+
+def _signals_of(names: Sequence[str], notes: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """What drove each pick; the scorecard attributes outcomes to these."""
+    return {s: {k: (notes.get(s) or {}).get(k) for k in
+                ("dip_score", "drawdown_6m", "momentum_1m", "momentum_12_1", "conviction", "rating", "quality_score")}
+            for s in names}
+
+
+def _targeted_exit(p: Dict[str, Any], exits: Sequence[str], trigger: str, reason: str, rules: rulebook.RulebookConfig,
+                   today: Any, live: Dict[str, float], current_value: float, n_stocks: int) -> Dict[str, Any]:
+    """A stop or the news review sells only `exits`, and everything else stays.
+
+    THE SALE COMES FIRST and is recorded as soon as it happens: it needs nothing
+    from the agent, so a slow or failed recommendation can never keep a stock the
+    rules said to sell. Finding replacements comes second. If that fails, the money
+    stays in cash until the next recalibration re-fills the slots."""
+    import portfolio_store
+    from datetime import datetime, timedelta, timezone
+    from alpaca.trading.client import TradingClient
+    from alpaca_clients import AlpacaBrokerClient
+
+    portfolio_id = p["id"]
+    old_holdings = p.get("holdings") or {}
+    rebalance_date = today.isoformat()
+    broker = AlpacaBrokerClient(TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True))
+
+    def price_of(sym: str, h: Optional[Dict[str, Any]] = None) -> float:
+        return float(prices.get(sym) or (h or {}).get("entry_price") or 0.0)
+
+    def cash_for(holdings: Dict[str, Dict[str, Any]]) -> float:
+        return max(0.0, current_value - sum(price_of(s, h) * h["shares"] for s, h in holdings.items()))
+
+    prices = dict(live)
+    sells = [{"symbol": s, "side": "SELL", "qty": old_holdings[s]["shares"], "price": price_of(s, old_holdings[s]),
+              "current_shares": old_holdings[s]["shares"]} for s in exits if s in old_holdings]
+    holdings, orders, errors, pending = _place_orders(portfolio_id, sells, {}, old_holdings, rebalance_date, broker)
+    if not orders:
+        return {"error": f"Could not sell {', '.join(exits)}: " + ("; ".join(e["error"] for e in errors) or "not held")}
+
+    sold = [s for s in exits if s in old_holdings and s not in holdings]
+    current = {s: float(h.get("shares") or 0) * price_of(s, h) / current_value
+               for s, h in old_holdings.items()} if current_value > 0 else {}
+    cadence = p.get("rebalance_every_days", 0) or 0
+    next_date = (datetime.now(timezone.utc) + timedelta(days=cadence)).date().isoformat() if cadence > 0 else None
+    portfolio_store.record_rebalance(
+        portfolio_id, holdings, cash_for(holdings), pending,
+        event={"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(), "orders": orders, "errors": errors,
+               "portfolio_value_before": current_value,
+               "target_weights": {s: w for s, w in current.items() if s in holdings},
+               "trigger": trigger, "reason": reason[:1000], "review": {}, "excluded": list(exits),
+               "holdings_after": _holdings_after(holdings, sells, pending), "signals": {},
+               "replacement": "looking"},
+        next_rebalance_date=next_date,
+    )
+    out: Dict[str, Any] = {"orders": orders, "errors": errors, "portfolio_value_before": current_value}
+
+    # ---- replacements. Nothing below can undo the sale.
+    try:
+        if not sold:
+            raise ValueError("the sale hasn't filled yet, so there's no money to reinvest")
+        blocked = sorted(set(rulebook.reentry_blocked(p, today, rules)) | set(exits))
+        result = recommend(p["sectors"], n_stocks, {"held": sorted(holdings), "blocked": blocked})
+        notes = result.get("book_notes") or {}
+        weights = {s: w for s, w in (result.get("final_weights") or {}).items() if s not in blocked}
+        fresh = sorted((s for s in weights if s not in old_holdings),
+                       key=lambda s: (-float((notes.get(s) or {}).get("conviction") or 0.0), -weights[s], s))
+        if not fresh:
+            raise ValueError(f"no replacement available (status: {result.get('status')}, risk: {result.get('risk_verdict')})")
+        names = set(current) | set(fresh)
+        target = rulebook.targeted_weights(current, sold, fresh, {s: (notes.get(s) or {}).get("industry") or "" for s in names},
+                                           {s: (notes.get(s) or {}).get("beta") for s in names}, rules)
+        prices.update(_live_prices(fresh))
+        plan: List[Dict[str, Any]] = []
+        for s in target:
+            if s in old_holdings or not prices.get(s):
+                continue
+            qty = math.floor(current_value * target[s] / prices[s])
+            if qty > 0 and not rulebook.below_min_trade(qty * prices[s], current_value, qty, rules):
+                plan.append({"symbol": s, "side": "BUY", "qty": qty, "price": prices[s], "current_shares": 0})
+        review = _review_plan(p, plan, target, notes, trigger, reason)          # never raises
+        final, bought, buy_errors, buy_pending = _place_orders(portfolio_id, plan, review.get("vetoed") or {}, holdings,
+                                                               rebalance_date, broker)
+        orders, errors = orders + bought, errors + buy_errors
+        pending = {**pending, **buy_pending}
+        portfolio_store.update_last_rebalance(
+            portfolio_id, final, cash_for(final), pending,
+            {"orders": orders, "errors": errors, "target_weights": target, "review": review, "replacement": "done",
+             "holdings_after": _holdings_after(final, plan + sells, pending), "signals": _signals_of(list(target), notes)})
+        out.update(orders=orders, errors=errors)
+    except Exception as e:
+        why = f"{type(e).__name__}: {e}"[:300]
+        print(f"[web_ui] replacement search failed for {portfolio_id}: {why}")
+        portfolio_store.update_last_rebalance(portfolio_id, holdings, cash_for(holdings), pending,
+                                              {"replacement": f"none: {why}",
+                                               "reason": f"{reason} Sold; no replacement yet, so the slot stays cash "
+                                                         f"until the next recalibration."[:1000]})
+        out["replacement_error"] = why
+    return out
+
+
+def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "",
+                          exclude: Sequence[str] = ()) -> Dict[str, Any]:
+    """The actual recalibration, sized against the portfolio's CURRENT
+    mark-to-market value, placing REAL Alpaca orders for the SHARE DELTA between
+    what it holds and its new target. Callable manually
+    (/portfolios/<id>/recalibrate), by the daily due-check
+    (/portfolios/recalibrate_due) or by the news watch
+    (/portfolios/proactive_check). `trigger` ("manual" | "scheduled" | "proactive")
+    and `reason` are recorded on the history event.
+
+    Follows rulebook.py on every trigger: holdings inside the keep band stay,
+    anything sold in the last reentry_block_days isn't bought back, changes too
+    small to be worth their cost don't trade, and sells go first. Only runs while
+    the market is open, so orders fill at live prices rather than at the next
+    open at a price nobody saw.
+
+    `exclude` (the news watch's exits) makes it TARGETED: see _targeted_exit."""
+    import portfolio_store
+    from datetime import datetime, timedelta, timezone
+    from alpaca.trading.client import TradingClient
+    from alpaca_clients import AlpacaBrokerClient
+
+    p = portfolio_store.get_portfolio(portfolio_id)
+    if p is None or p.get("status") != "open":
+        return {"error": "Portfolio not found or already closed."}
+    try:
+        market_open = _market_open()
+    except Exception as e:
+        return {"error": f"Could not check market hours ({e}), so nothing was traded."}
+    if not market_open:
+        return {"error": "The market is closed. Recalibrations only trade during market hours."}
+
+    # Size this rebalance off what the portfolio ACTUALLY holds. An earlier
+    # recalibration's orders may have filled since its ledger was written;
+    # without this, deltas are computed against stale holdings and (order IDs
+    # being date-stamped) a second, duplicate rebalance is placed on top.
+    if p.get("pending_order_ids") and _reconcile_portfolio_orders(portfolio_id):
+        p = portfolio_store.get_portfolio(portfolio_id) or p
+
+    rules = rulebook.default_config()
+    today = datetime.now(timezone.utc).date()
+    old_holdings = p.get("holdings") or {}
+    live = _live_prices(list(old_holdings.keys()))
+    current_value = _mark_to_market(p, live)["mtm_value"]
+
+    # Keep the number of stocks the portfolio was LAUNCHED with: recalibration
+    # changes which stocks, never how many. Older portfolios without n_stocks
+    # (see backfill_n_stocks.py) keep their current count.
+    n_stocks = int(p.get("n_stocks") or len(old_holdings) or p.get("top_n") or TOP_N_TOTAL)
+    exclude = sorted({str(s).upper() for s in exclude or ()})
+    if exclude:
+        return _targeted_exit(p, exclude, trigger, reason, rules, today, live, current_value, n_stocks)
+
+    blocked = sorted(rulebook.reentry_blocked(p, today, rules))
+    result = recommend(p["sectors"], n_stocks, {"held": sorted(old_holdings), "blocked": blocked})
+    weights = result.get("final_weights") or {}
+    if set(weights) & set(blocked):               # the rule also holds if the agent didn't apply it
+        weights = _drop_and_resize(weights, blocked, n_stocks, _max_per_name_for(n_stocks))
+    notes = result.get("book_notes") or {}
+    if not weights:
+        return {"error": f"Recalibration produced no recommendation "
+                         f"(status: {result.get('status')}, risk: {result.get('risk_verdict')})."}
+
+    all_symbols = sorted(set(old_holdings) | set(weights.keys()))
+    new_prices = _live_prices(all_symbols)
+    tc = TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True)
+    broker = AlpacaBrokerClient(tc)
+
+    # ---- the orders: sells first, so a buy never waits on proceeds. Reviewed by
+    # the evaluation agent (rec_evaluator.py) before anything is placed.
+    plan: List[Dict[str, Any]] = []
+    for sym in all_symbols:
+        px = new_prices.get(sym) or (old_holdings.get(sym) or {}).get("entry_price")
+        cur = (old_holdings.get(sym) or {}).get("shares", 0)
+        if not px:
+            continue
+        tgt = math.floor((current_value * weights.get(sym, 0.0)) / px) if weights.get(sym, 0.0) > 0 else 0
+        if tgt == cur or rulebook.below_min_trade((tgt - cur) * px, current_value, tgt, rules):
+            continue
+        plan.append({"symbol": sym, "side": "BUY" if tgt > cur else "SELL", "qty": abs(tgt - cur),
+                     "price": px, "current_shares": cur})
+    plan.sort(key=lambda o: (o["side"] != "SELL", o["symbol"]))
+    review = _review_plan(p, plan, weights, notes, trigger, reason)          # never raises
+
+    rebalance_date = today.isoformat()
+    new_holdings, orders_placed, errors, new_pending = _place_orders(portfolio_id, plan, review.get("vetoed") or {},
+                                                                     old_holdings, rebalance_date, broker)
 
     # BUG FIX, confirmed live: cash must be current_value minus the CURRENT
     # MARKET VALUE of what's held, not what was paid for it, or unrealized gains
@@ -2925,16 +3044,9 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
         event={"date": rebalance_date, "at": datetime.now(timezone.utc).isoformat(),
                "orders": orders_placed, "errors": errors,
               "portfolio_value_before": current_value, "target_weights": weights,
-              "trigger": trigger, "reason": reason[:1000], "review": review, "excluded": exclude,
-              # holdings right after this recalibration (orders still filling counted at their size) — the
-              # Portfolio page's "what changed" column reads this instead of reconstructing it
-              "holdings_after": {**{s: {"shares": h["shares"]} for s, h in new_holdings.items()},
-                                 **{o["symbol"]: {"shares": o["current_shares"] + (o["qty"] if o["side"] == "BUY" else -o["qty"])}
-                                    for o in plan if o["symbol"] in new_pending}},
-              # what drove each pick — the scorecard attributes outcomes to these
-              "signals": {s: {k: (notes.get(s) or {}).get(k) for k in
-                              ("dip_score", "drawdown_6m", "momentum_1m", "momentum_12_1", "conviction", "rating", "quality_score")}
-                          for s in weights}},
+              "trigger": trigger, "reason": reason[:1000], "review": review, "excluded": [],
+              "holdings_after": _holdings_after(new_holdings, plan, new_pending),
+              "signals": _signals_of(list(weights), notes)},
         next_rebalance_date=next_date,
     )
     return {"orders": orders_placed, "errors": errors, "portfolio_value_before": current_value}
@@ -3308,7 +3420,9 @@ def proactive_check_route():
         portfolios.append(p)
     deps = ProactiveDeps(quotes_fn=_intraday_quotes, news_fn=_headlines, recalibrate_fn=recalibrate,
                          record_fn=portfolio_store.record_proactive_check, client_fn=client,
-                         market_open_fn=_market_open, news_many_fn=_headlines_many, series_fn=_daily_closes)
+                         market_open_fn=_market_open, news_many_fn=_headlines_many, series_fn=_daily_closes,
+                         verdict_load_fn=portfolio_store.get_news_verdicts,
+                         verdict_save_fn=portfolio_store.save_news_verdicts)
     results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
     return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
             "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,

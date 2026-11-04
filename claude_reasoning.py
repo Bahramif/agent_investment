@@ -281,6 +281,7 @@ def _desk_prompt(snapshots: List[InstrumentSnapshot]) -> str:
 
 DESK_BATCH = 60          # stocks per scoring call: enough to compare a whole sector at once
 DESK_PARALLEL = 4        # batches scored concurrently (more just meets Vertex's burst 429s)
+DESK_DEADLINE_S = 120.0  # past this, a sector still waiting has no model read, like a failed call
 NEWS_STATUS = {"positive": "clean", "neutral": "clean", "negative": "negative", "thesis_break": "thesis_break"}
 NEWS_SENTIMENT = {"positive": 0.5, "neutral": 0.0, "negative": -0.5, "thesis_break": -1.0}
 
@@ -320,14 +321,18 @@ def reason_desk_convictions_claude(
     if not snapshots:
         return []
     client = client or _client()
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait
     sectors = {}
     for s in sorted(snapshots, key=lambda s: (s.path, s.name)):
         sectors.setdefault(rulebook.sector_of(s.path), []).append(s)
     batches = [peers[i:i + DESK_BATCH] for peers in sectors.values() for i in range(0, len(peers), DESK_BATCH)]
-    with ThreadPoolExecutor(max_workers=max(1, min(DESK_PARALLEL, len(batches)))) as pool:
-        results = list(pool.map(lambda b: _score_batch(b, client), batches))
-    reads = {n: e for batch in results for n, e in batch.items()}
+    pool = ThreadPoolExecutor(max_workers=max(1, min(DESK_PARALLEL, len(batches))))
+    futures = [pool.submit(_score_batch, b, client) for b in batches]
+    done, late = wait(futures, timeout=DESK_DEADLINE_S)
+    if late:
+        print(f"[claude_reasoning] {len(late)} desk batch(es) past {DESK_DEADLINE_S:.0f}s: no model read for those")
+    pool.shutdown(wait=False, cancel_futures=True)
+    reads = {n: e for f in done for n, e in f.result().items()}
     if not reads:
         return _fallback_desk(list(snapshots))
     for s in snapshots:
@@ -518,4 +523,30 @@ if __name__ == "__main__":
     assert all(by[n].rationale.startswith("Rules score") for n in next(c for c in bc.calls if "T060" in c)), \
         "the failed batch stays rules-only"
     print("✓ 3 one-sector batches; generous raw numbers don't win; a failed batch has no model read")
+
+    print("\nTEST 10: a hanging batch can't hold up scoring; that sector just has no model read")
+    import time as _t
+    release = threading.Event()
+
+    class HangClient:
+        messages = None
+        def __init__(self):
+            self.messages = self
+        def create(self, **kw):
+            text = kw["messages"][0]["content"]
+            names = [n for n in ("AAA", "BBB", "EEE", "FFF") if f"- {n} (" in text]
+            if "AAA" in names:
+                release.wait(5)
+            return _FakeResponse([_FakeToolUseBlock("score_instruments", {"scores": [_entry(n, 0.5) for n in names]})])
+    two = [_snap("AAA"), _snap("BBB"), _snap("EEE", "equities.energy"), _snap("FFF", "equities.energy")]
+    saved, DESK_DEADLINE_S = DESK_DEADLINE_S, 0.2
+    t0 = _t.time()
+    sigs = {s.name: s for s in reason_desk_convictions_claude(two, client=HangClient())}
+    took = _t.time() - t0
+    release.set()
+    DESK_DEADLINE_S = saved
+    assert took < 2 and len(sigs) == 4, took
+    assert sigs["AAA"].rationale.startswith("Rules score") and sigs["EEE"].rationale == "EEE why"
+    assert two[0].news_status == "unknown" and two[2].news_status == "clean"
+    print(f"✓ back in {took:.1f}s; the slow sector is rules-only, the other keeps its model read")
     print("  firm_graph.build_compiled_graph(reason_equities=analyst_fn, ...)")

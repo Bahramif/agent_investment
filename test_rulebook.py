@@ -157,6 +157,13 @@ if __name__ == "__main__":
     assert rb.targeted_weights({"A": 0.5, "B": 0.5}, ["B"], []) == {"A": 0.5}, "no replacement: the slot stays cash"
     ok("ok")
 
+    print("GENERIC 4: an unusual sector move is judged in that sector's own volatility, up or down, today or over a week")
+    assert rb.unusual_sector_move(-0.03, None, 0.01, CFG) and rb.unusual_sector_move(0.03, None, 0.01, CFG)
+    assert not rb.unusual_sector_move(-0.03, None, 0.02, CFG), "ordinary for a wilder sector"
+    assert rb.unusual_sector_move(-0.001, -0.05, 0.01, CFG), "a slide over 5 days counts"
+    assert not rb.unusual_sector_move(None, None, 0.01, CFG) and not rb.unusual_sector_move(-0.5, -0.5, None, CFG), "can't judge: no signal"
+    ok("ok")
+
     print("SMOOTH: no cliffs: a tiny change in any input moves the pullback credit by a tiny amount")
     for _ in range(20000):
         mom, dd, p5, v = rng.uniform(-0.2, 0.6), rng.uniform(-0.6, 0), rng.uniform(-0.2, 0.1), rng.uniform(0.01, 0.05)
@@ -284,6 +291,13 @@ if __name__ == "__main__":
     assert abs(t["M"] - (1.5 - 0.9) / 3.0) < 1e-9 and t["A"] == 0.30, t
     assert "N" not in rb.targeted_weights({"A": 0.36, "C": 0.2}, ["C"], ["N"], ind, {}, CFG), "already over: no new buy in it"
     ok("ok")
+
+    print("SIMULATION: re-ranking on sector moves stays within the early-trade limit and costs show up")
+    moved = run_simulation(price_series=series, sector_rerank=True, **kw)
+    assert moved.n_sector_rerank > 0 and moved.n_trades > res.n_trades, (moved.n_sector_rerank, moved.n_trades, res.n_trades)
+    assert moved.n_sector_rerank <= (len(res.dates) / 21 + 1) * 2 * 1.5
+    assert res.n_sector_rerank == 0, "off by default"
+    ok(f"{moved.n_sector_rerank} re-ranks, {moved.n_trades} trades vs {res.n_trades}")
 
     print("BY CHANCE: with no alpha at all, how often does each sell rule fire on one stock in a month?")
     paths, length = 20000, 21

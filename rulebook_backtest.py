@@ -170,6 +170,48 @@ def _run(job: Tuple[str, str, Optional[int], List[str], int, float]) -> Dict[str
             "warnings": res.warnings[:1]}
 
 
+def _sector_job(job: Tuple[str, float, Optional[float], bool]) -> Dict[str, Any]:
+    """One run of the sector-move study. `sigmas` None = no sector rule."""
+    period, cap, sigmas, clean = job
+    label, start, end = next(p for p in PERIODS if p[0] == period)
+    cfg = dataclasses.replace(BASE, **(PRICES_ONLY if clean else {}), sector_move_sigmas=sigmas or BASE.sector_move_sigmas)
+    series = {s: [r for r in rows if r[0] <= end] for s, rows in _PRICES.items()}
+    res = run_simulation(list(EQUITIES), ALL_SECTORS, series, CAPITAL, all_sectors=ALL_SECTORS, top_n=TOP_N, max_per_name=cap,
+                         start=start, end=end, cfg=cfg, fundamentals=_FUND, sector_rerank=sigmas is not None)
+    return {"period": period, "sigmas": sigmas, "clean": clean, **res.stats, "turnover": res.annual_turnover,
+            "reranks": res.n_sector_rerank, "costs": res.total_costs}
+
+
+def sector_study(cache_dir: str, workers: int, out: str) -> None:
+    """Does re-ranking on unusual sector moves help? This fires on EVERY unusual move
+    up to the limit: the model can't be replayed historically, and live it would
+    filter these. So it shows the mechanical rule, not the model's judgement."""
+    prices, fund = load_prices(cache_dir), load_fundamentals(cache_dir)
+    choices = (None, 2.0, 3.0)
+    jobs = [(p[0], MAX_PER_NAME, s, clean) for clean in (True, False) for s in choices for p in PERIODS]
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init, initargs=(prices, fund)) as pool:
+        rows = list(pool.map(_sector_job, jobs, chunksize=1))
+    periods = [p[0] for p in PERIODS]
+    L = ["", "## Re-ranking on unusual sector moves (mechanical, all five sectors, 12 stocks)", "",
+         "Fires on every unusual sector move, up to 2 per 30 days. The model's filter can't be replayed, so this isn't a "
+         "test of its judgement. Annualised return / Sharpe.", "",
+         "| Rule | " + " | ".join(periods) + " | Avg return | Avg Sharpe | Avg max DD | Avg turnover | Re-ranks per period |",
+         "|---|" + "---|" * (len(periods) + 5)]
+    for clean in (True, False):
+        for s in choices:
+            got = {r["period"]: r for r in rows if r["clean"] == clean and r["sigmas"] == s}
+            name = f"{'clean: ' if clean else ''}" + (f"re-rank at {s:.0f} sigma" if s else "no sector rule")
+            L.append(f"| {name} | " + " | ".join(f"{_pct(got[p]['annual_return'])} / {_num(got[p]['sharpe'])}" for p in periods)
+                     + f" | {_pct(statistics.fmean(got[p]['annual_return'] for p in periods))}"
+                     + f" | {_num(statistics.fmean(got[p]['sharpe'] for p in periods))}"
+                     + f" | {_pct(statistics.fmean(got[p]['max_drawdown'] for p in periods))}"
+                     + f" | {statistics.fmean(got[p]['turnover'] for p in periods):.1f}x"
+                     + f" | {statistics.fmean(got[p]['reranks'] for p in periods):.0f} |")
+    with open(out, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    print("\n".join(L), flush=True)
+
+
 def _pct(x: Optional[float]) -> str:
     return "n/a" if x is None else f"{x:+.1%}"
 
@@ -183,8 +225,12 @@ def main() -> None:
     ap.add_argument("--out", default="backtest_report.md")
     ap.add_argument("--cache-dir", default=".backtest_cache")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--sector-study", action="store_true", help="only the study of re-ranking on sector moves")
     a = ap.parse_args()
     os.makedirs(a.cache_dir, exist_ok=True)
+    if a.sector_study:
+        sector_study(a.cache_dir, a.workers, a.out)
+        return
     prices = load_prices(a.cache_dir)
     fund = load_fundamentals(a.cache_dir)
     print(f"{len(prices)} price series, {len(fund)} fundamentals", flush=True)

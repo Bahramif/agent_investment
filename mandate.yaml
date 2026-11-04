@@ -47,6 +47,8 @@ rulebook:
   keep_rank_multiple: 2.0
   # selling a loser: below cost AND behind its sector, since purchase, by this many monthly sigmas
   stop_sigma_mult: 3.0            # catches severe breakdowns only: tighter stops didn't reduce drawdowns in the backtest
+  # a sector moving this many of its own daily sigmas lets the news watch consider re-ranking early
+  sector_move_sigmas: 2.0
   # no rebuy for this long after any sale, whatever the reason
   reentry_block_days: 30
   # no new buy this close to a company's earnings report
@@ -120,13 +122,14 @@ day_trading:
 # =============================================================================
 # proactive_recalibration: the mid-day news watch (proactive_recal.py). Once per
 # trading day it checks each open portfolio whose owner switched it on. It can
-# only SELL the affected stock and fill that slot: on the rulebook's stop, or on
-# news the model judges thesis-breaking for a named holding.
+# SELL an affected stock and fill that slot (the rulebook's stop, or thesis-breaking
+# news), or re-rank the whole portfolio when a sector it holds moves unusually and
+# the model judges the move a real change in that sector's outlook.
 # =============================================================================
 proactive_recalibration:
   enabled: true
   dry_run: false                  # true = assess and log only, never trade
-  max_proactive_per_30d: 2        # early trades allowed; only the rulebook's stop may go beyond this
+  max_proactive_per_30d: 2        # early trades allowed, news or sector; only the rulebook's stop may go beyond this
   min_confidence: 0.7             # the model must be at least this sure before news sells a stock
   news_lookback_days: 1
   material_weight: 0.05           # holdings under 5% don't raise unusual-move flags on their own

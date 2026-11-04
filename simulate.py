@@ -70,6 +70,7 @@ class SimulationResult:
     annual_turnover: float = 0.0
     n_trades: int = 0
     n_stops: int = 0
+    n_sector_rerank: int = 0
 
 
 def fetch_price_series(
@@ -153,6 +154,8 @@ def run_simulation(
     cfg: Optional[rulebook.RulebookConfig] = None,
     fundamentals: Optional[Dict[str, Dict[str, Any]]] = None,   # {symbol: {quality, eps, industry, avg_volume}}; default: fetched
     scorer: Optional[Callable[[List[Any]], List[Any]]] = None,  # replace the score (the backtest's null model)
+    sector_rerank: bool = False,               # also re-rank on unusual sector moves, up to max_early per 30 days
+    max_early: int = 2,
 ) -> SimulationResult:
     cfg = cfg or rulebook.default_config()
     sector_by_symbol = {sym: rulebook.sector_of(path) for sym, path, _ in universe if rulebook.sector_of(path) in sectors}
@@ -191,6 +194,42 @@ def run_simulation(
     rebalance_actions: List[Dict[str, Tuple[str, float]]] = []
     total_costs, traded, n_trades, n_stops = 0.0, 0.0, 0, 0
     bps = cfg.cost_bps / 10_000.0
+
+    # each sector's equal-weighted daily returns, for the sector-move rule
+    sector_returns: Dict[str, Dict[str, float]] = {}
+    if sector_rerank:
+        for sec in sectors:
+            members = [ser for s, ser in series.items() if sector_by_symbol[s] == sec]
+            by_day: Dict[str, List[float]] = {}
+            for ser in members:
+                for k in range(1, len(ser.dates)):
+                    if ser.prices[k - 1]:
+                        by_day.setdefault(ser.dates[k], []).append(ser.prices[k] / ser.prices[k - 1] - 1.0)
+            sector_returns[sec] = {d: statistics.fmean(v) for d, v in by_day.items()}
+    early_dates: List[str] = []
+    n_sector_rerank = 0
+
+    def sector_moved(day: str) -> bool:
+        """A sector this book holds moved unusually, and the early-trade limit allows it."""
+        d = date.fromisoformat(day)
+        if sum(1 for e in early_dates if (d - date.fromisoformat(e)).days < 30) >= max_early:
+            return False
+        total = value_on(day) or 1.0
+        exposure: Dict[str, float] = {}
+        for s, n in shares.items():
+            exposure[sector_by_symbol[s]] = exposure.get(sector_by_symbol[s], 0.0) + n * (series[s].on(day) or 0.0) / total
+        for sec, ex in exposure.items():
+            rets = sector_returns.get(sec) or {}
+            days = [x for x in sorted(rets) if x <= day]
+            if ex < 0.05 or len(days) < rulebook.TRADING_DAYS_PER_MONTH or days[-1] != day:
+                continue
+            past = [rets[x] for x in days[-rulebook.TRADING_DAYS_PER_YEAR - 1:-1]]
+            five = 1.0
+            for x in days[-5:]:
+                five *= 1 + rets[x]
+            if rulebook.unusual_sector_move(rets[day], five - 1.0, statistics.stdev(past), cfg):
+                return True
+        return False
 
     def value_on(day: str) -> float:
         return cash + sum(n * (series[s].on(day) or 0.0) for s, n in shares.items())
@@ -280,7 +319,12 @@ def run_simulation(
         return out
 
     for i, day in enumerate(dates):
-        if i % rebalance_every_days == 0:
+        scheduled = i % rebalance_every_days == 0
+        early = sector_rerank and not scheduled and shares and sector_moved(day)
+        if early:
+            early_dates.append(day)
+            n_sector_rerank += 1
+        if scheduled or early:
             book, weights, tilts = book_on(day, top_n, set(shares), blocked_on(day))
             total = value_on(day)
             actions: Dict[str, Tuple[str, float]] = {}
@@ -348,5 +392,5 @@ def run_simulation(
         spy_return=(spy_values[-1] / initial_capital - 1.0) if spy_values and initial_capital else 0.0,
         warnings=warnings, stats=rulebook.performance_stats(values), total_costs=total_costs,
         annual_turnover=(traded / 2.0 / avg_value / years) if avg_value > 0 else 0.0,
-        n_trades=n_trades, n_stops=n_stops,
+        n_trades=n_trades, n_stops=n_stops, n_sector_rerank=n_sector_rerank,
     )

@@ -56,9 +56,10 @@ RETRY_STATUS = [429, 500, 502, 503, 504]
 # Per-attempt timeout. Measured live (Oct 2026, 5 concurrent): Pro median 10s / max
 # 32s, Flash median 4s / max 25s. Without a timeout ONE hung request (seen live:
 # 3m40s for a 280-token prompt) stalled a whole recommendation past the 5-minute
-# budget recalibrations wait on. 60s = ~2x the slowest normal call; the SDK
-# retries timeouts as transient errors.
-REQUEST_TIMEOUT_MS = 60_000
+# budget recalibrations wait on. 45s is well above the slowest normal call; the SDK
+# retries timeouts as transient errors, and the callers' own deadlines
+# (firm_graph.STRATEGIST_DEADLINE_S, claude_reasoning.DESK_DEADLINE_S) bound the total.
+REQUEST_TIMEOUT_MS = 45_000
 RETRY_ATTEMPTS = 3
 
 
@@ -280,7 +281,7 @@ if __name__ == "__main__":
     ho = built[0].kw["http_options"]
     ro = ho.retry_options
     assert ro.attempts == 3 and 429 in ro.http_status_codes and 503 in ro.http_status_codes
-    assert ho.timeout == 60_000, "a hung request is cut off (and retried) instead of stalling the recommendation"
+    assert ho.timeout == 45_000, "a hung request is cut off (and retried) instead of stalling the recommendation"
     print("✓ 8 threads -> 1 client, built with a 60s per-attempt timeout and 429/5xx retries (3 attempts)")
 
     print("TEST 2: tier mapping and overrides")
@@ -324,8 +325,8 @@ if __name__ == "__main__":
     print("TEST 6: the existing callers' parsing works unchanged on the shim's output")
     import proactive_recal as pr
     s, _ = shim(fake_response([NS(thought=False, text=None, function_call=NS(
-        name="decide_recalibration", args={"recalibrate": True, "confidence": 0.8, "urgency": "high", "reason": "x"}))]))
-    assert pr.call_claude(s, "prompt")["recalibrate"] is True
+        name="judge_holdings_news", args={"verdicts": [{"symbol": "AAA", "sell": True, "confidence": 0.8, "reason": "x"}]}))]))
+    assert pr.call_claude(s, "prompt")["verdicts"][0]["sell"] is True
     s, _ = shim(fake_response([], finish="SAFETY"))
     try:
         pr.call_claude(s, "prompt")
