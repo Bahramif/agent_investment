@@ -21,8 +21,7 @@ Three principles, each enforced by test_rulebook.py:
 
 THE LIFE OF A POSITION
   1. SCORE      within-sector percentile of 12-1 momentum, quality, value and
-                (when available) the LLM's read. An optional pullback credit is
-                switched off (pullback_weight 0): the backtest didn't support it.
+                (when available) the LLM's read, plus a pullback credit.
   2. BUY        highest-scoring eligible names, within the sub-industry limit.
                 Not eligible: under a year of history, too illiquid, broken
                 thesis. Not bought now: re-entry block, earnings imminent.
@@ -33,7 +32,10 @@ THE LIFE OF A POSITION
   6. RE-RANK    a sector moving unusually (sector_move_sigmas of its own volatility)
                 lets the news watch's sector review re-run steps 1-5 early, within
                 the early-trade limit, if the move reflects a real change.
-  7. SELL       rank falls out of the keep band (at a scheduled recalibration);
+  7. DIP BUY    any day, however recently the portfolio recalibrated: a valuable
+                stock on a real pullback (rulebook.dip_candidates) is bought with
+                cash for an open slot, or replaces the holding that scores lowest.
+  8. SELL       rank falls out of the keep band (at a scheduled recalibration);
                 or the STOP: below cost AND behind its sector by
                 stop_sigma_mult monthly sigmas since purchase; or news the
                 model judges thesis-breaking. News and stops sell only the
@@ -68,7 +70,7 @@ class RulebookConfig:
     weight_quality: float = 0.25
     weight_value: float = 0.20
     weight_llm: float = 0.20
-    pullback_weight: float = 0.0        # share of the score a full pullback credit is worth (off: see backtest_report.md)
+    pullback_weight: float = 0.10       # share of the score a full pullback credit is worth
     # eligibility
     min_history_bars: int = 252         # about a year of trading days
     min_dollar_volume: float = 10_000_000.0
@@ -79,6 +81,10 @@ class RulebookConfig:
     reentry_block_days: int = 30
     # a whole sector moving unusually (in its own daily sigmas) lets the news watch consider a re-rank
     sector_move_sigmas: float = 2.0
+    # dip buying: how good the pullback must be, and how good the company (its quality rank in its sector)
+    dip_min_credit: float = 0.5
+    dip_min_quality_pct: float = 0.5
+    dip_replace_margin: float = 0.20    # how much better a pick must score to replace a holding (1 = never replace)
     # buying
     earnings_block_days: int = 3
     # portfolio limits
@@ -106,6 +112,10 @@ def config_from_dict(raw: Optional[Dict[str, Any]]) -> RulebookConfig:
         raise ValueError("rulebook: stop_sigma_mult, sector_move_sigmas and max_portfolio_beta must be positive")
     if not 0.0 < cfg.max_industry_weight <= 1.0:
         raise ValueError("rulebook.max_industry_weight must be in (0, 1]")
+    if cfg.dip_replace_margin < 0:
+        raise ValueError("rulebook.dip_replace_margin must be non-negative")
+    if not 0.0 < cfg.dip_min_credit <= 1.0 or not 0.0 <= cfg.dip_min_quality_pct <= 1.0:
+        raise ValueError("rulebook: dip_min_credit must be in (0, 1], dip_min_quality_pct in [0, 1]")
     if cfg.reentry_block_days < 0 or cfg.earnings_block_days < 0 or cfg.min_history_bars < 0:
         raise ValueError("rulebook: day and bar counts must be non-negative")
     if not 0.0 <= cfg.min_trade_pct < 1.0 or cfg.cost_bps < 0 or cfg.min_dollar_volume < 0:
@@ -299,6 +309,60 @@ def earnings_imminent(earnings_date: Optional[str], today: date, cfg: Optional[R
     except ValueError:
         return False
     return 0 <= (d - today).days <= cfg.earnings_block_days
+
+
+# -----------------------------------------------------------------------------
+# Dip buying
+# -----------------------------------------------------------------------------
+def dip_candidates(snapshots: Sequence[Any], scores: Dict[str, Tuple[float, float]], held: Iterable[str],
+                   blocked: Iterable[str], today: date, cfg: Optional[RulebookConfig] = None) -> List[str]:
+    """Stocks worth buying on their dip, best score first. VALUABLE: quality in the
+    top half of its own sector, and profitable. A REAL DIP: pullback_credit of at
+    least dip_min_credit, which already means the long-term trend is up, the fall is
+    meaningful for that stock and it has stopped falling hard. Every other rule still
+    applies: eligibility, the re-entry block, no buying just before earnings. Whether
+    its news is clean is judged separately, because that takes the model."""
+    cfg = cfg or default_config()
+    held, blocked = set(held), set(blocked)
+    groups: Dict[str, List[Any]] = {}
+    for s in snapshots:
+        groups.setdefault(sector_of(s.path), []).append(s)
+    picks: List[str] = []
+    for peers in groups.values():
+        quality = percentile_ranks({s.name: s.quality_score for s in peers})
+        for s in peers:
+            credit = pullback_credit(s.momentum_12_1, s.drawdown_6m, s.pullback_5d, s.volatility or None, s.news_status)
+            if (s.name not in held and s.name not in blocked and credit >= cfg.dip_min_credit
+                    and quality[s.name] >= cfg.dip_min_quality_pct and (s.earnings_yield or 0.0) > 0.0
+                    and eligibility(s.history_bars, s.avg_dollar_volume, s.news_status, cfg)[0]
+                    and not earnings_imminent(s.earnings_date, today, cfg)):
+                picks.append(s.name)
+    return sorted(picks, key=lambda n: (-scores[n][0], n))
+
+
+def dip_trade(pick: str, pick_score: float, current: Dict[str, float], scores: Dict[str, float], n_stocks: int, cash: float,
+              max_per_name: float, industry: Dict[str, str], beta: Dict[str, Optional[float]],
+              cfg: Optional[RulebookConfig] = None) -> Optional[Tuple[Optional[str], float]]:
+    """How to buy `pick`: (holding to sell or None, target weight), or None if it
+    shouldn't be bought. An open slot with the cash for it comes first. Otherwise it
+    replaces the lowest-scoring holding, only if the pick scores higher. The portfolio
+    limits apply as to any new buy: it is cut back rather than breach one."""
+    cfg = cfg or default_config()
+    sell: Optional[str] = None
+    share = min(max_per_name, 1.0 / max(n_stocks, 1))
+    if len(current) < n_stocks and cash >= cfg.min_trade_pct:
+        weight = min(share, cash)
+    else:
+        if not current:
+            return None
+        sell = min(current, key=lambda s: (scores.get(s, 0.0), s))
+        if scores.get(sell, 0.0) + cfg.dip_replace_margin >= pick_score:
+            return None
+        weight = min(max_per_name, current[sell])
+    after = {s: w for s, w in current.items() if s != sell}
+    target = targeted_weights({**after, "__slot": weight}, ["__slot"], [pick], industry, beta, cfg)
+    weight = target.get(pick, 0.0)
+    return (sell, weight) if weight >= cfg.min_trade_pct else None
 
 
 # -----------------------------------------------------------------------------

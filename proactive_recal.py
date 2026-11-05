@@ -32,6 +32,13 @@ judging it a real change in the sector's outlook. It counts against
 max_proactive_per_30d, and there is one sector verdict per day. If a stock must be
 sold that day, the sale comes first and the re-rank waits.
 
+DIP BUYS: on any day, however recently the portfolio recalibrated, a valuable stock it
+doesn't hold on a real pullback (rulebook.dip_candidates) is bought, at most one per
+portfolio per day, provided the model finds nothing wrong in its news. It takes an open
+slot if there's cash, or replaces the lowest-scoring holding if it scores higher. The
+early-trade limit doesn't apply. Orders in flight still block it, and the pre-trade
+reviewer can still stop it. Stops, news sales and sector re-ranks come first.
+
 The sale happens first and doesn't depend on the agent; finding a replacement comes
 after it (web_ui._targeted_exit). If that fails, the slot stays cash until the next
 recalibration, and the check reports the sale with that note.
@@ -106,6 +113,7 @@ class ProactiveConfig:
     material_weight: float = 0.05             # holdings below this weight don't raise move flags on their own
     big_move_sigmas: float = 3.0              # a move this many daily sigmas is flagged to the model
     big_move_pct: float = 0.06                # the same flag for a stock with no volatility data
+    dip_buys: bool = True                     # buy a valuable stock on a real dip, any day
 
 
 def config_from_dict(raw: Optional[Dict[str, Any]]) -> ProactiveConfig:
@@ -676,6 +684,11 @@ class ProactiveDeps:
     pool_fn: Callable[[Sequence[str]], Dict[str, str]] = sector_symbols   # sectors -> {symbol: sector}
     # daily closes from a date to today: (symbols, start) -> {symbol: {date: close}}; powers the stop and the performance block
     series_fn: Optional[Callable[[List[str], date], Dict[str, Dict[date, float]]]] = None
+    # dip buying: (symbols) -> {symbol: {quality, eps, industry, earnings_date, avg_volume}}, and the trade itself.
+    # Without both, there is no dip check.
+    fundamentals_fn: Optional[Callable[[List[str]], Dict[str, Dict[str, Any]]]] = None
+    dip_buy_fn: Optional[Callable[..., Dict[str, Any]]] = None
+    max_per_name_fn: Callable[[int], float] = lambda n: min(1.0, max(0.10, 2.0 / max(n, 1)))   # the per-stock cap for a book of n
 
 
 @dataclass
@@ -739,12 +752,44 @@ def evaluate_portfolio(p: Dict[str, Any], cfg: ProactiveConfig, deps: ProactiveD
     trig = [t["text"] for t in ev["triggers"]]
     cov = {"holdings": len(symbols), "sector_stocks": ev["watch"]["not_held"],
            "with_news": ev["watch"]["with_news"], "big_movers": ev["watch"]["big_movers"]}
-    res = _evaluate(p, cfg, deps, today, book, dry_run, ev, trig, pool)
+    res = _evaluate(p, cfg, deps, today, book, dry_run, ev, trig, pool, quotes, heads, series)
     res.coverage = cov
     return res
 
 
-def _evaluate(p, cfg, deps, today, book, dry_run, ev, trig, pool) -> CheckResult:
+def _evaluate(p, cfg, deps, today, book, dry_run, ev, trig, pool, quotes, heads, series) -> CheckResult:
+    """The stock, sector and dip decisions, in that order of priority."""
+    res = _evaluate_exits(p, cfg, deps, today, book, dry_run, ev, trig, pool)
+    if res.action != "hold" or not cfg.dip_buys or deps.fundamentals_fn is None or deps.dip_buy_fn is None or not series:
+        return res
+    try:
+        dip = find_dip(p, cfg, deps, today, book, ev, pool, quotes, heads, series)
+    except Exception as e:                      # no news read or no data: no dip buy today
+        print(f"[proactive_recal] dip check unavailable for {p.get('id')}: {type(e).__name__}: {e}")
+        return res
+    if dip is None:
+        return res
+    review = {**res.review, "rule": "dip", "dip": dip["symbol"], "replacing": dip["replace"]}
+    reason = f"{dip['reason']} ({res.reason})"
+    if dry_run or cfg.dry_run:
+        return CheckResult(res.portfolio_id, res.name, "flagged", f"{reason} (dry run)", res.source, review, trig)
+    if p.get("pending_order_ids"):
+        return CheckResult(res.portfolio_id, res.name, "flagged", f"{reason} (not traded: orders from the last rebalance "
+                                                                  "are still being filled)", res.source, review, trig)
+    if not deps.market_open_fn():
+        return CheckResult(res.portfolio_id, res.name, "flagged", f"{reason} (market closed, not trading now)", res.source, review, trig)
+    try:
+        rc = deps.dip_buy_fn(res.portfolio_id, dip, reason)
+    except Exception as e:
+        return CheckResult(res.portfolio_id, res.name, "error", f"dip buy failed: {e}", res.source, review, trig)
+    if rc.get("error"):
+        return CheckResult(res.portfolio_id, res.name, "error", f"dip buy failed: {rc['error']}", res.source, review, trig, rc)
+    if rc.get("vetoed"):
+        return CheckResult(res.portfolio_id, res.name, "flagged", f"{reason} (not traded: {rc['vetoed']})", res.source, review, trig)
+    return CheckResult(res.portfolio_id, res.name, "recalibrated", reason, res.source, review, trig, rc)
+
+
+def _evaluate_exits(p, cfg, deps, today, book, dry_run, ev, trig, pool) -> CheckResult:
     pid, name = p.get("id", ""), p.get("name", "")
     with_news = [{"symbol": r["symbol"], "sector": pool.get(r["symbol"]), "day_change": r["day_change"],
                   "sector_move": (ev.get("sector_moves") or {}).get(pool.get(r["symbol"])), "headlines": r["headlines"]}
@@ -812,6 +857,62 @@ def _evaluate(p, cfg, deps, today, book, dry_run, ev, trig, pool) -> CheckResult
     if rerank:
         reason = f"{reason} (the sale comes first; a re-rank on {', '.join(sorted(rerank))} waits)"
     return _trade(pid, name, p, cfg, deps, today, dry_run, reason, source, review, trig, exits)
+
+
+def find_dip(p: Dict[str, Any], cfg: ProactiveConfig, deps: ProactiveDeps, today: date, book: NewsBook, ev: Dict[str, Any],
+             pool: Dict[str, str], quotes: Dict[str, Dict[str, float]], heads: Dict[str, List[str]],
+             series: Dict[str, Dict[date, float]]) -> Optional[Dict[str, Any]]:
+    """Today's best dip buy for this portfolio, or None. Built from the same snapshots
+    and score as every other decision, at the live price."""
+    from data_ingestion import snapshot_from_prices
+    rules = rulebook.default_config()
+    fund = deps.fundamentals_fn(sorted(pool)) or {}
+    bench = [series["SPY"][d] for d in sorted(series.get("SPY") or {}) if d < today]
+    snaps = []
+    for sym, sector in pool.items():
+        closes = series.get(sym) or {}
+        px = (quotes.get(sym) or {}).get("price")
+        if not closes or not px:
+            continue
+        f = fund.get(sym) or {}
+        snaps.append(snapshot_from_prices(
+            sym, f"equities.{sector}", [closes[d] for d in sorted(closes) if d < today] + [px], f.get("quality", 0.5),
+            eps=f.get("eps"), industry=f.get("industry") or "", benchmark=bench + [(quotes.get("SPY") or {}).get("price") or bench[-1]] if bench else None,
+            earnings_date=f.get("earnings_date"), avg_volume=f.get("avg_volume"), news_status="clean"))
+    scores = rulebook.composite_scores(snaps, None, rules)
+    held = set(p.get("holdings") or {}) | set(p.get("pending_order_ids") or {})
+    blocked = rulebook.reentry_blocked(p, today, rules)
+    picks = rulebook.dip_candidates(snaps, scores, held, blocked, today, rules)[:3]
+    if not picks:
+        return None
+    by_name = {s.name: s for s in snaps}
+    rows = [{"symbol": s, "sector": pool.get(s), "day_change": _move(quotes.get(s)),
+             "sector_move": (ev.get("sector_moves") or {}).get(pool.get(s)),
+             "headlines": [str(h)[:200] for h in (heads.get(s) or [])[:MAX_HEADLINES_PER_SYMBOL]]} for s in picks]
+    judged = book.verdicts([r for r in rows if r["headlines"]], ev["market"].get("SPY"), ev.get("sector_reads"))
+    total = float(ev["portfolio"]["value"]) or 1.0
+    current = {r["symbol"]: r["weight"] for r in ev["holdings"]}
+    n_stocks = int(p.get("n_stocks") or len(current) or 1)
+    cap = deps.max_per_name_fn(n_stocks)
+    industry = {s.name: s.industry for s in snaps}
+    beta = {s.name: s.beta for s in snaps}
+    same_day = last_recal_date(p) == today
+    for sym in picks:
+        if (judged.get(sym) or {}).get("sell"):
+            continue                                 # the news explains the fall: not a dip
+        plan = rulebook.dip_trade(sym, scores[sym][0], current, {k: v[0] for k, v in scores.items()}, n_stocks,
+                                  float(p.get("cash_remaining") or 0.0) / total, cap, industry, beta, rules)
+        if plan is None or (plan[0] and same_day):   # a second sale today could reuse an order ID
+            continue
+        s = by_name[sym]
+        return {"symbol": sym, "replace": plan[0], "weight": plan[1], "score": scores[sym][0], "credit": scores[sym][1],
+                "signals": {"dip_score": scores[sym][1], "drawdown_6m": s.drawdown_6m, "momentum_1m": s.momentum_1m,
+                            "momentum_12_1": s.momentum_12_1, "conviction": scores[sym][0], "quality_score": s.quality_score},
+                "earnings_date": s.earnings_date,
+                "reason": (f"Dip buy: {sym} is {abs(s.drawdown_6m):.0%} below its 6-month high, with a long-term uptrend "
+                           f"({s.momentum_12_1:+.0%} over the year to last month), top-half quality for its sector and "
+                           f"no bad news." + (f" Replacing {plan[0]}, the lowest-scoring holding." if plan[0] else ""))}
+    return None
 
 
 def _trade(pid, name, p, cfg, deps, today, dry_run, reason, source, review, trig, exits) -> CheckResult:
@@ -1207,6 +1308,77 @@ if __name__ == "__main__":
     assert log["recal"][0][2] == ["AAA"] and "re-rank on tech_ai waits" in r.reason, (log, r.reason)
     d, log = deps(quotes=sold_off, client=Router(yes_sector()), series=SERIES, pool=POOL)
     assert run_proactive_check([pf()], cfg, d, NOW, dry_run=True)[0].action == "flagged" and not log["recal"]
+    print("✓ ok")
+
+    print("TEST 14f: DIP BUYS: a valuable stock on a real dip is bought, however recently the portfolio recalibrated")
+    def closes_for(px, up=0.6, dip=0.18):
+        """A year up, then a pullback that has steadied: closes before `today`."""
+        n, out = 300, {}
+        for k in range(n):
+            d = today - timedelta(days=n - k)
+            base = px / (1 - dip)
+            level = base * (1 - up + up * min(1.0, k / (n - 40))) * (1 - dip * min(1.0, max(0, k - (n - 40)) / 25))
+            out[d] = level * (1.01 if k % 2 else 0.99)
+        return out
+    dip_series = {"AAA": closes_for(50.0, up=0.1, dip=0.0), "BBB": closes_for(100.0, up=0.1, dip=0.0),
+                  "CCC": closes_for(100.0), "DDD": closes_for(100.0, up=0.1, dip=0.0), "SPY": closes_for(600.0, up=0.2, dip=0.0)}
+    flat = {s: {"price": dip_series[s][max(dip_series[s])], "prev_close": dip_series[s][max(dip_series[s])]} for s in dip_series}
+    FUND = {"AAA": {"quality": 0.3, "eps": 3.0}, "BBB": {"quality": 0.4, "eps": 5.0}, "CCC": {"quality": 0.9, "eps": 6.0},
+            "DDD": {"quality": 0.2, "eps": 1.0}}
+    def dip_deps(p_quotes=flat, client=None, news=None, fund=FUND, market_open=True):
+        d, log = deps(quotes=p_quotes, news=news, client=client, series=dip_series, pool=POOL, market_open=market_open)
+        d.fundamentals_fn = lambda syms: fund
+        log["dips"] = []
+        d.dip_buy_fn = lambda pid, dip, why: log["dips"].append((pid, dip, why)) or {"orders": [{"symbol": dip["symbol"]}], "errors": []}
+        return d, log
+    used = [{"date": "2026-09-27", "trigger": "proactive"}, {"date": "2026-09-26", "trigger": "scheduled"},
+            {"date": "2026-09-25", "trigger": "proactive"}]
+    four = lambda: {"AAA": {"shares": 10, "entry_price": 50.0, "cost": 500.0, "entry_date": ENTRY}, "BBB": {"shares": 40, "entry_price": 100.0, "cost": 4000.0, "entry_date": ENTRY}}
+    d, log = dip_deps()
+    r = run_proactive_check([pf(rebalance_history=used, n_stocks=2, holdings=four())], cfg, d, NOW)[0]
+    assert r.action == "recalibrated" and log["dips"][0][1]["symbol"] == "CCC", (r.action, r.reason, log["dips"])
+    assert log["dips"][0][1]["replace"] == "BBB" and "Dip buy: CCC" in r.reason and r.review["rule"] == "dip", log["dips"]
+    print(f"✓ recalibrated yesterday, 30-day limit used, and it still buys: {r.reason[:110]}...")
+    d, log = dip_deps()
+    r = run_proactive_check([pf(n_stocks=3, cash_remaining=2000.0)], cfg, d, NOW)[0]
+    assert log["dips"][0][1]["replace"] is None and log["dips"][0][1]["symbol"] == "CCC", "an open slot with cash: nothing is sold"
+    print("✓ an open slot with cash sells nothing")
+
+    print("TEST 14g: no dip buy when the rules or the news say no")
+    for label, kw, pfkw in (("weak quality", {"fund": {**FUND, "CCC": {"quality": 0.1, "eps": 6.0}}}, {}),
+                            ("not profitable", {"fund": {**FUND, "CCC": {"quality": 0.9, "eps": -1.0}}}, {}),
+                            ("earnings imminent", {"fund": {**FUND, "CCC": {"quality": 0.9, "eps": 6.0, "earnings_date": "2026-09-29"}}}, {}),
+                            ("too illiquid", {"fund": {**FUND, "CCC": {"quality": 0.9, "eps": 6.0, "avg_volume": 1000}}}, {}),
+                            ("sold in the last 30 days", {}, {"rebalance_history": [{"date": "2026-09-20", "trigger": "manual", "orders": [{"symbol": "CCC", "side": "SELL"}]}]})):
+        d, log = dip_deps(**kw)
+        r = run_proactive_check([pf(**pfkw)], cfg, d, NOW)[0]
+        assert not log["dips"], (label, log["dips"])
+    bad_news = {"CCC": ["CCC restates three years of results"]}
+    d, log = dip_deps(news=None, client=FakeClient({"verdicts": [verdict("CCC", why="Restatement explains the fall.")]}))
+    d.news_many_fn = lambda syms, days: bad_news
+    assert run_proactive_check([pf()], cfg, d, NOW)[0].action == "hold" and not log["dips"], "the news explains the fall"
+    d, log = dip_deps(client=FakeClient(error=TimeoutError("down")))
+    d.news_many_fn = lambda syms, days: bad_news
+    assert not log["dips"] and run_proactive_check([pf()], cfg, d, NOW)[0].action == "hold", "no news read, no dip buy"
+    d, log = dip_deps()
+    assert run_proactive_check([pf()], ProactiveConfig(dip_buys=False), d, NOW)[0].action == "hold" and not log["dips"]
+    print("✓ quality, profit, earnings, liquidity, re-entry, news, an outage and the switch all stop it")
+
+    print("TEST 14h: dry runs, closed markets and orders in flight flag it; a stop comes first; a reviewer veto is reported")
+    d, log = dip_deps()
+    assert run_proactive_check([pf()], cfg, d, NOW, dry_run=True)[0].action == "flagged" and not log["dips"]
+    d, log = dip_deps(market_open=False)
+    assert run_proactive_check([pf()], cfg, d, NOW)[0].action == "flagged" and not log["dips"]
+    d, log = dip_deps()
+    assert "still being filled" in run_proactive_check([pf(pending_order_ids={"AAA": "x"})], cfg, d, NOW)[0].reason and not log["dips"]
+    d, log = dip_deps()
+    d.dip_buy_fn = lambda pid, dip, why: {"vetoed": "reviewer objected: catching a knife"}
+    r = run_proactive_check([pf()], cfg, d, NOW)[0]
+    assert r.action == "flagged" and "catching a knife" in r.reason
+    crash = {**flat, "AAA": {"price": 5.0, "prev_close": 5.0}}
+    d, log = dip_deps(p_quotes=crash)
+    r = run_proactive_check([pf()], cfg, d, NOW)[0]
+    assert log["recal"][0][2] == ["AAA"] and not log["dips"], "the stop comes first"
     print("✓ ok")
 
     print("TEST 15: an unusual move is judged against the stock's own volatility, and only informs the model")

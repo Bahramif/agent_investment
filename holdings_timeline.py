@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-TYPE_LABEL = {"scheduled": "📅 Scheduled", "proactive": "📰 Mid-day", "manual": "👆 Manual"}
+TYPE_LABEL = {"scheduled": "📅 Scheduled", "proactive": "📰 Mid-day", "manual": "👆 Manual", "dip": "📉 Dip buy"}
 EXECUTED = {"FILLED", "PARTIAL", "TIMEOUT", ""}     # TIMEOUT = accepted, filled later (reconciled into the ledger)
 
 

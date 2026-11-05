@@ -100,6 +100,7 @@ if __name__ == "__main__":
     harness.simulate.fetch_price_series = lambda *a, **k: {}
     c = web_ui.app.test_client()
     REAL_RECOMMEND = web_ui.recommend
+    ORIGINAL_REVIEW = web_ui._review_plan
     import portfolio_store as ps_store
 
     print("SCENARIO A: the endpoint is token-protected — it can place real orders")
@@ -342,6 +343,30 @@ if __name__ == "__main__":
     release.set()
     assert took < 2, took
     ok(f"gave up after {took:.1f}s with the call still running")
+
+    print("SCENARIO K6: A DIP BUY: sells what it replaces, buys, skips the 30-day limit, and the reviewer can stop it")
+    used = [{"date": (TODAY - timedelta(days=d)).isoformat(), "trigger": "proactive", "orders": [], "portfolio_value_before": 1.0} for d in (1, 2)]
+    fake = install(doc(pending_order_ids={}, rebalance_history=used))
+    world()
+    DIP = {"symbol": "CCC", "replace": "AAA", "weight": 0.2, "score": 0.9, "credit": 0.8, "signals": {"dip_score": 0.8}, "reason": "Dip buy: CCC."}
+    fake.docs["p1"]["n_stocks"] = 2
+    rc = web_ui.buy_dip("p1", DIP, "Dip buy: CCC.")
+    d = fake.docs["p1"]
+    assert [(s, side) for s, side, _ in FakeTradingClient.submitted][0] == ("AAA", "sell"), FakeTradingClient.submitted
+    assert "CCC" in d["holdings"] and "AAA" not in d["holdings"] and d["holdings"]["CCC"]["entry_date"] == TODAY.isoformat()
+    ev = d["rebalance_history"][-1]
+    assert ev["trigger"] == "dip" and ev["signals"]["CCC"]["dip_score"] == 0.8 and d["next_rebalance_date"] == doc()["next_rebalance_date"], "the schedule isn't touched"
+    import proactive_recal as pr
+    assert pr.proactive_count(d, TODAY) == 2, "a dip buy doesn't use up an early trade"
+    assert "📉 Dip buy" in c.get("/portfolios/p1").get_data(as_text=True)
+    ok(f"{FakeTradingClient.submitted}; history labelled; schedule and early-trade count unchanged")
+    fake = install(doc(pending_order_ids={}))
+    world()
+    web_ui._review_plan = (lambda orig: lambda *a, **k: {"vetoed": {"CCC": "reviewer objected"}, "orders": {}})(web_ui._review_plan)
+    rc = web_ui.buy_dip("p1", DIP, "x")
+    assert rc == {"vetoed": "reviewer objected"} and not FakeTradingClient.submitted and "AAA" in fake.docs["p1"]["holdings"], rc
+    ok("a blocked buy sells nothing")
+    web_ui._review_plan = ORIGINAL_REVIEW
 
     print("SCENARIO L: what was sold can't come back for 30 days, whatever sold it; a bad agent answer can't undo that")
     fake = install(doc(pending_order_ids={},

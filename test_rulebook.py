@@ -172,12 +172,31 @@ if __name__ == "__main__":
             assert abs(rb.pullback_credit(*args, "clean") - c0) < 0.08, (args, c0)
     ok("worst single-step change stays small over 20,000 random inputs (the old dip score jumped 0.70 between -3.9% and -4.1%)")
 
-    print("PULLBACK OFF: with pullback_weight 0 nothing earns or reports a pullback credit")
-    dip = InstrumentSnapshot("D", "equities.tech_ai", momentum_1m=-0.05, news_sentiment=0.0, quality_score=0.8, volatility=0.02,
-                             momentum_12_1=0.30, earnings_yield=0.05, drawdown_6m=-1.8 * rb.monthly_sigma(0.02), news_status="clean")
-    assert CFG.pullback_weight == 0.0 and rb.composite_scores([dip], None, CFG)["D"][1] == 0.0
-    assert rb.composite_scores([dip], None, rb.RulebookConfig(pullback_weight=0.1))["D"][1] > 0.5
-    assert reason_desk([dip], CFG)[0].dip_score == 0.0
+    print("DIPS: only a valuable stock on a real dip; every other rule still applies")
+    def dip_snap(name, quality=0.9, **kw):
+        base = dict(momentum_1m=-0.05, news_sentiment=0.0, quality_score=quality, volatility=0.02, momentum_12_1=0.30,
+                    earnings_yield=0.05, drawdown_6m=-1.8 * rb.monthly_sigma(0.02), news_status="clean")
+        return InstrumentSnapshot(name, "equities.tech_ai", **{**base, **kw})
+    desk = [dip_snap("GOOD"), dip_snap("JUNK", quality=0.1), dip_snap("LOSS", earnings_yield=-0.02), dip_snap("KNIFE", pullback_5d=-0.15),
+            dip_snap("CRASH", drawdown_6m=-5 * rb.monthly_sigma(0.02)), dip_snap("DOWN", momentum_12_1=-0.2), dip_snap("NOTYET", drawdown_6m=-0.01),
+            dip_snap("YOUNG", history_bars=50), dip_snap("SOON", earnings_date="2026-11-02"), dip_snap("HELD"), dip_snap("SOLD"),
+            dip_snap("MID", quality=0.5)]
+    scores = rb.composite_scores(desk, None, CFG)
+    got = rb.dip_candidates(desk, scores, {"HELD"}, {"SOLD"}, TODAY, CFG)
+    assert "GOOD" in got and not set(got) & {"JUNK", "LOSS", "KNIFE", "CRASH", "DOWN", "NOTYET", "YOUNG", "SOON", "HELD", "SOLD"}, got
+    assert rb.composite_scores([dip_snap("D")], None, CFG)["D"][1] > 0.5 and CFG.pullback_weight > 0
+    ok(f"only {got} qualify")
+
+    print("DIPS: how it's funded: an open slot with cash, else the lowest scorer if the pick beats it; limits cut it back")
+    cur = {"A": 0.3, "B": 0.2}
+    assert rb.dip_trade("N", 0.9, cur, {"A": 0.5, "B": 0.2}, 3, 0.5, 0.3, {}, {}, CFG) == (None, 1 / 3 if 1 / 3 < 0.3 else 0.3)
+    assert rb.dip_trade("N", 0.9, cur, {"A": 0.5, "B": 0.2}, 2, 0.5, 0.3, {}, {}, CFG) == ("B", 0.2), "a full book replaces its lowest scorer"
+    assert rb.dip_trade("N", 0.1, cur, {"A": 0.5, "B": 0.2}, 2, 0.5, 0.3, {}, {}, CFG) is None, "only if the pick scores higher"
+    never = rb.RulebookConfig(dip_replace_margin=1.0)
+    assert rb.dip_trade("N", 0.9, cur, {"A": 0.5, "B": 0.2}, 2, 0.5, 0.3, {}, {}, never) is None, "1 = never replace"
+    assert rb.dip_trade("N", 0.9, cur, {"A": 0.5, "B": 0.2}, 3, 0.5, 0.3, {}, {}, never)[0] is None, "an open slot still works"
+    assert rb.dip_trade("N", 0.9, cur, {"A": 0.5, "B": 0.2}, 3, 0.0, 0.3, {}, {}, CFG) == ("B", 0.2), "an open slot with no cash"
+    assert rb.dip_trade("N", 0.9, {"A": 0.35, "B": 0.2}, {"A": 0.5, "B": 0.2}, 2, 0.5, 0.3, {"A": "x", "N": "x"}, {}, CFG) is None, "the sub-industry is full"
     ok("ok")
 
     print("SCORE: ranks inside each sector; a sector's scale doesn't decide across sectors; the LLM is one input")
@@ -291,6 +310,13 @@ if __name__ == "__main__":
     assert abs(t["M"] - (1.5 - 0.9) / 3.0) < 1e-9 and t["A"] == 0.30, t
     assert "N" not in rb.targeted_weights({"A": 0.36, "C": 0.2}, ["C"], ["N"], ind, {}, CFG), "already over: no new buy in it"
     ok("ok")
+
+    print("SIMULATION: daily dip buys run, cost money, are off by default and don't look ahead")
+    dipped = run_simulation(price_series=series, dip_buys=True, **kw)
+    assert res.n_dip_buys == 0 and dipped.n_trades >= res.n_trades
+    other = run_simulation(price_series=shocked, dip_buys=True, **kw)
+    assert dipped.strategy_values[:before] == other.strategy_values[:before], "identical until the future changes"
+    ok(f"{dipped.n_dip_buys} dip buys, {dipped.n_trades} trades vs {res.n_trades}")
 
     print("SIMULATION: re-ranking on sector moves stays within the early-trade limit and costs show up")
     moved = run_simulation(price_series=series, sector_rerank=True, **kw)

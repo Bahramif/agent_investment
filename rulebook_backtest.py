@@ -66,7 +66,7 @@ VARIANTS: Dict[str, rulebook.RulebookConfig] = {
     "no keep band (1x)": _vary(keep_rank_multiple=1.0),
     "keep band 1.5x": _vary(keep_rank_multiple=1.5),
     "keep band 3x": _vary(keep_rank_multiple=3.0),
-    "pullback credit 0.10": _vary(pullback_weight=0.10),
+    "no pullback credit": _vary(pullback_weight=0.0),
     "no re-entry block": _vary(reentry_block_days=0),
     "no sub-industry limit": _vary(max_industry_weight=1.0),
     "no beta limit": _vary(max_portfolio_beta=99.0),
@@ -81,7 +81,7 @@ CLEAN_VARIANTS: Dict[str, rulebook.RulebookConfig] = {
     "no keep band (1x)": _vary(keep_rank_multiple=1.0, **PRICES_ONLY),
     "keep band 1.5x": _vary(keep_rank_multiple=1.5, **PRICES_ONLY),
     "keep band 3x": _vary(keep_rank_multiple=3.0, **PRICES_ONLY),
-    "pullback credit 0.10": _vary(pullback_weight=0.10, **PRICES_ONLY),
+    "no pullback credit": _vary(pullback_weight=0.0, **PRICES_ONLY),
     "no re-entry block": _vary(reentry_block_days=0, **PRICES_ONLY),
 }
 VARIANTS.update({f"clean: {k}": v for k, v in CLEAN_VARIANTS.items()})
@@ -212,6 +212,60 @@ def sector_study(cache_dir: str, workers: int, out: str) -> None:
     print("\n".join(L), flush=True)
 
 
+# Ways to limit dip buying's trading that don't depend on when the portfolio last recalibrated.
+DIP_LIMITS: Dict[str, Dict[str, float]] = {
+    "slots": {"dip_replace_margin": 1.0},
+    "anytime": {"dip_replace_margin": 0.0},
+    "margin": {"dip_replace_margin": 0.20},
+    "strict": {"dip_min_credit": 0.8, "dip_min_quality_pct": 0.75},
+}
+
+
+def _dip_job(job: Tuple[str, float, str, bool]) -> Dict[str, Any]:
+    period, cap, mode, clean = job
+    label, start, end = next(p for p in PERIODS if p[0] == period)
+    cfg = dataclasses.replace(BASE, **(PRICES_ONLY if clean else {}), pullback_weight=0.0 if mode == "off" else BASE.pullback_weight,
+                              **DIP_LIMITS.get(mode, {}))
+    series = {s: [r for r in rows if r[0] <= end] for s, rows in _PRICES.items()}
+    res = run_simulation(list(EQUITIES), ALL_SECTORS, series, CAPITAL, all_sectors=ALL_SECTORS, top_n=TOP_N, max_per_name=cap,
+                         start=start, end=end, cfg=cfg, fundamentals=_FUND, dip_buys=mode == "daily" or mode in DIP_LIMITS)
+    return {"period": period, "mode": mode, "clean": clean, **res.stats, "turnover": res.annual_turnover,
+            "dips": res.n_dip_buys, "costs": res.total_costs}
+
+
+def dip_study(cache_dir: str, workers: int, out: str) -> None:
+    """Does buying dips help? 'Clean' takes quality and value out of the SCORE, but
+    the dip rule still needs today's quality to say what's valuable. News is assumed
+    clean: a fall with real bad news behind it would be bought here, and live the model
+    would stop it. Both flatter these results."""
+    prices, fund = load_prices(cache_dir), load_fundamentals(cache_dir)
+    modes = (("off", "no dip rule"), ("score", "pullback credit only"),
+             ("slots", "daily, open slots only"), ("anytime", "daily, replace if any better"),
+             ("margin", "daily, replace only if 0.20 better (the default)"),
+             ("strict", "daily, stricter dip (credit 0.8, top-quarter quality)"))
+    jobs = [(p[0], MAX_PER_NAME, m, clean) for clean in (True, False) for m, _ in modes for p in PERIODS]
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init, initargs=(prices, fund)) as pool:
+        rows = list(pool.map(_dip_job, jobs, chunksize=1))
+    periods = [p[0] for p in PERIODS]
+    L = ["", "## Buying dips (all five sectors, 12 stocks)", "",
+         "Annualised return / Sharpe. News is assumed clean and `clean` lines still use today's quality to define a "
+         "valuable stock, so these results are flattered.", "",
+         "| Rule | " + " | ".join(periods) + " | Avg return | Avg Sharpe | Avg max DD | Avg turnover | Dip buys per period |",
+         "|---|" + "---|" * (len(periods) + 5)]
+    for clean in (True, False):
+        for m, label in modes:
+            got = {r["period"]: r for r in rows if r["clean"] == clean and r["mode"] == m}
+            L.append(f"| {'clean: ' if clean else ''}{label} | " + " | ".join(f"{_pct(got[p]['annual_return'])} / {_num(got[p]['sharpe'])}" for p in periods)
+                     + f" | {_pct(statistics.fmean(got[p]['annual_return'] for p in periods))}"
+                     + f" | {_num(statistics.fmean(got[p]['sharpe'] for p in periods))}"
+                     + f" | {_pct(statistics.fmean(got[p]['max_drawdown'] for p in periods))}"
+                     + f" | {statistics.fmean(got[p]['turnover'] for p in periods):.1f}x"
+                     + f" | {statistics.fmean(got[p]['dips'] for p in periods):.0f} |")
+    with open(out, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    print("\n".join(L), flush=True)
+
+
 def _pct(x: Optional[float]) -> str:
     return "n/a" if x is None else f"{x:+.1%}"
 
@@ -226,8 +280,12 @@ def main() -> None:
     ap.add_argument("--cache-dir", default=".backtest_cache")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--sector-study", action="store_true", help="only the study of re-ranking on sector moves")
+    ap.add_argument("--dip-study", action="store_true", help="only the study of buying dips")
     a = ap.parse_args()
     os.makedirs(a.cache_dir, exist_ok=True)
+    if a.dip_study:
+        dip_study(a.cache_dir, a.workers, a.out)
+        return
     if a.sector_study:
         sector_study(a.cache_dir, a.workers, a.out)
         return

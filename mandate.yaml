@@ -39,7 +39,7 @@ rulebook:
   weight_quality: 0.25            # margins, returns on equity, leverage, growth
   weight_value: 0.20              # forward earnings yield
   weight_llm: 0.20                # the model's read, ranked among the peers it compared
-  pullback_weight: 0.0            # off: a pullback credit lowered return and raised turnover in the clean backtest
+  pullback_weight: 0.10           # a pullback in an intact uptrend, with clean news
   # who may be held at all
   min_history_bars: 252           # about a year of trading days
   min_dollar_volume: 10000000
@@ -49,6 +49,10 @@ rulebook:
   stop_sigma_mult: 3.0            # catches severe breakdowns only: tighter stops didn't reduce drawdowns in the backtest
   # a sector moving this many of its own daily sigmas lets the news watch consider re-ranking early
   sector_move_sigmas: 2.0
+  # dip buying: the pullback must score this well, and the company rank this high on quality in its sector
+  dip_min_credit: 0.5
+  dip_min_quality_pct: 0.5
+  dip_replace_margin: 0.20        # how much better a dip must score to replace a holding (1 = never replace); 0 took turnover to over 10x a year
   # no rebuy for this long after any sale, whatever the reason
   reentry_block_days: 30
   # no new buy this close to a company's earnings report
@@ -124,7 +128,8 @@ day_trading:
 # trading day it checks each open portfolio whose owner switched it on. It can
 # SELL an affected stock and fill that slot (the rulebook's stop, or thesis-breaking
 # news), or re-rank the whole portfolio when a sector it holds moves unusually and
-# the model judges the move a real change in that sector's outlook.
+# the model judges the move a real change in that sector's outlook, or buy a
+# valuable stock on a real dip, however recently the portfolio recalibrated.
 # =============================================================================
 proactive_recalibration:
   enabled: true
@@ -135,6 +140,7 @@ proactive_recalibration:
   material_weight: 0.05           # holdings under 5% don't raise unusual-move flags on their own
   big_move_sigmas: 3.0            # flag a move this many daily sigmas (evidence for the model, not a trade)
   big_move_pct: 0.06              # the same flag for a stock with no volatility data
+  dip_buys: true                  # buy a valuable stock on a real dip any day; the 30-day limit doesn't apply
 
 # =============================================================================
 # evaluation: the evaluation agent (rec_evaluator.py). Reviews every

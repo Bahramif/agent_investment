@@ -1161,14 +1161,15 @@ ABOUT_PAGE = """
       <code>rulebook:</code> block of <code>mandate.yaml</code>), used by recommendations, the news
       watch and the simulation alike. No rule names a stock. Each stock gets one 0-1 <b>score</b>,
       from where it ranks among the stocks in its own sector:</p>
-    <div class="formula">score = 0.35&middot;momentum + 0.25&middot;quality + 0.20&middot;value + 0.20&middot;LLM read</div>
+    <div class="formula">score = 0.9 &times; (0.35&middot;momentum + 0.25&middot;quality + 0.20&middot;value + 0.20&middot;LLM read) + 0.1 &times; pullback credit</div>
     <ul>
       <li><b>LLM read</b> — the model compares a sector's stocks and classifies their headlines.
         Its scores are converted to ranks within each call, since raw scores aren't comparable
         between calls. If the model is unavailable its weight goes to the other factors and a
         stock's news counts as unknown.</li>
-      <li><b>No dip buying</b> — a recent fall earns no extra credit. The backtest didn't support it,
-        so that setting is off.</li>
+      <li><b>Pullback credit</b> — earned gradually, and only when the long-term trend is still up,
+        the fall is meaningful for that stock (about 1-3 of its monthly sigmas below its 6-month
+        high), it has stopped falling hard, and its news is clean. Unknown news earns nothing.</li>
       <li><b>Who can't be held</b> — a stock with under a year of trading history, under $10M of
         average daily dollar volume, or news the model judges thesis-breaking. The same test for
         every stock.</li>
@@ -1249,6 +1250,10 @@ ABOUT_PAGE = """
         sector moves unusually for it (2 of its own daily sigmas, up or down) and the model judges that a
         real change in its outlook, the whole portfolio is re-ranked by the same rules as a scheduled
         recalibration. This counts toward the same limit of two early trades in 30 days.</li>
+      <li>It also looks for dips every day, however recently the portfolio recalibrated. A stock you don't
+        hold, in the top half of its sector on quality and profitable, on a real pullback in an uptrend with
+        no bad news, is bought at most once a day per portfolio: with cash for an open slot, or replacing
+        the lowest-scoring holding if it scores higher. The early-trade limit doesn't apply.</li>
       <li>Every order is reviewed before it is placed: hard checks and the AI reviewer can block a
         buy, on every trigger, and never block a sell</li>
       <li>Closing a portfolio sells every real holding and removes it from the Portfolio tab's
@@ -2940,6 +2945,71 @@ def _targeted_exit(p: Dict[str, Any], exits: Sequence[str], trigger: str, reason
     return out
 
 
+def buy_dip(portfolio_id: str, dip: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """One dip buy from the news watch (proactive_recal.find_dip): sells the holding
+    it replaces, if any, then buys. Recorded as trigger "dip", which doesn't count
+    toward the early-trade limit. The reviewer sees it first, as any other buy."""
+    import portfolio_store
+    from datetime import datetime, timezone
+    from alpaca.trading.client import TradingClient
+    from alpaca_clients import AlpacaBrokerClient
+
+    p = portfolio_store.get_portfolio(portfolio_id)
+    if p is None or p.get("status") != "open":
+        return {"error": "Portfolio not found or already closed."}
+    holdings = p.get("holdings") or {}
+    sym, replace = dip["symbol"], dip.get("replace")
+    if sym in holdings or (replace and replace not in holdings):
+        return {"error": "the holdings changed before the dip buy could be placed"}
+    prices = _live_prices(sorted(set(holdings) | {sym}))
+    value = _mark_to_market(p, prices)["mtm_value"]
+    if not prices.get(sym) or value <= 0:
+        return {"error": f"no live price for {sym}"}
+    qty = math.floor(value * float(dip["weight"]) / prices[sym])
+    if qty < 1:
+        return {"error": "the position would round to zero shares"}
+    today = datetime.now(timezone.utc).date().isoformat()
+    sells = [{"symbol": replace, "side": "SELL", "qty": holdings[replace]["shares"],
+              "price": prices.get(replace) or holdings[replace]["entry_price"],
+              "current_shares": holdings[replace]["shares"]}] if replace else []
+    buys = [{"symbol": sym, "side": "BUY", "qty": qty, "price": prices[sym], "current_shares": 0}]
+    target = {s: float(h.get("shares") or 0) * (prices.get(s) or h.get("entry_price") or 0.0) / value
+              for s, h in holdings.items() if s != replace}
+    target[sym] = float(dip["weight"])
+    notes = {sym: {**dip.get("signals", {}), "earnings_date": dip.get("earnings_date"), "rationale": dip.get("reason", "")}}
+    review = _review_plan(p, sells + buys, target, notes, "dip", reason)
+    vetoed = review.get("vetoed") or {}
+    if sym in vetoed:                           # reviewed before anything trades, so nothing is sold for a blocked buy
+        return {"vetoed": vetoed[sym]}
+    broker = AlpacaBrokerClient(TradingClient(_ALPACA_API_KEY, _ALPACA_SECRET_KEY, paper=True))
+    new_holdings, orders, errors, pending = _place_orders(portfolio_id, sells, {}, holdings, today, broker)
+    if replace and replace in new_holdings:
+        return {"error": f"could not sell {replace}, so nothing was bought: " + ("; ".join(e["error"] for e in errors) or "the sale hasn't filled")}
+    new_holdings, bought, buy_errors, buy_pending = _place_orders(portfolio_id, buys, {}, new_holdings, today, broker)
+    orders, errors, pending = orders + bought, errors + buy_errors, {**pending, **buy_pending}
+    held_value = sum((prices.get(s) or h.get("entry_price") or 0.0) * h["shares"] for s, h in new_holdings.items())
+    portfolio_store.record_rebalance(
+        portfolio_id, new_holdings, max(0.0, value - held_value), pending,
+        event={"date": today, "at": datetime.now(timezone.utc).isoformat(), "orders": orders, "errors": errors,
+               "portfolio_value_before": value, "target_weights": target, "trigger": "dip", "reason": reason[:1000],
+               "review": review, "excluded": [], "holdings_after": _holdings_after(new_holdings, sells + buys, pending),
+               "signals": {sym: dip.get("signals", {})}},
+        next_rebalance_date=p.get("next_rebalance_date"),
+    )
+    return {"orders": orders, "errors": errors, "portfolio_value_before": value}
+
+
+def _dip_fundamentals(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fundamentals for the dip check, cached per stock by fundamentals.py."""
+    from concurrent.futures import ThreadPoolExecutor
+    from fundamentals import get_factor_inputs, get_quality_score
+
+    def one(s: str) -> Dict[str, Any]:
+        return {**get_factor_inputs(s), "quality": get_quality_score(s, fallback=0.5)}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return dict(zip(symbols, pool.map(one, symbols)))
+
+
 def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "",
                           exclude: Sequence[str] = ()) -> Dict[str, Any]:
     """The actual recalibration, sized against the portfolio's CURRENT
@@ -3422,7 +3492,8 @@ def proactive_check_route():
                          record_fn=portfolio_store.record_proactive_check, client_fn=client,
                          market_open_fn=_market_open, news_many_fn=_headlines_many, series_fn=_daily_closes,
                          verdict_load_fn=portfolio_store.get_news_verdicts,
-                         verdict_save_fn=portfolio_store.save_news_verdicts)
+                         verdict_save_fn=portfolio_store.save_news_verdicts,
+                         fundamentals_fn=_dip_fundamentals, dip_buy_fn=buy_dip, max_per_name_fn=_max_per_name_for)
     results = run_proactive_check(portfolios, cfg, deps, dry_run=dry_run)
     return {"dry_run": dry_run or cfg.dry_run, "checked": len(results),
             "results": [{"id": r.portfolio_id, "name": r.name, "action": r.action, "reason": r.reason,

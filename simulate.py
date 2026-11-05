@@ -71,6 +71,7 @@ class SimulationResult:
     n_trades: int = 0
     n_stops: int = 0
     n_sector_rerank: int = 0
+    n_dip_buys: int = 0
 
 
 def fetch_price_series(
@@ -156,6 +157,7 @@ def run_simulation(
     scorer: Optional[Callable[[List[Any]], List[Any]]] = None,  # replace the score (the backtest's null model)
     sector_rerank: bool = False,               # also re-rank on unusual sector moves, up to max_early per 30 days
     max_early: int = 2,
+    dip_buys: bool = False,                    # also run the daily dip check
 ) -> SimulationResult:
     cfg = cfg or rulebook.default_config()
     sector_by_symbol = {sym: rulebook.sector_of(path) for sym, path, _ in universe if rulebook.sector_of(path) in sectors}
@@ -206,6 +208,7 @@ def run_simulation(
                     if ser.prices[k - 1]:
                         by_day.setdefault(ser.dates[k], []).append(ser.prices[k] / ser.prices[k - 1] - 1.0)
             sector_returns[sec] = {d: statistics.fmean(v) for d, v in by_day.items()}
+    n_dip_buys = 0
     early_dates: List[str] = []
     n_sector_rerank = 0
 
@@ -367,6 +370,29 @@ def run_simulation(
                 rebalance_weights.append(dict(target))
                 rebalance_tilts.append({})
                 rebalance_actions.append(actions)
+        if dip_buys and not scheduled and not (i and dates[i] in rebalance_dates):
+            snaps = snapshots_on(day)
+            scores = rulebook.composite_scores(snaps, None, cfg)
+            picks = rulebook.dip_candidates(snaps, scores, set(shares), blocked_on(day), date.fromisoformat(day), cfg)
+            total = value_on(day)
+            current = {s: n * (series[s].on(day) or 0.0) / total for s, n in shares.items()}
+            info = {x.name: x for x in snaps}
+            for pick in picks:
+                plan = rulebook.dip_trade(pick, scores[pick][0], current, {k: v[0] for k, v in scores.items()}, top_n, cash / total,
+                                          max_per_name, {k: v.industry for k, v in info.items()}, {k: v.beta for k, v in info.items()}, cfg)
+                if plan is None:
+                    continue
+                sell, weight = plan
+                actions = {}
+                if sell:
+                    actions[sell] = trade(day, sell, 0.0)
+                actions[pick] = trade(day, pick, total * weight / series[pick].on(day))
+                n_dip_buys += 1
+                rebalance_dates.append(day)
+                rebalance_weights.append({**{s: w for s, w in current.items() if s != sell}, pick: weight})
+                rebalance_tilts.append({})
+                rebalance_actions.append(actions)
+                break
         values.append(value_on(day))
 
     # equal-weight buy-and-hold of whatever could be bought on day one
@@ -392,5 +418,5 @@ def run_simulation(
         spy_return=(spy_values[-1] / initial_capital - 1.0) if spy_values and initial_capital else 0.0,
         warnings=warnings, stats=rulebook.performance_stats(values), total_costs=total_costs,
         annual_turnover=(traded / 2.0 / avg_value / years) if avg_value > 0 else 0.0,
-        n_trades=n_trades, n_stops=n_stops, n_sector_rerank=n_sector_rerank,
+        n_trades=n_trades, n_stops=n_stops, n_sector_rerank=n_sector_rerank, n_dip_buys=n_dip_buys,
     )
