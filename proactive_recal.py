@@ -83,7 +83,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import rulebook
 
-DECIDE_MODEL = "claude-opus-5"      # once a day per portfolio, and it can trigger real trades — the strong model
+DECIDE_MODEL = "claude-opus-5"      # it can trigger real trades, so the strong tier: llm.py gives it a bigger thinking budget
 MAX_HEADLINES_PER_SYMBOL = 5
 WATCH_HEADLINES_PER_SYMBOL = 3
 MAX_WATCHED_SHOWN = 40        # non-held names put in front of the model, most newsworthy first

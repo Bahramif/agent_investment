@@ -20,7 +20,8 @@ works unchanged. Only client construction moves here.
   * Tools become Gemini function declarations (same JSON schema); a forced
     tool_choice becomes function-calling mode ANY restricted to that name.
   * THINKING is on for every call: a thinking budget per tier (strong 2048,
-    fast 1024 tokens, overridable). Thought parts are never returned as
+    fast 1024 tokens, overridable), so high-stakes calls think longer even
+    though both tiers now use the same model. Thought parts are never returned as
     output; their token count is logged so cost stays visible.
   * Claude model IDs passed by callers are mapped by tier: anything "opus"
     or "sonnet" -> the strong Gemini model, anything else (haiku) -> fast.
@@ -29,7 +30,7 @@ works unchanged. Only client construction moves here.
 
 Provider selection (environment, read at call time):
   MERIDIAN_LLM_PROVIDER   "gemini" (default) | "anthropic"
-  MERIDIAN_GEMINI_STRONG  default "gemini-3.1-pro-preview"
+  MERIDIAN_GEMINI_STRONG  default "gemini-3.8-flash" (the same as fast, by choice)
   MERIDIAN_GEMINI_FAST    default "gemini-3.8-flash"
   MERIDIAN_GEMINI_THINKING_STRONG / _FAST   thinking budgets (tokens)
   MERIDIAN_GEMINI_LOCATION  default "global"
@@ -47,8 +48,8 @@ import threading
 from types import SimpleNamespace as NS
 from typing import Any, Dict, List, Optional
 
-DEFAULT_STRONG = "gemini-3.1-pro-preview"
 DEFAULT_FAST = "gemini-3.8-flash"
+DEFAULT_STRONG = DEFAULT_FAST    # Flash for every call. Set MERIDIAN_GEMINI_STRONG to use another model for this tier.
 MAX_OUTPUT_TOKENS = 65536        # Gemini's per-request output limit (thinking counts against it)
 # Vertex answers bursts with 429 RESOURCE_EXHAUSTED ("try again later"); Google's
 # guidance is retry with exponential backoff: 3 attempts, ~2s then ~4s (+jitter).
@@ -73,13 +74,22 @@ def gemini_model_for(claude_model: str) -> str:
     m = (claude_model or "").lower()
     if m.startswith("gemini"):
         return claude_model
-    strong = "opus" in m or "sonnet" in m
+    strong = _is_strong_tier(m)
     return os.environ.get("MERIDIAN_GEMINI_STRONG" if strong else "MERIDIAN_GEMINI_FAST",
                           DEFAULT_STRONG if strong else DEFAULT_FAST)
 
 
-def thinking_budget_for(gemini_model: str) -> int:
-    fast = gemini_model == os.environ.get("MERIDIAN_GEMINI_FAST", DEFAULT_FAST)
+def _is_strong_tier(claude_model: str) -> bool:
+    m = (claude_model or "").lower()
+    return "opus" in m or "sonnet" in m
+
+
+def thinking_budget_for(gemini_model: str, requested_model: str = "") -> int:
+    """By the tier the caller asked for when it named one, else by the model."""
+    if _is_strong_tier(requested_model):
+        fast = False
+    else:
+        fast = gemini_model == os.environ.get("MERIDIAN_GEMINI_FAST", DEFAULT_FAST)
     key, default = ("MERIDIAN_GEMINI_THINKING_FAST", 1024) if fast else ("MERIDIAN_GEMINI_THINKING_STRONG", 2048)
     try:
         return max(0, int(os.environ.get(key, default)))
@@ -133,7 +143,7 @@ class GeminiClaudeShim:
         from google.genai import types
 
         gmodel = gemini_model_for(model)
-        budget = thinking_budget_for(gmodel)
+        budget = thinking_budget_for(gmodel, model)
         contents = [types.Content(role="model" if m.get("role") == "assistant" else "user",
                                   parts=[types.Part(text=_text_of(m.get("content")))])
                     for m in messages if m.get("role") in ("user", "assistant")]
@@ -289,6 +299,10 @@ if __name__ == "__main__":
     assert gemini_model_for("claude-sonnet-5") == DEFAULT_STRONG
     assert gemini_model_for("gemini-2.5-pro") == "gemini-2.5-pro"
     assert thinking_budget_for(DEFAULT_FAST) == 1024
+    assert DEFAULT_STRONG == DEFAULT_FAST and "pro" not in DEFAULT_STRONG, "Flash for every call"
+    assert gemini_model_for("claude-opus-5") == gemini_model_for("claude-haiku-4-5") == DEFAULT_FAST
+    assert thinking_budget_for(DEFAULT_FAST, "claude-opus-5") == 2048, "high-stakes calls keep the bigger budget on Flash"
+    assert thinking_budget_for(DEFAULT_FAST, "claude-haiku-4-5") == 1024
     os.environ["MERIDIAN_GEMINI_STRONG"] = "gemini-2.5-pro"
     os.environ["MERIDIAN_GEMINI_THINKING_STRONG"] = "512"
     assert gemini_model_for("claude-opus-5") == "gemini-2.5-pro" and thinking_budget_for("gemini-2.5-pro") == 512
