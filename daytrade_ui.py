@@ -12,7 +12,7 @@ Routes
                                  account/positions, recent days, roll-up
   GET  /daytrade/sessions/<date> one day in detail: trades, playbook, events,
                                  live-vs-shadow (the LLM ablation)
-  POST /daytrade/halt            kill switch ON   — open to anyone with page access
+  POST /daytrade/halt            kill switch ON   — requires the shared token (P0.3)
   POST /daytrade/resume          kill switch OFF  — requires the shared token
   GET  /daytrade/api/status      JSON for monitoring
   GET  /daytrade/learning        the failure-learning loop: lessons by status with their
@@ -24,12 +24,14 @@ WHY LESSON CHANGES NEED THE TOKEN. A lesson can only restrict, but switching
 one on or off still changes what the engine does tomorrow, so both go
 through the same gate as resuming trading.
 
-WHY HALT IS OPEN BUT RESUME IS NOT. The rest of this app is deliberately
-public (web_ui.py says so). Halting can only REDUCE risk, so leaving it open
-is safe and means the button works when you need it. Resuming re-enables
-order placement, so it needs the shared token, mirroring the pattern web_ui
-already uses for /portfolios/recalibrate_due. If no token is configured that
-is an explicit opt-out (local use), same as there.
+WHY HALT NEEDS THE TOKEN TOO (P0.3). Halting only reduces risk, so it used
+to be open — but flipping trading state is still a state change only the
+owner should make, and an open halt button is a denial-of-service on the
+strategy (anyone reaching the page could halt trading every day). Halt,
+resume, and lesson changes all go through the same gate now. If no token
+is configured the gate FAILS CLOSED (refuses) instead of running
+unprotected — the old opt-out is gone; set the daytrade-token secret
+(or the token the host app injects) for local use.
 
 PAPER ONLY, and the page says so. It never places an order itself — it
 reads the store and the broker and flips one Firestore flag; the runner does
@@ -110,6 +112,7 @@ DASHBOARD = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     <div class="running"><b>🟢 Trading is enabled.</b> Halting stops new entries and flattens open positions at the next cycle.
       <form class="inline" method="post" action="/daytrade/halt" style="margin-left:10px">
         <input type="text" name="reason" placeholder="reason (optional)">
+        {% if token_required %}<input type="password" name="token" placeholder="token" required>{% endif %}
         <button class="btn-halt">HALT</button></form></div>
   {% endif %}
 
@@ -340,14 +343,23 @@ def make_daytrade_blueprint(
 
     @bp.route("/daytrade/halt", methods=["POST"])
     def halt():
+        # P0.3 — halting flips trading state, so it needs the shared token
+        # like resume does (see _authorized below).
+        if not _authorized():
+            return ("unauthorized — halting trading requires the token", 403)
         reason = (request.form.get("reason") or "").strip()[:200] or "manual halt from the dashboard"
         store_fn().set_halted(True, reason, by="dashboard")
         return redirect("/daytrade?msg=Trading+halted.")
 
     def _authorized() -> bool:
+        # P0.3 — fail closed: no token configured means NO token-gated
+        # action runs (previously `not expected` returned True, leaving
+        # resume/lessons unprotected whenever the secret was never set).
         expected = token_fn()
+        if not expected:
+            return False
         supplied = request.form.get("token") or request.headers.get("X-Daytrade-Token") or ""
-        return not expected or hmac.compare_digest(supplied.encode(), expected.encode())
+        return hmac.compare_digest(supplied.encode(), expected.encode())
 
     @bp.route("/daytrade/resume", methods=["POST"])
     def resume():
