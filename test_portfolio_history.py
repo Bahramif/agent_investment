@@ -127,13 +127,13 @@ if __name__ == "__main__":
                                  "expected_return": 0.0, "batch_id": "b2"})
     install(base.doc())
     base.world()
-    c.post("/execute", data={"sectors": "tech_ai", "capital": "1000", "top_n": "2", "batch_id": "b2",
-                             "rebalance_cadence": "21"})
+    base.admin_post(c, "/execute", data={"sectors": "tech_ai", "capital": "1000", "top_n": "2", "batch_id": "b2",
+                                          "rebalance_cadence": "21"})
     ps.create_portfolio = real_create
     assert set(seen["initial_holdings"]) == {"AAA", "BBB"} and seen["initial_holdings"]["AAA"]["shares"] > 0
     fake = install(base.doc(pending_order_ids={}))
     base.world()
-    c.post("/portfolios/p1/recalibrate")
+    base.recalibrate_now(c)
     ev = fake.docs["p1"]["rebalance_history"][-1]
     assert set(ev["holdings_after"]) == set(fake.docs["p1"]["holdings"]), (ev["holdings_after"], fake.docs["p1"]["holdings"])
     ok(f"launch stored {sorted(seen['initial_holdings'])}; recalibration stored holdings_after {sorted(ev['holdings_after'])}")

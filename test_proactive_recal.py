@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
 import test_portfolio_page_reconcile as harness      # stubs GCP, imports the real web_ui
-from test_portfolio_page_reconcile import FakeTradingClient, base_doc, install
+from test_portfolio_page_reconcile import FakeTradingClient, base_doc, install, admin_post, recalibrate_now
 
 web_ui = harness.web_ui
 import alpaca.trading.client as alpaca_trading_client   # noqa: E402
@@ -194,7 +194,7 @@ if __name__ == "__main__":
     assert fake.docs["p1"]["rebalance_history"][-1]["trigger"] == "scheduled"
     fake = install(doc())
     world()
-    c.post("/portfolios/p1/recalibrate")
+    recalibrate_now(c)
     assert fake.docs["p1"]["rebalance_history"][-1]["trigger"] == "manual"
     fake = install(doc(rebalance_history=[
         {"date": "2026-09-01", "orders": [], "portfolio_value_before": 1.0},                              # pre-label
@@ -232,12 +232,12 @@ if __name__ == "__main__":
     assert "proactive_checks" not in fake.docs["p1"], "an OFF portfolio leaves no trace"
     html = c.get("/portfolios/p1").get_data(as_text=True)
     assert "Mid-day news watch:" in html and ">OFF<" in html and "Turn on" in html
-    assert c.post("/portfolios/p1/news_watch", data={"enabled": "1"}).status_code == 302
+    assert admin_post(c, "/portfolios/p1/news_watch", data={"enabled": "1"}).status_code == 302
     assert fake.docs["p1"]["news_watch"] is True and fake.docs["p1"]["news_watch_changed_at"]
     assert ">ON<" in c.get("/portfolios/p1").get_data(as_text=True)
     r = c.post("/portfolios/proactive_check", headers=TOKEN).get_json()
     assert r["checked"] == 1 and r["results"][0]["action"] == "recalibrated"
-    c.post("/portfolios/p1/news_watch", data={"enabled": "0"})
+    admin_post(c, "/portfolios/p1/news_watch", data={"enabled": "0"})
     assert fake.docs["p1"]["news_watch"] is False
     ok("off -> not checked, no log; Turn on -> next run acts; Turn off -> back off")
 
@@ -253,8 +253,8 @@ if __name__ == "__main__":
     install(doc())
     for form, want in (({"news_watch": "1"}, True), ({}, False)):
         seen.clear()
-        c.post("/execute", data={"sectors": "tech_ai", "capital": "1000", "top_n": "5", "batch_id": "b1",
-                                 "rebalance_cadence": "21", **form})
+        admin_post(c, "/execute", data={"sectors": "tech_ai", "capital": "1000", "top_n": "5", "batch_id": "b1",
+                                        "rebalance_cadence": "21", **form})
         assert seen.get("news_watch") is want, (form, seen.get("news_watch"))
     ps.create_portfolio = real_create
     ok("checked -> news_watch=True, unchecked -> False")
@@ -355,7 +355,7 @@ if __name__ == "__main__":
         seen_ctx.append(context)
         return {"final_weights": {"AAA": 0.4, "CCC": 0.3, "DDD": 0.3}, "status": "ok"}
     web_ui.recommend = stale_agent
-    c.post("/portfolios/p1/recalibrate")
+    recalibrate_now(c)
     assert seen_ctx[0]["blocked"] == ["AAA", "BBB"], seen_ctx
     assert "AAA" not in {s for s, side, _ in FakeTradingClient.submitted if side == "buy"}, FakeTradingClient.submitted
     assert "AAA" not in fake.docs["p1"]["holdings"]
@@ -367,7 +367,9 @@ if __name__ == "__main__":
     r = c.post("/portfolios/recalibrate_due", headers=TOKEN).get_json()
     assert "market is closed" in r["results"][0]["error"] and not FakeTradingClient.submitted, r
     assert fake.docs["p1"]["next_rebalance_date"] == TODAY.isoformat() and st["recommend_calls"] == 0
-    html = c.post("/portfolios/p1/recalibrate").get_data(as_text=True)
+    # P0.3 — the preview step reports the same "market is closed" error
+    # (the plan can't be computed), and nothing trades either way.
+    html = admin_post(c, "/portfolios/p1/recalibrate").get_data(as_text=True)
     assert "market is closed" in html, "the button says why nothing happened"
     ok("deferred; the manual button shows the reason")
 
@@ -378,25 +380,31 @@ if __name__ == "__main__":
                                  "ZZZ": {"shares": 10, "entry_price": 10.0, "cost": 100.0}}))
     world()
     web_ui.recommend = lambda sectors, top_n, context=None: {"final_weights": {"AAA": 0.495, "BBB": 0.498}, "status": "ok"}
-    c.post("/portfolios/p1/recalibrate")
+    recalibrate_now(c)
     assert [(s, side) for s, side, _ in FakeTradingClient.submitted] == [("ZZZ", "sell")], FakeTradingClient.submitted
     ok("0.3% resizes skipped; the 1% position closed in full")
 
     print("SCENARIO O: CASH from the rulebook's limits is never priced or ordered; strategist views persist")
     fake = install(doc(pending_order_ids={}))
     world()
-    state_seen = {}
+    states_seen = []
     def remote_query(thread_id, state):
-        state_seen.update(state)
+        states_seen.append(state)
         return {"final_weights": {"BBB": 0.3, "CCC": 0.3, "CASH": 0.4}, "status": "ok",
                 "theme_memory": {"tech_ai": {"theme": "tech_ai", "strategic": {"raw": 0.1}, "tactical": {"raw": 0.0}}}}
     web_ui._remote_agent.query = remote_query
     web_ui.recommend = REAL_RECOMMEND
     web_ui._call_with_timeout = lambda fn, *a, timeout=None, **k: fn(*a, **k)
-    c.post("/portfolios/p1/recalibrate")
+    recalibrate_now(c)
     assert "CASH" not in {s for s, _, _ in FakeTradingClient.submitted}, FakeTradingClient.submitted
     assert "CASH" not in fake.docs["p1"]["rebalance_history"][-1]["target_weights"]
-    assert state_seen["theme_memory"] == {} and state_seen["mandate"]["default_limits"]["held"] == ["AAA", "BBB"]
+    # P0.3 — preview + confirm runs the recommendation twice: the preview
+    # sees a fresh (empty) theme memory and SAVES its view; the confirming
+    # run then re-reads that saved view. Both runs agree on the held names.
+    assert len(states_seen) == 2, states_seen
+    assert states_seen[0]["theme_memory"] == {} and states_seen[0]["mandate"]["default_limits"]["held"] == ["AAA", "BBB"]
+    assert states_seen[1]["theme_memory"]["tech_ai"]["strategic"]["raw"] == 0.1
+    assert states_seen[1]["mandate"]["default_limits"]["held"] == ["AAA", "BBB"]
     first_saved = ps_store.get_strategist_memory()
     assert first_saved["theme_memory"]["tech_ai"]["strategic"]["raw"] == 0.1 and first_saved["saved_at"]
     thread, state2 = web_ui._build_recommend_state(["tech_ai"], 3)

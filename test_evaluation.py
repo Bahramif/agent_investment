@@ -66,7 +66,7 @@ if __name__ == "__main__":
     fake = install(base.doc(pending_order_ids={}))
     setup({"BBB": 0.5, "CCC": 0.4}, heads={"CCC": ["CCC under SEC investigation over accounting irregularities"],
                                             "BBB": ["BBB misses estimates, shares slide 6%"]})
-    c.post("/portfolios/p1/recalibrate")
+    base.recalibrate_now(c)
     ev = fake.docs["p1"]["rebalance_history"][-1]
     assert not bought("CCC") and bought("BBB"), FakeTradingClient.submitted
     assert any(s == "AAA" and side == "sell" for s, side, _ in FakeTradingClient.submitted), "sells still go out"
@@ -79,12 +79,12 @@ if __name__ == "__main__":
     print("SCENARIO B: concentration — a >40% buy in a 3-name portfolio is blocked; a 2-name one is not")
     fake = install(base.doc(pending_order_ids={}))
     setup({"BBB": 0.5, "CCC": 0.3, "DDD": 0.2})
-    c.post("/portfolios/p1/recalibrate")
+    base.recalibrate_now(c)
     v = fake.docs["p1"]["rebalance_history"][-1]["review"]["vetoed"]
     assert list(v) == ["BBB"] and "concentration" in v["BBB"] and bought("CCC") and bought("DDD")
     fake = install(base.doc(pending_order_ids={}))
     setup({"BBB": 0.6, "CCC": 0.4})
-    c.post("/portfolios/p1/recalibrate")
+    base.recalibrate_now(c)
     assert fake.docs["p1"]["rebalance_history"][-1]["review"]["vetoed"] == {} and bought("BBB")
     ok("BBB 50% of a 3-name book blocked; 60% of a 2-name book allowed (concentrated by design)")
 
@@ -95,7 +95,7 @@ if __name__ == "__main__":
                                   {"symbol": "AAA", "verdict": "concern", "reason": "Selling a quality name."}]})
     fake = install(base.doc(pending_order_ids={}))
     setup({"BBB": 0.5, "CCC": 0.4}, reviewer=rv)
-    c.post("/portfolios/p1/recalibrate")
+    base.recalibrate_now(c)
     review = fake.docs["p1"]["rebalance_history"][-1]["review"]
     assert review["grade"] == "C" and review["model"] == "fake-reviewer" and list(review["vetoed"]) == ["BBB"]
     assert not bought("BBB") and bought("CCC"), "the same on every trigger: an objection blocks that buy only"
@@ -116,7 +116,7 @@ if __name__ == "__main__":
     web_ui._headlines_many = lambda syms, days: (_ for _ in ()).throw(TimeoutError("news down"))
     web_ui._daily_closes = lambda syms, start: (_ for _ in ()).throw(RuntimeError("bars down"))
     web_ui._SCORECARD.update(at=-1e9, value=None)
-    c.post("/portfolios/p1/recalibrate")
+    base.recalibrate_now(c)
     ev = fake.docs["p1"]["rebalance_history"][-1]
     assert bought("BBB") and bought("CCC") and ev["review"]["vetoed"] == {} and ev["trigger"] == "manual"
     ok("news, prices and model all down -> recalibration traded normally, nothing blocked")
