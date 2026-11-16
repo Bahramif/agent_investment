@@ -116,6 +116,41 @@ def install(doc):
 def ok(msg): print(f"✓ {msg}")
 
 
+# ---- P0.3 helpers: sign in as the admin and POST to destructive routes ----
+# The stubbed Secret Manager returns b"stub" for EVERY secret, so the admin
+# token (the recalibrate-token secret) is "stub" in tests.
+ADMIN_TOKEN = "stub"
+
+
+def login(c):
+    """Sign the test client in at /login with the admin token."""
+    r = c.post("/login", data={"admin_token": ADMIN_TOKEN})
+    assert r.status_code == 302, r.status_code
+    return r
+
+
+def admin_post(c, url, data=None, **kw):
+    """POST to a destructive route as a signed-in admin, with a valid
+    per-session CSRF token. Logs in fresh each call (cheap) so the CSRF
+    token is always the current one."""
+    login(c)
+    with c.session_transaction() as sess:
+        tok = sess.get("csrf_token")
+    assert tok, "login must issue a CSRF token"
+    body = dict(data or {})
+    body.setdefault("csrf_token", tok)
+    return c.post(url, data=body, **kw)
+
+
+def recalibrate_now(c, pid="p1"):
+    """The manual recalibration's two-step flow (P0.3): first submission
+    renders the preview (no orders), second submission with confirm=1
+    actually trades. Returns the confirming submission's response."""
+    r = admin_post(c, f"/portfolios/{pid}/recalibrate")
+    assert r.status_code == 200 and "Preview: recalibrate" in r.get_data(as_text=True), r.status_code
+    return admin_post(c, f"/portfolios/{pid}/recalibrate", data={"confirm": "1"})
+
+
 if __name__ == "__main__":
     alpaca_trading_client.TradingClient = FakeTradingClient
     web_ui._live_prices = lambda syms: {s: 12.0 for s in syms}
@@ -199,7 +234,13 @@ if __name__ == "__main__":
 
     print("TEST 7: CLOSE sells the shares actually held (60), not the stale ledger's 100")
     fake = install(base_doc())
-    r = c.post("/portfolios/p1/close")
+    # P0.3 — liquidation is two server-side steps: the first submission only
+    # renders the confirm page and must trade nothing...
+    r = admin_post(c, "/portfolios/p1/close")
+    assert r.status_code == 200 and "Type the portfolio name" in r.get_data(as_text=True)
+    assert not FakeTradingClient.submitted and fake.docs["p1"]["status"] == "open"
+    # ...only the second submission, typing the exact portfolio name, sells.
+    r = admin_post(c, "/portfolios/p1/close", data={"confirm_name": "Test PF"})
     sells = {sym: qty for sym, side, qty in FakeTradingClient.submitted if side == "sell"}
     assert sells == {"AAA": 60, "BBB": 50, "CCC": 30}, sells
     assert fake.docs["p1"]["status"] == "closed"

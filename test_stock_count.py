@@ -56,8 +56,8 @@ if __name__ == "__main__":
     ps.create_portfolio = lambda **kw: seen.update(kw) or "new1"
     install(base.doc())
     base.world()
-    c.post("/execute", data={"sectors": "tech_ai", "capital": "10000", "top_n": "3", "batch_id": "b1",
-                             "rebalance_cadence": "21"})
+    base.admin_post(c, "/execute", data={"sectors": "tech_ai", "capital": "10000", "top_n": "3", "batch_id": "b1",
+                                         "rebalance_cadence": "21"})
     ps.create_portfolio = real_create
     assert seen.get("n_stocks") == 3 and seen.get("top_n") == 3, {k: seen.get(k) for k in ("n_stocks", "top_n")}
     ok("3 stocks bought -> n_stocks=3, top_n=3")
@@ -70,8 +70,9 @@ if __name__ == "__main__":
         asked = []
         web_ui.recommend = lambda sectors, top_n, context=None: asked.append(top_n) or {
             "final_weights": {"BBB": 0.5, "CCC": 0.5}, "status": "ok", "book_notes": {}}
-        c.post("/portfolios/p1/recalibrate")
-        assert asked == [want], (label, asked)
+        base.recalibrate_now(c)
+        # P0.3 — preview + confirm runs recommend() twice with the same top_n.
+        assert asked == [want, want], (label, asked)
         ok(label)
     install(base.doc(pending_order_ids={}, n_stocks=5))
     base.world()

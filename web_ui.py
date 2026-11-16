@@ -44,12 +44,14 @@ WHAT'S HONEST vs. WHAT'S A GUESS, so nothing here overstates itself:
 from __future__ import annotations
 
 import json
+import hmac
 import math
 import os
+import secrets
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from flask import Flask, render_template_string, request, Response, stream_with_context, redirect
+from flask import Flask, render_template_string, request, Response, session, stream_with_context, redirect
 
 import vertexai
 from vertexai.preview import reasoning_engines
@@ -132,6 +134,54 @@ REBALANCE_OPTIONS = {"5": "Weekly", "21": "Monthly", "63": "Quarterly"}
 SYMBOL_TO_SECTOR = {sym: path.split(".")[-1] for sym, path, _ in UNIVERSE}
 
 app = Flask(__name__)
+
+
+# Secrets from Secret Manager. A value is cached for the life of the process;
+# a FAILED read is not, and is retried after SECRET_RETRY_S. So one transient
+# Secret Manager error can't lock the scheduled endpoints out (they fail closed
+# while no token can be read) until the instance restarts.
+SECRET_RETRY_S = 60.0
+_SECRET_CACHE: Dict[str, Tuple[Optional[str], float]] = {}
+
+
+def _secret(name: str) -> Optional[str]:
+    """The latest version of Secret Manager secret `name`, or None if it can't be
+    read or is empty. Never logs the value."""
+    import time
+    cached = _SECRET_CACHE.get(name)
+    if cached is not None and (cached[0] or time.monotonic() - cached[1] < SECRET_RETRY_S):
+        return cached[0]
+    value: Optional[str] = None
+    try:
+        from google.cloud import secretmanager
+        value = secretmanager.SecretManagerServiceClient().access_secret_version(
+            name=f"projects/{PROJECT}/secrets/{name}/versions/latest").payload.data.decode("utf-8") or None
+    except Exception as e:
+        print(f"[web_ui] ALERT: secret {name} unavailable ({type(e).__name__}); retrying in {SECRET_RETRY_S:.0f}s")
+    _SECRET_CACHE[name] = (value, time.monotonic())
+    return value
+
+
+def _session_secret() -> str:
+    """The key that signs session cookies (the admin login + CSRF tokens). It must
+    be the SAME on every instance: Cloud Run runs several and starts new ones on
+    demand, and a cookie signed by one instance is unreadable on another, which
+    would sign the owner out mid-action. MERIDIAN_SESSION_SECRET (local), else the
+    `session-secret` secret. Without either, a random per-process key works on a
+    single instance only, and is logged as an alert. Never the admin token."""
+    value = os.environ.get("MERIDIAN_SESSION_SECRET") or _secret("session-secret")
+    if value:
+        return value
+    print("[web_ui] ALERT: no session-secret configured: sign-ins won't carry across instances or restarts")
+    return secrets.token_hex(32)
+
+
+app.secret_key = _session_secret()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("K_SERVICE")),   # HTTPS-only on Cloud Run, which sets K_SERVICE
+)
 vertexai.init(project=PROJECT, location=LOCATION)
 _remote_agent = reasoning_engines.ReasoningEngine(RESOURCE_NAME)
 
@@ -187,6 +237,107 @@ def _claude_client():
         return Anthropic(api_key=key)
     from anthropic import AnthropicVertex
     return AnthropicVertex(project_id=PROJECT, region="global")
+
+# =============================================================================
+# P0.3 — Server-side auth for destructive actions.
+#
+# Threat model: the read pages are deliberately public (anyone may VIEW a
+# portfolio), but anything that PLACES ORDERS or changes what the agent will
+# do on its own (launch, recalibrate, liquidate, news-watch toggle, day-trade
+# halt/resume) must prove the caller is the owner. A client-side JS
+# confirm() dialog is not proof — any script or curl call can skip it.
+#
+# Mechanism: ONE admin token, the `admin-token` Secret Manager secret (env
+# override MERIDIAN_ADMIN_TOKEN for local dev / tests). It is deliberately NOT
+# the `recalibrate-token` Cloud Scheduler sends: a person types this one into a
+# browser, and guessing or leaking it must not also open the scheduled trading
+# endpoints. Failed sign-ins are rate-limited (_login_blocked).
+# The owner signs in once at /login with that token; the server sets a
+# signed session cookie (admin_authenticated) and every destructive POST
+# additionally requires a per-session CSRF token rendered into its form.
+# No token value is ever rendered into a page. If no admin token is
+# configured at all, login always fails and every destructive action is
+# refused — fail closed, never open by default.
+# =============================================================================
+def _admin_token() -> Optional[str]:
+    """The single admin token. Env override first (local dev / tests),
+    otherwise the `admin-token` secret, otherwise None (unconfigured
+    -> sign-in always fails, so every destructive action is refused)."""
+    return os.environ.get("MERIDIAN_ADMIN_TOKEN") or _secret("admin-token")
+
+
+# Sign-in attempts. Counted per instance, so across Cloud Run's instances the real
+# ceiling is a multiple of these, still far too slow to guess a long random token.
+LOGIN_MAX_FAILURES = 5            # per client in the window
+LOGIN_MAX_FAILURES_TOTAL = 30     # all clients together in the window (a client can fake its address)
+LOGIN_WINDOW_S = 900.0
+_LOGIN_FAILURES: Dict[str, List[float]] = {}
+
+
+def _client_address() -> str:
+    """The caller's address: Cloud Run's front end puts it first in X-Forwarded-For."""
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return forwarded or request.remote_addr or "unknown"
+
+
+def _login_blocked(client: str, now: float) -> bool:
+    for key in list(_LOGIN_FAILURES):
+        _LOGIN_FAILURES[key] = [t for t in _LOGIN_FAILURES[key] if now - t < LOGIN_WINDOW_S]
+        if not _LOGIN_FAILURES[key]:
+            del _LOGIN_FAILURES[key]
+    total = sum(len(v) for v in _LOGIN_FAILURES.values())
+    return len(_LOGIN_FAILURES.get(client, [])) >= LOGIN_MAX_FAILURES or total >= LOGIN_MAX_FAILURES_TOTAL
+
+
+def _csrf_token() -> str:
+    """Per-session CSRF token, created lazily and rotated on login. Exposed
+    to templates as the {{ csrf_token() }} Jinja global (see below)."""
+    tok = session.get("csrf_token")
+    if not tok:
+        tok = secrets.token_hex(16)
+        session["csrf_token"] = tok
+    return tok
+
+
+app.jinja_env.globals["csrf_token"] = _csrf_token
+
+
+def _check_csrf() -> bool:
+    """True only when the submitted form carries this session's CSRF token."""
+    submitted = request.form.get("csrf_token") or ""
+    expected = session.get("csrf_token") or ""
+    return bool(expected) and hmac.compare_digest(submitted, expected)
+
+
+def _require_admin_csrf():
+    """Gate for destructive POST routes. Returns a (body, 403) tuple when
+    the caller must be refused, else None (proceed). Checks, in order:
+    signed-in admin session, then the per-session CSRF token."""
+    if not session.get("admin_authenticated"):
+        return ("unauthorized — destructive actions require signing in at /login", 403)
+    if not _check_csrf():
+        return ("unauthorized — missing or invalid CSRF token; reload the page and try again", 403)
+    return None
+
+
+@app.context_processor
+def _inject_admin_state():
+    return {"admin_signed_in": bool(session.get("admin_authenticated"))}
+
+
+def _is_test_portfolio(p: Dict[str, Any]) -> bool:
+    """True for portfolios that must not appear in the production switcher:
+    explicitly flagged (is_test) or named like a test portfolio — exactly
+    "test", or ending in "-test" (e.g. the "Oct2-actual-test" portfolio).
+    Deliberately NOT a bare "test" substring or "test " prefix: those would
+    also hide innocent names such as "Test PF" or "Latest". This hides them
+    from navigation only — no data is deleted and a test portfolio is still
+    reachable by direct URL."""
+    if p.get("is_test"):
+        return True
+    name = str(p.get("name") or "").strip().lower()
+    return name == "test" or name.endswith("-test")
+
 
 # In-memory cache of the last recommendation, so /chat has context without
 # needing a real session store — fine for a single-user local tool.
@@ -845,6 +996,8 @@ TOP_NAV = """
   <a href="/simulate" class="{{ 'active' if active_page == 'simulate' else '' }}">📈 Simulate</a>
   <a href="/evaluation" class="{{ 'active' if active_page == 'evaluation' else '' }}">🧪 Evaluation</a>
   <a href="/about" class="{{ 'active' if active_page == 'about' else '' }}">ℹ️ How This Works</a>
+  {% if admin_signed_in %}<span style="margin-left:auto;padding:8px 6px;font-size:0.86rem;color:#00a340;font-weight:600;white-space:nowrap;">✓ Signed in</span>
+  {% else %}<a href="/login" style="margin-left:auto;">🔐 Sign in</a>{% endif %}
 </nav>
 """
 
@@ -1315,8 +1468,12 @@ def _portfolio_selector(portfolios: List[Dict[str, Any]], current: str) -> str:
     (and from the compare-all list) entirely — filtered here so every
     caller gets this for free rather than each needing to remember it.
     A closed portfolio is still reachable directly by its /portfolios/<id>
-    URL, just no longer surfaced for ongoing navigation between portfolios."""
-    portfolios = [p for p in portfolios if p.get("status") == "open"]
+    URL, just no longer surfaced for ongoing navigation between portfolios.
+
+    TEST portfolios are likewise hidden here (P0.3, _is_test_portfolio):
+    e.g. "Oct2-actual-test" must not appear in the production switcher.
+    They are not deleted and remain reachable by direct URL."""
+    portfolios = [p for p in portfolios if p.get("status") == "open" and not _is_test_portfolio(p)]
 
     def opt(value: str, label: str) -> str:
         sel = " selected" if value == current else ""
@@ -1605,6 +1762,7 @@ PAGE = """
           <a href="/portfolios">compare their performance →</a></div>
         <form method="post" action="/execute"
               onsubmit="return confirm('Launch a new tracked portfolio with ' + {{ ctx.rows|length }} + ' names on Alpaca now?');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           {% for s in ctx.selected_sectors %}<input type="hidden" name="sectors" value="{{ s }}">{% endfor %}
           <input type="hidden" name="capital" value="{{ ctx.capital }}">
           <input type="hidden" name="top_n" value="{{ top_n }}">
@@ -1742,6 +1900,91 @@ function selectStock(symbol) {
 </html>
 """
 PAGE = PAGE.replace("<body>", "<body>\n" + TOP_NAV, 1)
+
+
+LOGIN_PAGE = """
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian — Sign in</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 480px;
+         margin: 0 auto; padding: 32px 16px 64px; color: #0d1117; line-height: 1.45; }
+  h1 { font-size: 1.3rem; } .sub { color: #6a7280; font-size: 0.9rem; margin-bottom: 20px; }
+  .warn { color: #a3312f; background: #fee; padding: 12px 14px; border-radius: 10px; margin: 12px 0; }
+  label { display: block; font-weight: 600; margin: 12px 0 4px; }
+  input { width: 100%; font-size: 1rem; padding: 9px 14px; border-radius: 8px; border: 1.5px solid #ddd; font-family: inherit; box-sizing: border-box; }
+  button { background: #0d1117; color: white; border: none; cursor: pointer; font-weight: 600;
+           font-size: 1rem; padding: 12px 20px; border-radius: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <h1>🔐 Sign in</h1>
+  <div class="sub">Viewing portfolios is public, but launching, recalibrating, liquidating,
+    or changing the news watch needs the admin token: the <code>admin-token</code>
+    secret (or <code>MERIDIAN_ADMIN_TOKEN</code> locally). It is never stored in the
+    browser beyond this signed-in session.</div>
+  {% if error %}<div class="warn">{{ error }}</div>{% endif %}
+  {% if admin_signed_in %}
+    <p>You are signed in. Destructive actions on this browser are unlocked.</p>
+    <form method="post" action="/logout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">Sign out</button>
+    </form>
+  {% else %}
+    <form method="post" action="/login">
+      <label>Admin token
+        <input type="password" name="admin_token" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+    </form>
+  {% endif %}
+  <p class="sub"><a href="/">← Back to Meridian</a></p>
+</body>
+</html>
+"""
+LOGIN_PAGE = LOGIN_PAGE.replace("<body>", "<body>\n" + TOP_NAV, 1)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_route():
+    """P0.3 — the one sign-in. Compares the submitted token against the
+    admin token with a constant-time compare. No admin token configured
+    -> login always fails (fail closed). On success the session is marked
+    admin and the CSRF token is rotated; the token itself is never stored
+    in the session or rendered anywhere. (No CSRF check on this form:
+    the token IS the credential, and an attacker who doesn't know it
+    can't complete a login for anyone.)"""
+    import time
+    error = None
+    if request.method == "POST":
+        client, now = _client_address(), time.monotonic()
+        if _login_blocked(client, now):
+            print(f"[web_ui] ALERT: sign-in refused, too many failed attempts (client {client})")
+            return render_template_string(LOGIN_PAGE, error="Too many failed sign-in attempts. Try again in 15 minutes.",
+                                          active_page=""), 429
+        expected = _admin_token()
+        supplied = request.form.get("admin_token") or ""
+        if expected and hmac.compare_digest(supplied.encode(), expected.encode()):
+            _LOGIN_FAILURES.pop(client, None)
+            session["admin_authenticated"] = True
+            session["csrf_token"] = secrets.token_hex(16)   # rotate on privilege change
+            return redirect("/")
+        _LOGIN_FAILURES.setdefault(client, []).append(now)
+        error = ("Wrong token." if expected
+                 else "No admin token is configured — set the admin-token secret "
+                      "(or MERIDIAN_ADMIN_TOKEN) and try again.")
+    return render_template_string(LOGIN_PAGE, error=error, active_page="")
+
+
+@app.route("/logout", methods=["POST"])
+def logout_route():
+    """Sign out: clears the whole session (admin flag + CSRF token)."""
+    blocked = _require_admin_csrf()
+    if blocked:
+        return blocked
+    session.clear()
+    return redirect("/login")
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -1897,6 +2140,10 @@ EXECUTE_PAGE = EXECUTE_PAGE.replace("<body>", "<body>\n" + TOP_NAV, 1)
 
 @app.route("/execute", methods=["POST"])
 def execute():
+    # P0.3 — launching places real Alpaca orders: admin session + CSRF token required.
+    blocked = _require_admin_csrf()
+    if blocked:
+        return blocked
     selected = request.form.getlist("sectors") or ["tech_ai"]
     capital = float(request.form.get("capital", DEFAULT_CAPITAL) or DEFAULT_CAPITAL)
     top_n = int(float(request.form.get("top_n", TOP_N_TOTAL) or TOP_N_TOTAL))
@@ -2686,8 +2933,65 @@ def portfolios_route():
                                   active_page="portfolios", selector=selector)
 
 
+CLOSE_CONFIRM_PAGE = """
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian — Confirm liquidation: {{ p.name }}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 780px;
+         margin: 0 auto; padding: 32px 16px 64px; color: #0d1117; line-height: 1.45; }
+  h1 { font-size: 1.3rem; } .sub { color: #6a7280; font-size: 0.9rem; margin-bottom: 20px; }
+  .warn { color: #a3312f; background: #fee; padding: 12px 14px; border-radius: 10px; margin: 12px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
+  th { color: #888; font-weight: 500; }
+  label { display: block; font-weight: 600; margin: 16px 0 4px; }
+  input[type=text] { width: 100%; font-size: 1rem; padding: 9px 14px; border-radius: 8px; border: 1.5px solid #ddd; font-family: inherit; box-sizing: border-box; }
+  button { font-size: 1rem; padding: 12px 20px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; }
+  .go { background: #a3312f; color: #fff; } .back { background: #eef0f5; color: #0d1117; }
+</style>
+</head>
+<body>
+  <h1>Close &amp; liquidate {{ p.name }}?</h1>
+  <div class="warn">This sells <b>every holding</b> below for real on Alpaca (paper) and
+    closes the portfolio. It cannot be undone from here — a closed portfolio
+    is no longer tracked or recalibrated.</div>
+  {% if holdings %}
+  <table>
+    <tr><th>Symbol</th><th>Shares</th><th>Entry price</th></tr>
+    {% for sym, h in holdings.items() %}
+    <tr><td>{{ sym }}</td><td>{{ h.shares }}</td><td>${{ '%.2f'|format(h.entry_price) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>This portfolio holds no shares.</p>{% endif %}
+  <form method="post" action="/portfolios/{{ p.id }}/close">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Type the portfolio name (<code>{{ p.name }}</code>) to confirm
+      <input type="text" name="confirm_name" autocomplete="off" required></label>
+    <div style="display:flex; gap:10px; margin-top:20px; flex-wrap:wrap;">
+      <button type="submit" class="go">Sell everything &amp; close this portfolio</button>
+      <a href="/portfolios/{{ p.id }}"><button type="button" class="back">Cancel — do nothing</button></a>
+    </div>
+  </form>
+</body>
+</html>
+"""
+CLOSE_CONFIRM_PAGE = CLOSE_CONFIRM_PAGE.replace("<body>", "<body>\n" + TOP_NAV, 1)
+
+
 @app.route("/portfolios/<portfolio_id>/close", methods=["POST"])
 def close_portfolio_route(portfolio_id: str):
+    # P0.3 — liquidation is the most destructive action in the app, so it
+    # is two server-side steps, not a JS confirm() alone: (1) this first
+    # submission only renders the confirm page listing what will be sold;
+    # (2) only a second submission that types the portfolio's exact name
+    # (same admin session + fresh CSRF token) actually sells anything.
+    # An unauthenticated or token-less POST changes nothing.
+    blocked = _require_admin_csrf()
+    if blocked:
+        return blocked
     import portfolio_store
     from alpaca.trading.client import TradingClient
     from alpaca_clients import AlpacaBrokerClient
@@ -2698,6 +3002,10 @@ def close_portfolio_route(portfolio_id: str):
         selector = _portfolio_selector(_all_portfolios_enriched(), "/portfolios?view=all")
         return render_template_string(PORTFOLIOS_PAGE, portfolios=[], error="Portfolio not found or already closed.",
                                       active_page="portfolios", selector=selector)
+
+    if request.form.get("confirm_name") != p.get("name"):
+        return render_template_string(CLOSE_CONFIRM_PAGE, p=p, holdings=p.get("holdings") or {},
+                                      active_page="portfolios")
 
     # Resolve anything that filled since the ledger was written BEFORE
     # deciding what to sell — otherwise this sells stale share counts.
@@ -3011,7 +3319,7 @@ def _dip_fundamentals(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
 
 
 def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: str = "",
-                          exclude: Sequence[str] = ()) -> Dict[str, Any]:
+                          exclude: Sequence[str] = (), dry_run: bool = False) -> Dict[str, Any]:
     """The actual recalibration, sized against the portfolio's CURRENT
     mark-to-market value, placing REAL Alpaca orders for the SHARE DELTA between
     what it holds and its new target. Callable manually
@@ -3094,6 +3402,17 @@ def recalibrate_portfolio(portfolio_id: str, trigger: str = "manual", reason: st
     plan.sort(key=lambda o: (o["side"] != "SELL", o["symbol"]))
     review = _review_plan(p, plan, weights, notes, trigger, reason)          # never raises
 
+    if dry_run:
+        # P0.3 — preview-before-execute: compute the real plan (live prices,
+        # recommendation, pre-trade review) but place NO orders and record
+        # nothing. The caller renders this for the owner to confirm; the
+        # confirming submission re-derives the plan, so the preview is a
+        # snapshot, not a locked-in order list. (Targeted exits never reach
+        # here — _targeted_exit returns before the plan is built.)
+        return {"preview": True, "orders": plan, "review": review,
+                "portfolio_value_before": current_value, "target_weights": weights,
+                "errors": []}
+
     rebalance_date = today.isoformat()
     new_holdings, orders_placed, errors, new_pending = _place_orders(portfolio_id, plan, review.get("vetoed") or {},
                                                                      old_holdings, rebalance_date, broker)
@@ -3135,47 +3454,106 @@ def _et_time(iso: str) -> str:
 
 @app.route("/portfolios/<portfolio_id>/news_watch", methods=["POST"])
 def news_watch_route(portfolio_id: str):
-    """The owner's on/off switch for the mid-day news watch. Same trust model
-    as "Recalibrate Now" and "Close & Liquidate" on this page (the app is
-    deliberately public; the scheduled endpoints are what carry the token)."""
+    """The owner's on/off switch for the mid-day news watch. P0.3: this
+    changes what the agent may do on its own (sell holdings on news), so
+    it needs the admin session + CSRF token like every other destructive
+    action — the old "deliberately public" trust model no longer applies."""
+    blocked = _require_admin_csrf()
+    if blocked:
+        return blocked
     import portfolio_store
     portfolio_store.set_news_watch(portfolio_id, request.form.get("enabled") == "1")
     return redirect(f"/portfolios/{portfolio_id}")
 
 
+RECALIBRATE_PREVIEW_PAGE = """
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian — Preview recalibration: {{ p.name }}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 780px;
+         margin: 0 auto; padding: 32px 16px 64px; color: #0d1117; line-height: 1.45; }
+  h1 { font-size: 1.3rem; } .sub { color: #6a7280; font-size: 0.9rem; margin-bottom: 20px; }
+  .warn { color: #a3312f; background: #fee; padding: 12px 14px; border-radius: 10px; margin: 12px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
+  th { color: #888; font-weight: 500; }
+  .buy { color: #00a340; font-weight: 700; } .sell { color: #d43f3f; font-weight: 700; }
+  button { font-size: 1rem; padding: 12px 20px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; }
+  .go { background: #0d1117; color: #fff; } .back { background: #eef0f5; color: #0d1117; }
+</style>
+</head>
+<body>
+  <h1>Preview: recalibrate {{ p.name }}</h1>
+  <div class="sub">No orders have been placed yet. This is the plan the agent computed
+    just now from live prices (portfolio value before: ${{ '{:,.2f}'.format(value_before) }}).
+    Confirming re-derives the plan, so the trades below are a snapshot — prices
+    and weights may shift slightly between preview and confirm.</div>
+  {% if review and review.vetoed %}
+    <div class="warn">⛔ Pre-trade review vetoed: {% for sym, why in review.vetoed.items() %}{{ sym }} ({{ why }}){% if not loop.last %}; {% endif %}{% endfor %}</div>
+  {% endif %}
+  {% if orders %}
+  <table>
+    <tr><th>Symbol</th><th>Side</th><th>Shares</th><th>Price</th><th>Notional</th></tr>
+    {% for o in orders %}
+    <tr><td>{{ o.symbol }}</td><td class="{{ o.side|lower }}">{{ o.side }}</td><td>{{ o.qty }}</td>
+      <td>${{ '%.2f'|format(o.price) }}</td><td>${{ '{:,.2f}'.format(o.qty * o.price) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No changes needed — every holding is already at its target weight.</p>
+  {% endif %}
+  <div style="display:flex; gap:10px; margin-top:20px; flex-wrap:wrap;">
+    <form method="post" action="/portfolios/{{ p.id }}/recalibrate">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="confirm" value="1">
+      <button type="submit" class="go">✓ Confirm — place these orders</button>
+    </form>
+    <a href="/portfolios/{{ p.id }}"><button type="button" class="back">Cancel — do nothing</button></a>
+  </div>
+  <p class="sub">Reviewer grade: {{ review.grade if review and review.grade else '—' }}{% if review and review.summary %} — {{ review.summary }}{% endif %}</p>
+</body>
+</html>
+"""
+RECALIBRATE_PREVIEW_PAGE = RECALIBRATE_PREVIEW_PAGE.replace("<body>", "<body>\n" + TOP_NAV, 1)
+
+
 @app.route("/portfolios/<portfolio_id>/recalibrate", methods=["POST"])
 def recalibrate_route(portfolio_id: str):
     """Manual "Recalibrate Now" trigger — the same real logic the scheduled
-    daily due-check runs automatically, just invoked on demand."""
+    daily due-check runs automatically, just invoked on demand.
+    P0.3 — two steps, both server-side: (1) this first submission only
+    COMPUTES the plan (dry_run) and shows it for review — no orders, no
+    ledger write; (2) only a second submission with confirm=1 (same admin
+    session + fresh CSRF token) actually trades. The JS confirm() on the
+    button is a courtesy layer, not the protection."""
+    blocked = _require_admin_csrf()
+    if blocked:
+        return blocked
+    if request.form.get("confirm") != "1":
+        preview = recalibrate_portfolio(portfolio_id, trigger="manual", dry_run=True)
+        if preview.get("error"):
+            return portfolio_detail(portfolio_id, notice=preview["error"])
+        import portfolio_store
+        p = portfolio_store.get_portfolio(portfolio_id)
+        return render_template_string(RECALIBRATE_PREVIEW_PAGE, p=p, orders=preview["orders"],
+                                      review=preview["review"],
+                                      value_before=preview["portfolio_value_before"],
+                                      active_page="portfolios")
     result = recalibrate_portfolio(portfolio_id, trigger="manual")
     return portfolio_detail(portfolio_id, notice=result.get("error"))
 
 
-_RECALIBRATE_TOKEN = None
-
-
 def _recalibrate_token() -> Optional[str]:
-    """Shared-secret check for the bulk due-check endpoint below. The rest
-    of this app is deliberately public (see the session's earlier decision
-    to keep it that way) — but that endpoint actually PLACES REAL ORDERS
-    for every due portfolio when hit, so unlike every other page here, it
-    cannot be left open to anyone who finds the URL. Cloud Scheduler is
-    configured to send this same token as a header (see the gcloud scheduler
-    job created for this). Returns None (meaning "no check configured") if
-    the secret was never set — that's an explicit opt-out, not an accident,
-    for local testing without Secret Manager access."""
-    global _RECALIBRATE_TOKEN
-    if _RECALIBRATE_TOKEN is None:
-        try:
-            from google.cloud import secretmanager
-            client = secretmanager.SecretManagerServiceClient()
-            _RECALIBRATE_TOKEN = client.access_secret_version(
-                name=f"projects/{PROJECT}/secrets/recalibrate-token/versions/latest"
-            ).payload.data.decode("utf-8")
-        except Exception as e:
-            print(f"[web_ui] no recalibrate-token secret configured ({e}) — due-check endpoint is UNPROTECTED")
-            _RECALIBRATE_TOKEN = ""
-    return _RECALIBRATE_TOKEN or None
+    """The token Cloud Scheduler sends to the scheduled endpoints, which PLACE
+    REAL ORDERS, so they can't be left open to anyone who finds the URL.
+
+    FAIL CLOSED: None (the secret can't be read) means both scheduled endpoints
+    refuse to run (503) and log an alert. A failed read is retried (_secret), so a
+    transient Secret Manager error only blocks them while it lasts."""
+    return _secret("recalibrate-token")
 
 
 @app.route("/portfolios/recalibrate_due", methods=["POST"])
@@ -3186,7 +3564,14 @@ def recalibrate_due_route():
     automatic rather than something you have to remember to click."""
     import portfolio_store
     expected = _recalibrate_token()
-    if expected and request.headers.get("X-Recalibrate-Token") != expected:
+    if expected is None:
+        # P0.3 — fail closed: no token configured means nobody may trigger
+        # this endpoint, not even with the right header (there is no right
+        # header). Log it loudly; a missing secret is a deployment problem,
+        # not a reason to trade unprotected.
+        print("[web_ui] ALERT: /portfolios/recalibrate_due refused — recalibrate-token not configured")
+        return {"error": "recalibrate token not configured — refusing to run unprotected"}, 503
+    if request.headers.get("X-Recalibrate-Token") != expected:
         return {"error": "unauthorized"}, 403
 
     due = portfolio_store.list_due_portfolios()
@@ -3468,7 +3853,11 @@ def proactive_check_route():
     import portfolio_store
     from proactive_recal import ProactiveDeps, run_proactive_check
     expected = _recalibrate_token()
-    if expected and request.headers.get("X-Recalibrate-Token") != expected:
+    if expected is None:
+        # P0.3 — fail closed, as in recalibrate_due_route above.
+        print("[web_ui] ALERT: /portfolios/proactive_check refused — recalibrate-token not configured")
+        return {"error": "recalibrate token not configured — refusing to run unprotected"}, 503
+    if request.headers.get("X-Recalibrate-Token") != expected:
         return {"error": "unauthorized"}, 403
     dry_run = request.args.get("dry_run") in ("1", "true", "yes")
 
@@ -3547,6 +3936,7 @@ PORTFOLIO_DETAIL_PAGE = """
   <form method="post" action="/portfolios/{{ p.id }}/news_watch" style="margin:0 0 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"
         {% if not p.news_watch %}onsubmit="return confirm('Turn on the mid-day news watch for {{ p.name }}? Each trading day at 12:30 ET it may sell a holding (real paper orders) that hits its stop or has thesis-breaking news, and fill that slot.');"{% endif %}>
     <input type="hidden" name="enabled" value="{{ '0' if p.news_watch else '1' }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <span style="font-size:0.9rem;">📰 Mid-day news watch:
       <b style="color:{{ '#00a340' if p.news_watch else '#888' }};">{{ 'ON' if p.news_watch else 'OFF' }}</b>
       <span style="color:#6a7280;">{{ '— checks daily at 12:30 ET and may sell a holding that hits its stop or has thesis-breaking news' if p.news_watch else '— recalibrates only on schedule or when you click' }}</span></span>
@@ -3720,11 +4110,13 @@ PORTFOLIO_DETAIL_PAGE = """
   <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
     <form method="post" action="/portfolios/{{ p.id }}/recalibrate"
           onsubmit="return confirm('Re-run the recommendation for {{ p.name }} and adjust real Alpaca positions to the new target weights now?');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" style="background:#0d1117;color:#fff;border:none;font-size:0.85rem;
               padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:600;">🔄 Recalibrate Now</button>
     </form>
     <form method="post" action="/portfolios/{{ p.id }}/close"
           onsubmit="return confirm('Sell all holdings in {{ p.name }} for real on Alpaca and close this portfolio?');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" style="background:#fee;color:#a3312f;border:1.5px solid #f3d4d4;font-size:0.85rem;
               padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:600;">Close &amp; Liquidate</button>
     </form>
@@ -3866,7 +4258,6 @@ def portfolio_detail(portfolio_id: str, notice: Optional[str] = None):
 # =============================================================================
 _DAYTRADE_STORE = None
 _DAYTRADE_BROKER = None
-_DAYTRADE_TOKEN: Optional[str] = None
 
 
 def _daytrade_store():
@@ -3898,22 +4289,10 @@ def _daytrade_live() -> Dict[str, Any]:
 
 
 def _daytrade_token() -> Optional[str]:
-    """Shared secret required to RESUME trading after a halt (halting itself
-    is open — it only reduces risk). Same opt-out semantics as
-    _recalibrate_token(): no secret configured means unprotected, on purpose,
-    for local use."""
-    global _DAYTRADE_TOKEN
-    if _DAYTRADE_TOKEN is None:
-        try:
-            from google.cloud import secretmanager
-            client = secretmanager.SecretManagerServiceClient()
-            _DAYTRADE_TOKEN = client.access_secret_version(
-                name=f"projects/{PROJECT}/secrets/daytrade-token/versions/latest"
-            ).payload.data.decode("utf-8")
-        except Exception as e:
-            print(f"[web_ui] no daytrade-token secret configured ({e}) — RESUME is UNPROTECTED")
-            _DAYTRADE_TOKEN = ""
-    return _DAYTRADE_TOKEN or None
+    """Shared secret required to HALT or RESUME day trading and to change lessons
+    (see daytrade_ui._authorized). Fails closed like _recalibrate_token(): while
+    the secret can't be read, those actions are refused, not left open."""
+    return _secret("daytrade-token")
 
 
 try:
